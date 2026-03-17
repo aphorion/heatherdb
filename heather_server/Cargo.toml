@@ -1,0 +1,20 @@
+[package]
+name = "heather_server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+heather_db = { path = "../heather_db" }
+heather_algebra = { path = "../heather_algebra" }
+axum = "0.8"
+tokio = { version = "1", features = ["full"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["limit", "timeout", "trace", "cors"] }
+rust-embed = "8"
+mime_guess = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive", "env"] }
+rayon = "1"

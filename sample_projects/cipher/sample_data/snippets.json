@@ -1,0 +1,152 @@
+[
+  {
+    "description": "Read a JSON file and parse it",
+    "code": "import json\n\nwith open('data.json', 'r') as f:\n    data = json.load(f)\n\nprint(data)",
+    "language": "python"
+  },
+  {
+    "description": "Write data to a JSON file",
+    "code": "import json\n\ndata = {'name': 'Alice', 'age': 30}\n\nwith open('output.json', 'w') as f:\n    json.dump(data, f, indent=2)",
+    "language": "python"
+  },
+  {
+    "description": "Read a CSV file into a list of dictionaries",
+    "code": "import csv\n\nwith open('data.csv', 'r') as f:\n    reader = csv.DictReader(f)\n    rows = list(reader)\n\nfor row in rows:\n    print(row)",
+    "language": "python"
+  },
+  {
+    "description": "Write a list of dictionaries to a CSV file",
+    "code": "import csv\n\ndata = [{'name': 'Alice', 'age': 30}, {'name': 'Bob', 'age': 25}]\n\nwith open('output.csv', 'w', newline='') as f:\n    writer = csv.DictWriter(f, fieldnames=['name', 'age'])\n    writer.writeheader()\n    writer.writerows(data)",
+    "language": "python"
+  },
+  {
+    "description": "Make an HTTP GET request and parse JSON response",
+    "code": "import requests\n\nresponse = requests.get('https://api.example.com/data')\nresponse.raise_for_status()\ndata = response.json()\n\nprint(data)",
+    "language": "python"
+  },
+  {
+    "description": "Make an HTTP POST request with JSON body",
+    "code": "import requests\n\npayload = {'key': 'value', 'name': 'test'}\nresponse = requests.post('https://api.example.com/submit', json=payload)\nresponse.raise_for_status()\nresult = response.json()\n\nprint(result)",
+    "language": "python"
+  },
+  {
+    "description": "Download a file from a URL",
+    "code": "import requests\n\nurl = 'https://example.com/file.zip'\nresponse = requests.get(url, stream=True)\n\nwith open('downloaded.zip', 'wb') as f:\n    for chunk in response.iter_content(chunk_size=8192):\n        f.write(chunk)",
+    "language": "python"
+  },
+  {
+    "description": "Connect to a SQLite database and query data",
+    "code": "import sqlite3\n\nconn = sqlite3.connect('database.db')\ncursor = conn.cursor()\n\ncursor.execute('SELECT * FROM users WHERE age > ?', (25,))\nrows = cursor.fetchall()\n\nfor row in rows:\n    print(row)\n\nconn.close()",
+    "language": "python"
+  },
+  {
+    "description": "Create a SQLite table and insert data",
+    "code": "import sqlite3\n\nconn = sqlite3.connect('database.db')\ncursor = conn.cursor()\n\ncursor.execute('''\n    CREATE TABLE IF NOT EXISTS users (\n        id INTEGER PRIMARY KEY,\n        name TEXT NOT NULL,\n        age INTEGER\n    )\n''')\n\ncursor.execute('INSERT INTO users (name, age) VALUES (?, ?)', ('Alice', 30))\nconn.commit()\nconn.close()",
+    "language": "python"
+  },
+  {
+    "description": "Sort a list of dictionaries by a key",
+    "code": "data = [{'name': 'Charlie', 'age': 35}, {'name': 'Alice', 'age': 30}, {'name': 'Bob', 'age': 25}]\n\nsorted_data = sorted(data, key=lambda x: x['age'])\n\nfor item in sorted_data:\n    print(item)",
+    "language": "python"
+  },
+  {
+    "description": "Filter a list using a condition",
+    "code": "numbers = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]\n\nevens = [n for n in numbers if n % 2 == 0]\nodd_greater_than_5 = [n for n in numbers if n % 2 != 0 and n > 5]\n\nprint('Evens:', evens)\nprint('Odd > 5:', odd_greater_than_5)",
+    "language": "python"
+  },
+  {
+    "description": "Count word frequency in a text",
+    "code": "from collections import Counter\n\ntext = 'the cat sat on the mat the cat'\nwords = text.lower().split()\ncounts = Counter(words)\n\nfor word, count in counts.most_common():\n    print(f'{word}: {count}')",
+    "language": "python"
+  },
+  {
+    "description": "Create a simple Flask web server with routes",
+    "code": "from flask import Flask, jsonify, request\n\napp = Flask(__name__)\n\n@app.route('/')\ndef index():\n    return jsonify({'message': 'Hello, World!'})\n\n@app.route('/greet/<name>')\ndef greet(name):\n    return jsonify({'greeting': f'Hello, {name}!'})\n\nif __name__ == '__main__':\n    app.run(debug=True)",
+    "language": "python"
+  },
+  {
+    "description": "Create a FastAPI server with POST endpoint",
+    "code": "from fastapi import FastAPI\nfrom pydantic import BaseModel\n\napp = FastAPI()\n\nclass Item(BaseModel):\n    name: str\n    price: float\n\n@app.post('/items')\nasync def create_item(item: Item):\n    return {'name': item.name, 'price': item.price, 'status': 'created'}",
+    "language": "python"
+  },
+  {
+    "description": "Hash a password securely with bcrypt",
+    "code": "import bcrypt\n\npassword = 'my_secret_password'.encode('utf-8')\nsalt = bcrypt.gensalt()\nhashed = bcrypt.hashpw(password, salt)\n\n# Verify\nis_valid = bcrypt.checkpw(password, hashed)\nprint('Valid:', is_valid)",
+    "language": "python"
+  },
+  {
+    "description": "Generate a JWT token for authentication",
+    "code": "import jwt\nimport datetime\n\nsecret = 'your-secret-key'\npayload = {\n    'user_id': 123,\n    'exp': datetime.datetime.utcnow() + datetime.timedelta(hours=1)\n}\n\ntoken = jwt.encode(payload, secret, algorithm='HS256')\ndecoded = jwt.decode(token, secret, algorithms=['HS256'])\n\nprint('Token:', token)\nprint('Decoded:', decoded)",
+    "language": "python"
+  },
+  {
+    "description": "Send an email using SMTP",
+    "code": "import smtplib\nfrom email.mime.text import MIMEText\n\nmsg = MIMEText('Hello, this is a test email.')\nmsg['Subject'] = 'Test Email'\nmsg['From'] = 'sender@example.com'\nmsg['To'] = 'recipient@example.com'\n\nwith smtplib.SMTP('smtp.example.com', 587) as server:\n    server.starttls()\n    server.login('sender@example.com', 'password')\n    server.send_message(msg)",
+    "language": "python"
+  },
+  {
+    "description": "Parse command line arguments",
+    "code": "import argparse\n\nparser = argparse.ArgumentParser(description='Process some data')\nparser.add_argument('input', help='Input file path')\nparser.add_argument('--output', '-o', default='result.txt', help='Output file')\nparser.add_argument('--verbose', '-v', action='store_true', help='Verbose output')\n\nargs = parser.parse_args()\nprint(f'Input: {args.input}, Output: {args.output}, Verbose: {args.verbose}')",
+    "language": "python"
+  },
+  {
+    "description": "Run tasks concurrently with asyncio",
+    "code": "import asyncio\n\nasync def fetch_data(url):\n    print(f'Fetching {url}...')\n    await asyncio.sleep(1)  # simulate network call\n    return f'Data from {url}'\n\nasync def main():\n    urls = ['https://api1.com', 'https://api2.com', 'https://api3.com']\n    results = await asyncio.gather(*[fetch_data(url) for url in urls])\n    for r in results:\n        print(r)\n\nasyncio.run(main())",
+    "language": "python"
+  },
+  {
+    "description": "Create a decorator that logs function calls",
+    "code": "import functools\nimport time\n\ndef log_calls(func):\n    @functools.wraps(func)\n    def wrapper(*args, **kwargs):\n        start = time.time()\n        print(f'Calling {func.__name__}({args}, {kwargs})')\n        result = func(*args, **kwargs)\n        elapsed = time.time() - start\n        print(f'{func.__name__} returned {result} in {elapsed:.3f}s')\n        return result\n    return wrapper\n\n@log_calls\ndef add(a, b):\n    return a + b\n\nadd(3, 4)",
+    "language": "python"
+  },
+  {
+    "description": "Implement a retry decorator with exponential backoff",
+    "code": "import functools\nimport time\nimport random\n\ndef retry(max_attempts=3, base_delay=1.0):\n    def decorator(func):\n        @functools.wraps(func)\n        def wrapper(*args, **kwargs):\n            for attempt in range(max_attempts):\n                try:\n                    return func(*args, **kwargs)\n                except Exception as e:\n                    if attempt == max_attempts - 1:\n                        raise\n                    delay = base_delay * (2 ** attempt) + random.random()\n                    print(f'Retry {attempt + 1}/{max_attempts} after {delay:.1f}s: {e}')\n                    time.sleep(delay)\n        return wrapper\n    return decorator",
+    "language": "python"
+  },
+  {
+    "description": "Create a context manager for timing code blocks",
+    "code": "import time\nfrom contextlib import contextmanager\n\n@contextmanager\ndef timer(label='Block'):\n    start = time.perf_counter()\n    yield\n    elapsed = time.perf_counter() - start\n    print(f'{label}: {elapsed:.4f}s')\n\nwith timer('Data processing'):\n    total = sum(range(1_000_000))",
+    "language": "python"
+  },
+  {
+    "description": "Binary search implementation",
+    "code": "def binary_search(arr, target):\n    left, right = 0, len(arr) - 1\n    while left <= right:\n        mid = (left + right) // 2\n        if arr[mid] == target:\n            return mid\n        elif arr[mid] < target:\n            left = mid + 1\n        else:\n            right = mid - 1\n    return -1\n\nnumbers = [1, 3, 5, 7, 9, 11, 13]\nprint(binary_search(numbers, 7))  # 3",
+    "language": "python"
+  },
+  {
+    "description": "Implement a LRU cache from scratch",
+    "code": "from collections import OrderedDict\n\nclass LRUCache:\n    def __init__(self, capacity):\n        self.cache = OrderedDict()\n        self.capacity = capacity\n\n    def get(self, key):\n        if key in self.cache:\n            self.cache.move_to_end(key)\n            return self.cache[key]\n        return -1\n\n    def put(self, key, value):\n        if key in self.cache:\n            self.cache.move_to_end(key)\n        self.cache[key] = value\n        if len(self.cache) > self.capacity:\n            self.cache.popitem(last=False)",
+    "language": "python"
+  },
+  {
+    "description": "Read environment variables with defaults",
+    "code": "import os\nfrom dotenv import load_dotenv\n\nload_dotenv()\n\ndb_host = os.getenv('DB_HOST', 'localhost')\ndb_port = int(os.getenv('DB_PORT', '5432'))\napi_key = os.getenv('API_KEY')\n\nif not api_key:\n    raise ValueError('API_KEY environment variable is required')\n\nprint(f'Connecting to {db_host}:{db_port}')",
+    "language": "python"
+  },
+  {
+    "description": "Validate data with Pydantic model",
+    "code": "from pydantic import BaseModel, validator, EmailStr\nfrom typing import Optional\n\nclass User(BaseModel):\n    name: str\n    email: EmailStr\n    age: int\n    bio: Optional[str] = None\n\n    @validator('age')\n    def age_must_be_positive(cls, v):\n        if v < 0 or v > 150:\n            raise ValueError('age must be between 0 and 150')\n        return v\n\nuser = User(name='Alice', email='alice@example.com', age=30)\nprint(user.dict())",
+    "language": "python"
+  },
+  {
+    "description": "Process files in a directory recursively",
+    "code": "from pathlib import Path\n\ndef process_directory(root, pattern='*.txt'):\n    root = Path(root)\n    for filepath in root.rglob(pattern):\n        size = filepath.stat().st_size\n        print(f'{filepath.relative_to(root)}: {size} bytes')\n\nprocess_directory('/path/to/directory', '*.py')",
+    "language": "python"
+  },
+  {
+    "description": "Create a simple TCP socket server",
+    "code": "import socket\n\ndef start_server(host='localhost', port=8080):\n    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:\n        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)\n        s.bind((host, port))\n        s.listen(5)\n        print(f'Server listening on {host}:{port}')\n        while True:\n            conn, addr = s.accept()\n            with conn:\n                data = conn.recv(1024)\n                print(f'Received from {addr}: {data.decode()}')\n                conn.sendall(b'OK')\n\nstart_server()",
+    "language": "python"
+  },
+  {
+    "description": "Implement a simple pub/sub event system",
+    "code": "from collections import defaultdict\nfrom typing import Callable\n\nclass EventBus:\n    def __init__(self):\n        self._subscribers = defaultdict(list)\n\n    def subscribe(self, event: str, callback: Callable):\n        self._subscribers[event].append(callback)\n\n    def publish(self, event: str, **data):\n        for callback in self._subscribers[event]:\n            callback(**data)\n\nbus = EventBus()\nbus.subscribe('user_created', lambda name, **_: print(f'Welcome, {name}!'))\nbus.subscribe('user_created', lambda name, **_: print(f'Sending email to {name}'))\nbus.publish('user_created', name='Alice')",
+    "language": "python"
+  },
+  {
+    "description": "Create a rate limiter using token bucket algorithm",
+    "code": "import time\nimport threading\n\nclass RateLimiter:\n    def __init__(self, rate, capacity):\n        self.rate = rate\n        self.capacity = capacity\n        self.tokens = capacity\n        self.last_refill = time.monotonic()\n        self.lock = threading.Lock()\n\n    def acquire(self):\n        with self.lock:\n            now = time.monotonic()\n            elapsed = now - self.last_refill\n            self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)\n            self.last_refill = now\n            if self.tokens >= 1:\n                self.tokens -= 1\n                return True\n            return False\n\nlimiter = RateLimiter(rate=5, capacity=10)  # 5 req/sec, burst of 10",
+    "language": "python"
+  }
+]

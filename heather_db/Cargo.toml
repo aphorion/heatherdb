@@ -1,0 +1,41 @@
+[package]
+name = "heather_db"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+heed = "0.20"
+rand = "0.8"
+rand_distr = "0.4"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+bincode = "1"
+rayon = "1"
+
+[dev-dependencies]
+tempfile = "3"
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "write_throughput"
+harness = false
+
+[[bench]]
+name = "read_latency"
+harness = false
+
+[[bench]]
+name = "multi_collection"
+harness = false
+
+[[bench]]
+name = "persistence"
+harness = false
+
+[[bench]]
+name = "store_ops"
+harness = false
+
+[[bench]]
+name = "capacity"
+harness = false

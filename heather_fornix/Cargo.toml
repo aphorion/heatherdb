@@ -1,0 +1,15 @@
+[package]
+name = "heather_fornix"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "heather-fornix"
+path = "src/main.rs"
+
+[dependencies]
+heather_db = { path = "../heather_db" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"

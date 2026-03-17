@@ -1,0 +1,113 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  body {
+    @apply bg-film-black text-cream antialiased overflow-x-hidden;
+    font-family: 'Crimson Pro', Georgia, serif;
+  }
+
+  ::selection {
+    background: rgba(232, 179, 75, 0.3);
+    color: #ede8df;
+  }
+
+  ::-webkit-scrollbar { width: 5px; height: 5px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: rgba(232, 179, 75, 0.15); border-radius: 999px; }
+  ::-webkit-scrollbar-thumb:hover { background: rgba(232, 179, 75, 0.3); }
+}
+
+/* Film grain overlay */
+.film-grain::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
+  opacity: 0.03;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+}
+
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+@layer utilities {
+  .animate-fade-in {
+    animation: fadeIn 0.7s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+  }
+  .animate-slide-up {
+    animation: slideUp 0.8s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+    opacity: 0;
+  }
+  .animate-slide-right {
+    animation: slideRight 0.6s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+    opacity: 0;
+  }
+  .animate-zoom-slow {
+    animation: zoomSlow 30s ease-in-out infinite alternate;
+  }
+  .animate-flicker {
+    animation: flicker 4s ease-in-out infinite;
+  }
+
+  .delay-75 { animation-delay: 75ms; }
+  .delay-150 { animation-delay: 150ms; }
+  .delay-200 { animation-delay: 200ms; }
+  .delay-300 { animation-delay: 300ms; }
+  .delay-500 { animation-delay: 500ms; }
+  .delay-700 { animation-delay: 700ms; }
+  .delay-1000 { animation-delay: 1000ms; }
+
+  .text-glow-gold {
+    text-shadow: 0 0 60px rgba(232, 179, 75, 0.15), 0 0 120px rgba(232, 179, 75, 0.05);
+  }
+
+  .border-warm {
+    border-color: rgba(237, 232, 223, 0.06);
+  }
+
+  .bg-warm-gradient {
+    background: linear-gradient(135deg, rgba(232, 179, 75, 0.04) 0%, transparent 50%);
+  }
+
+  .poster-shadow {
+    box-shadow:
+      0 8px 30px rgba(0,0,0,0.4),
+      0 2px 8px rgba(0,0,0,0.3),
+      inset 0 1px 0 rgba(255,255,255,0.03);
+  }
+
+  .card-warm {
+    @apply bg-film-card border border-warm rounded-2xl;
+    background: linear-gradient(180deg, rgba(44,40,37,0.8) 0%, rgba(34,31,28,1) 100%);
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes slideUp {
+  from { opacity: 0; transform: translateY(28px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+@keyframes slideRight {
+  from { opacity: 0; transform: translateX(-20px); }
+  to { opacity: 1; transform: translateX(0); }
+}
+@keyframes zoomSlow {
+  from { transform: scale(1.0); }
+  to { transform: scale(1.1); }
+}
+@keyframes flicker {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.85; }
+}
+
+@layer components {
+  .label {
+    @apply text-[10px] font-display font-semibold uppercase tracking-[0.2em] text-cream-muted;
+  }
+}

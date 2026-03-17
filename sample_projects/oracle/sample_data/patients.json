@@ -1,0 +1,143 @@
+{
+  "conditions": {
+    "flu": {
+      "description": "Influenza — viral respiratory infection",
+      "typical_profile": {
+        "fever": 0.8, "fatigue": 0.7, "chills": 0.8, "malaise": 0.6,
+        "headache": 0.5, "cough": 0.7, "sore_throat": 0.5, "runny_nose": 0.4,
+        "muscle_ache": 0.8, "appetite_loss": 0.5
+      }
+    },
+    "meningitis": {
+      "description": "Bacterial meningitis — inflammation of brain membranes",
+      "typical_profile": {
+        "fever": 1.0, "headache": 0.9, "stiff_neck": 1.0,
+        "light_sensitivity": 0.8, "nausea": 0.7, "vomiting": 0.6,
+        "confusion": 0.7, "fatigue": 0.6, "rash": 0.4, "seizures": 0.3
+      }
+    },
+    "diabetes_type2": {
+      "description": "Type 2 Diabetes — insulin resistance",
+      "typical_profile": {
+        "excessive_thirst": 0.9, "frequent_urination": 0.9,
+        "excessive_hunger": 0.7, "fatigue": 0.6, "blurred_vision": 0.5,
+        "weight_loss": 0.4, "numbness": 0.4, "dry_skin": 0.3,
+        "slow_healing": 0.3, "irritability": 0.3
+      }
+    },
+    "pneumonia": {
+      "description": "Bacterial pneumonia — lung infection",
+      "typical_profile": {
+        "fever": 0.9, "cough": 0.9, "shortness_breath": 0.8,
+        "chest_pain": 0.7, "fatigue": 0.7, "chills": 0.6,
+        "bloody_sputum": 0.4, "rapid_heartbeat": 0.5, "nausea": 0.3,
+        "muscle_ache": 0.4
+      }
+    },
+    "rheumatoid_arthritis": {
+      "description": "Rheumatoid arthritis — autoimmune joint disease",
+      "typical_profile": {
+        "joint_pain": 1.0, "stiffness": 0.9, "swelling": 0.8,
+        "fatigue": 0.6, "limited_mobility": 0.7, "weakness": 0.4,
+        "fever": 0.2, "appetite_loss": 0.3, "dry_skin": 0.3,
+        "numbness": 0.3
+      }
+    },
+    "heart_failure": {
+      "description": "Congestive heart failure — reduced cardiac output",
+      "typical_profile": {
+        "shortness_breath": 0.9, "fatigue": 0.8, "swollen_legs": 0.8,
+        "rapid_heartbeat": 0.7, "chest_tightness": 0.6, "wheezing": 0.4,
+        "cough": 0.4, "weight_loss": 0.3, "dizziness": 0.5,
+        "cold_extremities": 0.6, "insomnia": 0.4
+      }
+    },
+    "gastroenteritis": {
+      "description": "Stomach flu — GI tract inflammation",
+      "typical_profile": {
+        "nausea": 0.9, "vomiting": 0.8, "diarrhea": 0.9,
+        "abdominal_pain": 0.7, "fever": 0.5, "chills": 0.4,
+        "fatigue": 0.5, "dehydration": 0.7, "appetite_loss": 0.6,
+        "cramps": 0.6, "headache": 0.3
+      }
+    },
+    "migraine": {
+      "description": "Migraine — severe recurring headache",
+      "typical_profile": {
+        "headache": 1.0, "light_sensitivity": 0.9, "nausea": 0.7,
+        "blurred_vision": 0.6, "dizziness": 0.5, "vomiting": 0.4,
+        "fatigue": 0.5, "irritability": 0.4, "stiff_neck": 0.3,
+        "numbness": 0.2
+      }
+    },
+    "depression": {
+      "description": "Major depressive disorder",
+      "typical_profile": {
+        "depression": 1.0, "fatigue": 0.8, "insomnia": 0.7,
+        "appetite_loss": 0.6, "weight_loss": 0.4, "anxiety": 0.5,
+        "irritability": 0.6, "headache": 0.3, "muscle_ache": 0.3,
+        "weakness": 0.4, "confusion": 0.2
+      }
+    },
+    "urinary_infection": {
+      "description": "Urinary tract infection (UTI)",
+      "typical_profile": {
+        "painful_urination": 0.9, "frequent_urination": 0.8,
+        "abdominal_pain": 0.5, "fever": 0.4, "chills": 0.3,
+        "nausea": 0.3, "back_pain": 0.4, "fatigue": 0.3,
+        "bloody_sputum": 0.1, "malaise": 0.3
+      }
+    }
+  },
+  "patients": [
+    {"symptoms": {"fever": 0.9, "fatigue": 0.8, "chills": 0.7, "muscle_ache": 0.9, "cough": 0.6, "headache": 0.5, "sore_throat": 0.4, "runny_nose": 0.5, "malaise": 0.7}, "condition": "flu"},
+    {"symptoms": {"fever": 0.7, "fatigue": 0.6, "chills": 0.9, "muscle_ache": 0.7, "cough": 0.8, "sore_throat": 0.6, "appetite_loss": 0.5}, "condition": "flu"},
+    {"symptoms": {"fever": 0.8, "chills": 0.8, "muscle_ache": 0.8, "headache": 0.6, "cough": 0.5, "fatigue": 0.7, "runny_nose": 0.3, "sneezing": 0.3}, "condition": "flu"},
+    {"symptoms": {"fever": 0.6, "fatigue": 0.9, "muscle_ache": 0.6, "cough": 0.9, "sore_throat": 0.7, "malaise": 0.5, "headache": 0.4, "appetite_loss": 0.6}, "condition": "flu"},
+    {"symptoms": {"fever": 0.9, "chills": 0.7, "cough": 0.7, "muscle_ache": 0.7, "fatigue": 0.5, "runny_nose": 0.6, "sneezing": 0.4, "headache": 0.3}, "condition": "flu"},
+
+    {"symptoms": {"fever": 1.0, "headache": 0.9, "stiff_neck": 1.0, "light_sensitivity": 0.8, "nausea": 0.6, "confusion": 0.5, "vomiting": 0.5}, "condition": "meningitis"},
+    {"symptoms": {"fever": 0.9, "headache": 1.0, "stiff_neck": 0.9, "light_sensitivity": 0.9, "nausea": 0.7, "confusion": 0.8, "rash": 0.5, "seizures": 0.2}, "condition": "meningitis"},
+    {"symptoms": {"fever": 1.0, "stiff_neck": 0.8, "headache": 0.8, "light_sensitivity": 0.7, "vomiting": 0.7, "confusion": 0.6, "fatigue": 0.7}, "condition": "meningitis"},
+    {"symptoms": {"fever": 0.8, "headache": 0.9, "stiff_neck": 1.0, "nausea": 0.8, "light_sensitivity": 0.6, "seizures": 0.4, "rash": 0.3, "confusion": 0.7}, "condition": "meningitis"},
+
+    {"symptoms": {"excessive_thirst": 0.9, "frequent_urination": 1.0, "excessive_hunger": 0.7, "fatigue": 0.6, "blurred_vision": 0.5, "weight_loss": 0.3}, "condition": "diabetes_type2"},
+    {"symptoms": {"excessive_thirst": 0.8, "frequent_urination": 0.8, "fatigue": 0.7, "blurred_vision": 0.4, "numbness": 0.5, "dry_skin": 0.4, "weight_loss": 0.5}, "condition": "diabetes_type2"},
+    {"symptoms": {"excessive_thirst": 1.0, "frequent_urination": 0.9, "excessive_hunger": 0.8, "fatigue": 0.5, "irritability": 0.4, "blurred_vision": 0.6}, "condition": "diabetes_type2"},
+    {"symptoms": {"frequent_urination": 0.9, "excessive_thirst": 0.7, "fatigue": 0.8, "numbness": 0.6, "dry_skin": 0.5, "blurred_vision": 0.3, "weight_loss": 0.4}, "condition": "diabetes_type2"},
+
+    {"symptoms": {"fever": 0.9, "cough": 1.0, "shortness_breath": 0.8, "chest_pain": 0.7, "fatigue": 0.6, "chills": 0.7, "rapid_heartbeat": 0.4}, "condition": "pneumonia"},
+    {"symptoms": {"cough": 0.8, "fever": 0.8, "shortness_breath": 0.9, "chest_pain": 0.6, "bloody_sputum": 0.5, "chills": 0.5, "fatigue": 0.7, "muscle_ache": 0.3}, "condition": "pneumonia"},
+    {"symptoms": {"fever": 1.0, "cough": 0.9, "shortness_breath": 0.7, "chest_pain": 0.8, "rapid_heartbeat": 0.6, "fatigue": 0.8, "chills": 0.6, "nausea": 0.3}, "condition": "pneumonia"},
+    {"symptoms": {"cough": 0.9, "shortness_breath": 0.8, "fever": 0.7, "bloody_sputum": 0.4, "chest_pain": 0.5, "chills": 0.6, "muscle_ache": 0.5, "fatigue": 0.5}, "condition": "pneumonia"},
+
+    {"symptoms": {"joint_pain": 1.0, "stiffness": 0.9, "swelling": 0.8, "fatigue": 0.5, "limited_mobility": 0.7, "weakness": 0.4}, "condition": "rheumatoid_arthritis"},
+    {"symptoms": {"joint_pain": 0.9, "stiffness": 0.8, "swelling": 0.7, "limited_mobility": 0.8, "fatigue": 0.6, "dry_skin": 0.3, "numbness": 0.3}, "condition": "rheumatoid_arthritis"},
+    {"symptoms": {"joint_pain": 0.8, "swelling": 0.9, "stiffness": 1.0, "weakness": 0.5, "fatigue": 0.7, "limited_mobility": 0.6, "appetite_loss": 0.3}, "condition": "rheumatoid_arthritis"},
+    {"symptoms": {"stiffness": 0.9, "joint_pain": 0.9, "swelling": 0.6, "limited_mobility": 0.7, "fatigue": 0.5, "fever": 0.2, "weakness": 0.6}, "condition": "rheumatoid_arthritis"},
+
+    {"symptoms": {"shortness_breath": 0.9, "fatigue": 0.8, "swollen_legs": 0.8, "rapid_heartbeat": 0.7, "chest_tightness": 0.6, "dizziness": 0.5, "cold_extremities": 0.5}, "condition": "heart_failure"},
+    {"symptoms": {"shortness_breath": 0.8, "swollen_legs": 0.9, "fatigue": 0.7, "rapid_heartbeat": 0.6, "wheezing": 0.5, "cough": 0.4, "insomnia": 0.4, "cold_extremities": 0.6}, "condition": "heart_failure"},
+    {"symptoms": {"fatigue": 0.9, "shortness_breath": 1.0, "swollen_legs": 0.7, "chest_tightness": 0.7, "rapid_heartbeat": 0.8, "dizziness": 0.6, "cold_extremities": 0.7}, "condition": "heart_failure"},
+    {"symptoms": {"swollen_legs": 0.8, "shortness_breath": 0.7, "fatigue": 0.8, "dizziness": 0.4, "wheezing": 0.4, "chest_tightness": 0.5, "rapid_heartbeat": 0.5, "weight_loss": 0.3}, "condition": "heart_failure"},
+
+    {"symptoms": {"nausea": 0.9, "vomiting": 0.8, "diarrhea": 1.0, "abdominal_pain": 0.7, "fever": 0.5, "dehydration": 0.7, "cramps": 0.6, "appetite_loss": 0.6}, "condition": "gastroenteritis"},
+    {"symptoms": {"diarrhea": 0.8, "nausea": 0.8, "vomiting": 0.9, "abdominal_pain": 0.8, "cramps": 0.7, "dehydration": 0.6, "fever": 0.4, "fatigue": 0.5}, "condition": "gastroenteritis"},
+    {"symptoms": {"vomiting": 0.7, "diarrhea": 0.9, "nausea": 0.7, "dehydration": 0.8, "abdominal_pain": 0.6, "appetite_loss": 0.7, "chills": 0.3, "headache": 0.3}, "condition": "gastroenteritis"},
+    {"symptoms": {"nausea": 1.0, "diarrhea": 0.8, "vomiting": 0.6, "cramps": 0.8, "abdominal_pain": 0.9, "fever": 0.6, "dehydration": 0.5, "fatigue": 0.6}, "condition": "gastroenteritis"},
+
+    {"symptoms": {"headache": 1.0, "light_sensitivity": 0.9, "nausea": 0.7, "blurred_vision": 0.6, "dizziness": 0.5, "vomiting": 0.4, "fatigue": 0.5}, "condition": "migraine"},
+    {"symptoms": {"headache": 0.9, "light_sensitivity": 0.8, "nausea": 0.8, "dizziness": 0.6, "blurred_vision": 0.5, "irritability": 0.5, "stiff_neck": 0.3}, "condition": "migraine"},
+    {"symptoms": {"headache": 1.0, "light_sensitivity": 1.0, "vomiting": 0.6, "nausea": 0.6, "blurred_vision": 0.7, "fatigue": 0.6, "numbness": 0.3}, "condition": "migraine"},
+    {"symptoms": {"headache": 0.8, "light_sensitivity": 0.7, "nausea": 0.9, "dizziness": 0.7, "stiff_neck": 0.4, "irritability": 0.4, "fatigue": 0.4}, "condition": "migraine"},
+
+    {"symptoms": {"depression": 1.0, "fatigue": 0.8, "insomnia": 0.7, "appetite_loss": 0.6, "anxiety": 0.5, "irritability": 0.6, "weakness": 0.4, "headache": 0.3}, "condition": "depression"},
+    {"symptoms": {"depression": 0.9, "insomnia": 0.8, "fatigue": 0.9, "anxiety": 0.6, "irritability": 0.5, "appetite_loss": 0.5, "weight_loss": 0.4}, "condition": "depression"},
+    {"symptoms": {"depression": 0.8, "fatigue": 0.7, "insomnia": 0.6, "irritability": 0.7, "anxiety": 0.7, "weakness": 0.5, "confusion": 0.3, "muscle_ache": 0.3}, "condition": "depression"},
+    {"symptoms": {"depression": 1.0, "insomnia": 0.9, "fatigue": 0.8, "appetite_loss": 0.7, "weight_loss": 0.5, "anxiety": 0.4, "headache": 0.4}, "condition": "depression"},
+
+    {"symptoms": {"painful_urination": 0.9, "frequent_urination": 0.8, "abdominal_pain": 0.5, "fever": 0.4, "back_pain": 0.4, "nausea": 0.3, "fatigue": 0.3}, "condition": "urinary_infection"},
+    {"symptoms": {"painful_urination": 1.0, "frequent_urination": 0.9, "abdominal_pain": 0.6, "fever": 0.3, "chills": 0.3, "malaise": 0.4}, "condition": "urinary_infection"},
+    {"symptoms": {"frequent_urination": 0.8, "painful_urination": 0.8, "back_pain": 0.5, "fever": 0.5, "abdominal_pain": 0.4, "nausea": 0.4, "fatigue": 0.4}, "condition": "urinary_infection"}
+  ]
+}
