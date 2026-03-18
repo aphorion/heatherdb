@@ -34,8 +34,8 @@ pub struct EAMConfig {
     pub t_max: usize,
     /// Convergence threshold
     pub epsilon: f64,
-    /// Max neighbors per location for the navigable graph (default D/4, min 20).
-    /// Sweet spot is D/4 to D/2. Beyond D saturates.
+    /// Neighbor graph toggle. Non-zero enables the navigable graph.
+    /// Actual capacity is computed dynamically as max((k-1)·⌈ln L⌉, 2k).
     /// Set to 0 to disable graph construction.
     pub neighbor_cap: usize,
     /// Number of landmark entry points for graph search (default 32)
@@ -64,6 +64,20 @@ impl EAMConfig {
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Adaptive neighbor capacity: max((k-1)·⌈ln L⌉, 2k).
+    /// (k-1)·⌈ln L⌉ provides the long-range connections for O(log L) navigability.
+    /// 2k floor ensures connectivity even at small L.
+    /// Returns 0 if neighbor_cap is 0 (graph disabled).
+    pub fn adaptive_neighbor_cap(&self, num_locations: usize) -> usize {
+        if self.neighbor_cap == 0 {
+            return 0;
+        }
+        let ln_l = (num_locations.max(1) as f64).ln().ceil() as usize;
+        let long_range = (self.k - 1) * ln_l;
+        let floor = 2 * self.k;
+        long_range.max(floor)
     }
 
     pub fn validate(&self) -> Result<()> {

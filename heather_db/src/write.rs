@@ -103,7 +103,10 @@ pub fn adaptive_write(
     // ── Neighbor graph update ─────────────────────────────────────
     // Each activated location learns about its co-activated peers.
     // Cost: O(k²) — negligible compared to the O(LD) activation step.
-    if config.neighbor_cap > 0 {
+    // Adaptive capacity: max(D, k·ln(L)) — D for local Voronoi coverage,
+    // k·ln(L) for global navigability in O(log L) hops.
+    let nb_cap = config.adaptive_neighbor_cap(locations.len());
+    if nb_cap > 0 {
         // Collect IDs of all activated locations
         let activated_ids: Vec<u64> = indices.iter().map(|&i| locations[i].id.0).collect();
 
@@ -121,8 +124,8 @@ pub fn adaptive_write(
             }
 
             // Prune if over capacity: keep the most recently added (tail)
-            if loc.neighbors.len() > config.neighbor_cap {
-                let excess = loc.neighbors.len() - config.neighbor_cap;
+            if loc.neighbors.len() > nb_cap {
+                let excess = loc.neighbors.len() - nb_cap;
                 loc.neighbors.drain(0..excess);
             }
         }
@@ -144,11 +147,11 @@ pub fn adaptive_write(
         new_loc.counter = input.to_vec();
         new_loc.write_count = 1.0;
         // Novelty child: seed neighbors from the activated set
-        if config.neighbor_cap > 0 {
+        if nb_cap > 0 {
             let activated_ids: Vec<u64> = indices.iter().map(|&i| locations[i].id.0).collect();
             new_loc.neighbors = activated_ids;
-            if new_loc.neighbors.len() > config.neighbor_cap {
-                new_loc.neighbors.truncate(config.neighbor_cap);
+            if new_loc.neighbors.len() > nb_cap {
+                new_loc.neighbors.truncate(nb_cap);
             }
         }
         new_locations.push(new_loc);
@@ -181,7 +184,7 @@ pub fn adaptive_write(
         locations[winner_global].write_count *= 0.5;
 
         // Child inherits parent's neighbors; they become mutual neighbors
-        if config.neighbor_cap > 0 {
+        if nb_cap > 0 {
             let parent_id = locations[winner_global].id.0;
             let child_id = id.0;
             new_loc.neighbors = locations[winner_global].neighbors.clone();
@@ -189,13 +192,13 @@ pub fn adaptive_write(
             if !new_loc.neighbors.contains(&parent_id) {
                 new_loc.neighbors.push(parent_id);
             }
-            if new_loc.neighbors.len() > config.neighbor_cap {
-                new_loc.neighbors.truncate(config.neighbor_cap);
+            if new_loc.neighbors.len() > nb_cap {
+                new_loc.neighbors.truncate(nb_cap);
             }
             // Add child as neighbor of parent
             if !locations[winner_global].neighbors.contains(&child_id) {
                 locations[winner_global].neighbors.push(child_id);
-                if locations[winner_global].neighbors.len() > config.neighbor_cap {
+                if locations[winner_global].neighbors.len() > nb_cap {
                     locations[winner_global].neighbors.drain(0..1);
                 }
             }

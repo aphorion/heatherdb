@@ -85,11 +85,10 @@ pub fn knn_merge(locations: &mut Vec<HardLocation>, config: &EAMConfig) -> Merge
         }
         // Remove the merged location from survivor's neighbor list
         locations[i].neighbors.retain(|&n| n != j_id);
-        // Cap at neighbor_cap
-        if config.neighbor_cap > 0 && locations[i].neighbors.len() > config.neighbor_cap {
-            locations[i]
-                .neighbors
-                .truncate(config.neighbor_cap);
+        // Cap at adaptive neighbor capacity
+        let nb_cap = config.adaptive_neighbor_cap(locations.len());
+        if nb_cap > 0 && locations[i].neighbors.len() > nb_cap {
+            locations[i].neighbors.truncate(nb_cap);
         }
 
         merged[j] = true;

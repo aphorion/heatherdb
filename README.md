@@ -118,7 +118,7 @@ HeatherDB is not a key-value store or a vector search engine. It is an *associat
 
 **Writing (three phases):** When you write a vector, the write cycle runs in three phases. *Select:* activate the k=20 nearest hard locations with conscience-based winner selection. *Update:* accumulate weighted counters and migrate addresses via competitive learning in a single pass. *Regulate:* novelty splits spawn new locations for unseen regions (tau_split=0.3), overload splits distribute saturated locations (tau_overload=100), and local dedup cleans up. The memory self-organizes its own topology — location count is a diagnostic of data complexity, not a tunable parameter.
 
-**Navigable graph search:** Every write produces neighborhood knowledge as a free byproduct. The k activated locations learn who they co-activated with, building a navigable graph that mirrors the data manifold. At query time, instead of comparing against all L locations (O(LD)), the system enters the graph at the nearest landmark and follows neighbor edges via greedy descent — one batched matrix-vector multiply per hop. Query cost: ~17-22 µs at d=128 regardless of collection size, vs linear growth for brute force. The graph isn't bolted on — it's what competitive learning was building all along.
+**Navigable graph search:** Every write produces neighborhood knowledge as a free byproduct. The k activated locations learn who they co-activated with, building a navigable graph that mirrors the data manifold. At query time, instead of comparing against all L locations (O(LD)), the system enters the graph at the nearest landmark and follows neighbor edges via greedy descent — one batched matrix-vector multiply per hop. Query cost: ~17-22 µs at d=128 regardless of collection size, vs linear growth for brute force. Neighbor capacity adapts to the memory: nb_max = max((k-1)·⌈ln L⌉, 2k) — scaling with collection size for O(log L) global navigability. The graph isn't bolted on — it's what competitive learning was building all along.
 
 **Reading:** Given a query vector, graph search finds the k most relevant locations on the learned manifold. An energy-based Hopfield network (beta=5.0 softmax temperature) iteratively reconstructs the best-matching stored pattern from these locations. This creates basins of attraction around stored memories — noisy queries are pulled toward the correct pattern.
 
@@ -340,7 +340,7 @@ All errors return `{ "error": "<message>" }` with an appropriate HTTP status cod
 
 ## Performance
 
-Measured on Apple Silicon (M-series). Config: l_0=1000, k=20, neighbor_cap=D/4, 32 landmarks.
+Measured on Apple Silicon (M-series). Config: l_0=1000, k=20, neighbor_cap=max((k-1)·⌈ln L⌉, 2k), 32 landmarks.
 
 ### Throughput
 
