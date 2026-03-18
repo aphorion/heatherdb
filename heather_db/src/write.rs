@@ -27,12 +27,14 @@ pub fn adaptive_write(
     eta: f64,
     next_id: &mut u64,
     rng: &mut impl Rng,
+    landmarks: &[usize],
+    id_lookup: &[u32],
 ) -> WriteResult {
     let k = config.k.min(locations.len());
 
     // ── Phase 1: Select ─────────────────────────────────────────────
-    // k-nearest by cosine similarity, activation weights, conscience winner.
-    let (indices, sims) = read::activate(input, locations, k);
+    // k-nearest via graph search (falls back to SoA/brute force when graph is young).
+    let (indices, sims) = read::activate_auto(input, locations, k, landmarks, id_lookup);
 
     if indices.is_empty() {
         return WriteResult {
@@ -278,7 +280,7 @@ mod tests {
         let mut next_id = 3u64;
         let mut rng = rand::thread_rng();
 
-        let result = adaptive_write(&input, &mut locations, &config, 0.01, &mut next_id, &mut rng);
+        let result = adaptive_write(&input, &mut locations, &config, 0.01, &mut next_id, &mut rng, &[], &[]);
         assert!(!result.modified_indices.is_empty());
         // Location 0 should have received the most weight
         assert!(locations[0].write_count > locations[1].write_count);
@@ -295,7 +297,7 @@ mod tests {
         let mut next_id = 1u64;
         let mut rng = rand::thread_rng();
 
-        let result = adaptive_write(&input, &mut locations, &mut config, 0.01, &mut next_id, &mut rng);
+        let result = adaptive_write(&input, &mut locations, &mut config, 0.01, &mut next_id, &mut rng, &[], &[]);
         // Should have created at least one new location (novelty split)
         assert!(!result.new_locations.is_empty());
     }

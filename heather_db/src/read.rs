@@ -54,18 +54,22 @@ pub fn activate(
 ) -> (Vec<usize>, Vec<f64>) {
     let work = locations.len() * query.len();
 
+    // Normalize query once — all addresses are unit vectors,
+    // so dot product = cosine similarity. Saves 2D FLOPs per location.
+    let q = vec_ops::normalize(query);
+
     // Compute all similarities — parallel or sequential based on work size
     let sims: Vec<(usize, f64)> = if work >= PARALLEL_THRESHOLD {
         locations
             .par_iter()
             .enumerate()
-            .map(|(i, loc)| (i, vec_ops::cosine_similarity(query, &loc.address)))
+            .map(|(i, loc)| (i, vec_ops::dot(&q, &loc.address)))
             .collect()
     } else {
         locations
             .iter()
             .enumerate()
-            .map(|(i, loc)| (i, vec_ops::cosine_similarity(query, &loc.address)))
+            .map(|(i, loc)| (i, vec_ops::dot(&q, &loc.address)))
             .collect()
     };
 
@@ -92,6 +96,60 @@ pub fn activate(
     let indices: Vec<usize> = entries.iter().map(|(i, _)| *i).collect();
     let similarities: Vec<f64> = entries.iter().map(|(_, s)| *s).collect();
     (indices, similarities)
+}
+
+/// Struct-of-arrays activation: query against a contiguous [L × D] address matrix.
+/// Normalizes query once, computes all similarities via batch dot product on
+/// contiguous memory, then top-k selection. Cache-friendly — no pointer chasing.
+pub fn activate_soa(
+    query: &[f64],
+    address_matrix: &[f64],
+    d: usize,
+    k: usize,
+) -> (Vec<usize>, Vec<f64>) {
+    let q = vec_ops::normalize(query);
+    let all_sims = vec_ops::batch_dot_unit(&q, address_matrix, d);
+
+    let mut heap: BinaryHeap<MinEntry> = BinaryHeap::with_capacity(k + 1);
+    for (i, sim) in all_sims.into_iter().enumerate() {
+        if heap.len() < k {
+            heap.push(MinEntry { index: i, similarity: sim });
+        } else if let Some(min) = heap.peek() {
+            if sim > min.similarity {
+                heap.pop();
+                heap.push(MinEntry { index: i, similarity: sim });
+            }
+        }
+    }
+
+    let mut entries: Vec<(usize, f64)> = heap
+        .into_iter()
+        .map(|e| (e.index, e.similarity))
+        .collect();
+    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+    let indices = entries.iter().map(|(i, _)| *i).collect();
+    let similarities = entries.iter().map(|(_, s)| *s).collect();
+    (indices, similarities)
+}
+
+/// Auto-select best activation method: graph → SoA brute-force → scattered brute-force.
+pub fn activate_auto_full(
+    query: &[f64],
+    locations: &[HardLocation],
+    k: usize,
+    landmarks: &[usize],
+    id_lookup: &[u32],
+    address_matrix: &[f64],
+    d: usize,
+) -> (Vec<usize>, Vec<f64>) {
+    if is_graph_ready(locations, k) && !landmarks.is_empty() {
+        graph_activate(query, locations, k, landmarks, id_lookup)
+    } else if !address_matrix.is_empty() {
+        activate_soa(query, address_matrix, d, k)
+    } else {
+        activate(query, locations, k)
+    }
 }
 
 /// Select landmark locations: the most-written-to locations, spread across the space.

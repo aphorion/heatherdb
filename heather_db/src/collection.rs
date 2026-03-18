@@ -47,18 +47,45 @@ pub(crate) struct EAMInner {
     pub(crate) landmarks: Vec<usize>,
     /// Flat LocationId → index lookup array for O(1) graph traversal
     pub(crate) id_lookup: Vec<u32>,
+    /// Contiguous [L × D] address matrix for cache-friendly brute-force activation.
+    /// Row i = locations[i].address. Updated incrementally on writes.
+    pub(crate) address_matrix: Vec<f64>,
 }
 
 impl EAMInner {
-    /// Full rebuild of landmarks + id_lookup. Use after merge/load_snapshot.
+    /// Full rebuild of landmarks + id_lookup + address_matrix.
     pub(crate) fn rebuild_graph_cache(&mut self) {
         self.id_lookup = read::build_id_lookup(&self.locations);
         self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
+        self.rebuild_address_matrix();
+    }
+
+    /// Rebuild address matrix from locations.
+    pub(crate) fn rebuild_address_matrix(&mut self) {
+        let d = self.config.d;
+        self.address_matrix = Vec::with_capacity(self.locations.len() * d);
+        for loc in &self.locations {
+            self.address_matrix.extend_from_slice(&loc.address);
+        }
+    }
+
+    /// Sync specific rows of the address matrix after address migration.
+    pub(crate) fn sync_addresses(&mut self, indices: &[usize]) {
+        let d = self.config.d;
+        for &idx in indices {
+            let start = idx * d;
+            self.address_matrix[start..start + d].copy_from_slice(&self.locations[idx].address);
+        }
+    }
+
+    /// Append addresses for newly added locations.
+    pub(crate) fn append_addresses(&mut self, start_idx: usize) {
+        for i in start_idx..self.locations.len() {
+            self.address_matrix.extend_from_slice(&self.locations[i].address);
+        }
     }
 
     /// Incremental update after appending new locations.
-    /// O(new_count) instead of O(L). Landmarks are not rebuilt —
-    /// existing landmarks are stable enough entry points for graph search.
     pub(crate) fn extend_id_lookup(&mut self, start_idx: usize) {
         for i in start_idx..self.locations.len() {
             let id = self.locations[i].id.0 as usize;
@@ -124,6 +151,11 @@ impl Collection {
 
         let id_lookup = read::build_id_lookup(&locations);
         let landmarks = read::select_landmarks(&locations, config.num_landmarks);
+        let d = config.d;
+        let mut address_matrix = Vec::with_capacity(locations.len() * d);
+        for loc in &locations {
+            address_matrix.extend_from_slice(&loc.address);
+        }
 
         Ok(Collection {
             collection_id,
@@ -136,6 +168,7 @@ impl Collection {
                 doc_next_id: 0,
                 landmarks,
                 id_lookup,
+                address_matrix,
             }),
             store,
         })
@@ -180,6 +213,11 @@ impl Collection {
 
         let id_lookup = read::build_id_lookup(&locations);
         let landmarks = read::select_landmarks(&locations, config.num_landmarks);
+        let d = config.d;
+        let mut address_matrix = Vec::with_capacity(locations.len() * d);
+        for loc in &locations {
+            address_matrix.extend_from_slice(&loc.address);
+        }
 
         Ok(Collection {
             collection_id,
@@ -192,6 +230,7 @@ impl Collection {
                 doc_next_id,
                 landmarks,
                 id_lookup,
+                address_matrix,
             }),
             store,
         })
@@ -223,16 +262,22 @@ impl Collection {
         }
 
         let mut rng = rand::thread_rng();
-        let EAMInner {
-            ref config,
-            ref mut locations,
-            ref mut next_id,
-            ref mut eta,
-            ..
-        } = *inner;
-        let result = write::adaptive_write(input, locations, config, *eta, next_id, &mut rng);
-
-        inner.eta = result.eta;
+        let result = {
+            let EAMInner {
+                ref config,
+                ref mut locations,
+                ref mut next_id,
+                ref mut eta,
+                ref landmarks,
+                ref id_lookup,
+                ..
+            } = *inner;
+            let r = write::adaptive_write(
+                input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+            );
+            *eta = r.eta;
+            r
+        };
 
         let new_locs = result.new_locations;
 
@@ -264,11 +309,112 @@ impl Collection {
 
         txn.commit()?;
 
+        // Sync address matrix for migrated locations
+        inner.sync_addresses(&result.modified_indices);
+
         if !new_locs.is_empty() {
             let start = inner.locations.len();
             inner.locations.extend(new_locs);
             inner.extend_id_lookup(start);
+            inner.append_addresses(start);
         }
+
+        Ok(())
+    }
+
+    /// Batch write multiple patterns under a single lock + transaction.
+    pub fn write_batch(&self, inputs: &[impl AsRef<[f64]>]) -> Result<()> {
+        for input in inputs {
+            vec_ops::validate_vector(input.as_ref())?;
+        }
+
+        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+
+        if inner.locations.is_empty() {
+            return Err(HeatherError::EmptyMemory);
+        }
+
+        let d = inner.config.d;
+        for input in inputs {
+            if input.as_ref().len() != d {
+                return Err(HeatherError::DimensionMismatch {
+                    expected: d,
+                    got: input.as_ref().len(),
+                });
+            }
+        }
+
+        let mut rng = rand::thread_rng();
+        let mut all_modified = std::collections::HashSet::new();
+        let mut all_new_locs: Vec<HardLocation> = Vec::new();
+
+        for input in inputs {
+            let input = input.as_ref();
+            let result = {
+                let EAMInner {
+                    ref config,
+                    ref mut locations,
+                    ref mut next_id,
+                    ref mut eta,
+                    ref landmarks,
+                    ref id_lookup,
+                    ..
+                } = *inner;
+                let r = write::adaptive_write(
+                    input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                );
+                *eta = r.eta;
+                r
+            };
+
+            // Sync addresses for migrated locations immediately
+            inner.sync_addresses(&result.modified_indices);
+            for &idx in &result.modified_indices {
+                all_modified.insert(idx);
+            }
+
+            // Append new locations so subsequent writes see them
+            if !result.new_locations.is_empty() {
+                let start = inner.locations.len();
+                let new_locs = result.new_locations;
+                for loc in &new_locs {
+                    all_new_locs.push(loc.clone());
+                }
+                inner.locations.extend(new_locs);
+                inner.extend_id_lookup(start);
+                inner.append_addresses(start);
+            }
+        }
+
+        // Persist everything in a single atomic transaction
+        let mut txn = self.store.write_txn()?;
+
+        for &idx in &all_modified {
+            if idx < inner.locations.len() {
+                self.store
+                    .put_location(&mut txn, self.collection_id, &inner.locations[idx])?;
+            }
+        }
+
+        for loc in &all_new_locs {
+            self.store
+                .put_location(&mut txn, self.collection_id, loc)?;
+        }
+
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "next_id",
+            &bincode::serialize(&inner.next_id)?,
+        )?;
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "eta",
+            &bincode::serialize(&inner.eta)?,
+        )?;
+
+        txn.commit()?;
 
         Ok(())
     }
@@ -292,12 +438,14 @@ impl Collection {
         }
 
         let k = inner.config.k.min(inner.locations.len());
-        let (indices, _sims) = read::activate_auto(
+        let (indices, _sims) = read::activate_auto_full(
             query,
             &inner.locations,
             k,
             &inner.landmarks,
             &inner.id_lookup,
+            &inner.address_matrix,
+            inner.config.d,
         );
 
         match strategy {
@@ -417,15 +565,22 @@ impl Collection {
 
         // Run adaptive write (same as write())
         let mut rng = rand::thread_rng();
-        let EAMInner {
-            ref config,
-            ref mut locations,
-            ref mut next_id,
-            ref mut eta,
-            ..
-        } = *inner;
-        let result = write::adaptive_write(input, locations, config, *eta, next_id, &mut rng);
-        inner.eta = result.eta;
+        let result = {
+            let EAMInner {
+                ref config,
+                ref mut locations,
+                ref mut next_id,
+                ref mut eta,
+                ref landmarks,
+                ref id_lookup,
+                ..
+            } = *inner;
+            let r = write::adaptive_write(
+                input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+            );
+            *eta = r.eta;
+            r
+        };
 
         // Capture activated location IDs before extending
         let activated_loc_ids: Vec<u64> = result
@@ -486,10 +641,14 @@ impl Collection {
 
         txn.commit()?;
 
+        // Sync address matrix for migrated locations
+        inner.sync_addresses(&result.modified_indices);
+
         if !new_locs.is_empty() {
             let start = inner.locations.len();
             inner.locations.extend(new_locs);
             inner.extend_id_lookup(start);
+            inner.append_addresses(start);
         }
 
         Ok(doc_id)
@@ -539,12 +698,14 @@ impl Collection {
 
         // Step 1: Activate query against hard locations (graph-accelerated when ready)
         let k = inner.config.k.min(inner.locations.len());
-        let (indices, _sims) = read::activate_auto(
+        let (indices, _sims) = read::activate_auto_full(
             query,
             &inner.locations,
             k,
             &inner.landmarks,
             &inner.id_lookup,
+            &inner.address_matrix,
+            inner.config.d,
         );
 
         // Step 2: Gather candidate doc IDs from posting lists (deduplicated)
@@ -766,12 +927,14 @@ impl Collection {
         }
 
         let k = inner.config.k.min(inner.locations.len());
-        let (indices, sims) = read::activate_auto(
+        let (indices, sims) = read::activate_auto_full(
             query,
             &inner.locations,
             k,
             &inner.landmarks,
             &inner.id_lookup,
+            &inner.address_matrix,
+            inner.config.d,
         );
 
         match strategy {

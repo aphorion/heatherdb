@@ -340,17 +340,30 @@ All errors return `{ "error": "<message>" }` with an appropriate HTTP status cod
 
 ## Performance
 
-Measured on Apple Silicon (M-series). Config: l_0=1000, k=20, neighbor_cap=40, 32 landmarks.
+Measured on Apple Silicon (M-series). Config: l_0=1000, k=20, neighbor_cap=D/4, 32 landmarks.
 
 ### Throughput
 
 | Operation | d=64 | d=128 | d=384 |
 |---|---|---|---|
-| Single write | 4.2 ms | 3.9 ms | 4.6 ms |
-| Warmed write (post-200) | — | 4.9 ms | 5.5 ms |
+| Single write | 3.3 ms | 3.7 ms | 4.1 ms |
+| Warmed write (post-200) | — | 4.6 ms | 4.8 ms |
 | Single read (iterative) | 18 µs | 43 µs | 153 µs |
 | Single read (single-step) | — | 20 µs | — |
 | Reads/sec (sustained) | 19,418 | 9,336 | 3,473 |
+
+### Batch writes
+
+Writes use graph-activated search (same graph as reads), dot-product-only similarity (addresses are unit-normalized), and struct-of-arrays address layout for cache-friendly brute-force fallback. Batch writes amortize lock acquisition and LMDB persistence into a single transaction.
+
+| Batch size | Individual writes | Batch write | Speedup | Per-write cost |
+|---|---|---|---|---|
+| 10 | 39.4 ms | **6.8 ms** | **5.8x** | 0.68 ms |
+| 50 | 192.9 ms | **11.4 ms** | **16.9x** | 0.23 ms |
+| 100 | 390.3 ms | **11.6 ms** | **33.7x** | 0.12 ms |
+| 500 | 2,460 ms | **31.7 ms** | **77.6x** | 0.06 ms |
+
+At batch=500, per-write cost drops to 63 microseconds. The LMDB transaction overhead (~3ms per individual write) is amortized across the entire batch.
 
 ### Graph search vs. brute force
 
@@ -388,9 +401,9 @@ Across dimensions (5000 writes):
 ### Capacity stress test
 
 ```
-d=64:  1002 locs, 1.0 MB,  ~4.2 ms/write, 19,418 reads/sec
-d=128: 2284 locs, 4.5 MB,  ~4.3 ms/write,  9,336 reads/sec
-d=384: 3000 locs, 17.6 MB, ~4.7 ms/write,  3,473 reads/sec
+d=64:  1002 locs, 1.0 MB,  ~3.3 ms/write, 19,418 reads/sec
+d=128: 2284 locs, 4.5 MB,  ~3.7 ms/write,  9,336 reads/sec
+d=384: 3000 locs, 17.6 MB, ~4.1 ms/write,  3,473 reads/sec
 ```
 
 Sub-millisecond reads. Single-digit millisecond writes. Megabytes, not gigabytes. Runs on a Raspberry Pi.

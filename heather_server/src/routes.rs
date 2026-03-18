@@ -113,12 +113,8 @@ pub async fn write(
             }
             Ok((ids.len(), Some(ids)))
         } else {
-            let mut count = 0;
-            for vec in &req.vectors {
-                col_clone.write(vec)?;
-                count += 1;
-            }
-            Ok::<_, heather_db::HeatherError>((count, None))
+            col_clone.write_batch(&req.vectors)?;
+            Ok::<_, heather_db::HeatherError>((req.vectors.len(), None))
         }
     })
     .await;
