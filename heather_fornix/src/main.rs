@@ -57,6 +57,7 @@ impl From<ExportedLocation> for HardLocation {
             address: loc.address,
             counter: loc.counter,
             write_count: loc.write_count,
+            neighbors: Vec::new(),
         }
     }
 }

@@ -79,6 +79,21 @@ pub fn validate_vector(v: &[f64]) -> Result<()> {
     Ok(())
 }
 
+/// Batch dot product: unit-normalized query against rows packed contiguously.
+/// Layout: `rows = [row0_d0, row0_d1, ..., row0_dD, row1_d0, ...]`.
+/// All vectors assumed unit-normalized so dot = cosine similarity.
+/// Returns one similarity per row.
+#[inline]
+pub fn batch_dot_unit(query: &[f64], rows: &[f64], d: usize) -> Vec<f64> {
+    let n = rows.len() / d;
+    let mut result = Vec::with_capacity(n);
+    for i in 0..n {
+        let row = &rows[i * d..(i + 1) * d];
+        result.push(dot(query, row));
+    }
+    result
+}
+
 pub fn random_unit_vector(d: usize, rng: &mut impl Rng) -> Vec<f64> {
     let v: Vec<f64> = (0..d).map(|_| rng.sample(StandardNormal)).collect();
     normalize(&v)

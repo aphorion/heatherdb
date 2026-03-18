@@ -14,6 +14,10 @@ pub struct HardLocation {
     pub counter: Vec<f64>,
     /// Accumulated write count: sum of activation weights
     pub write_count: f64,
+    /// Neighbor location IDs — co-activated locations from the write cycle.
+    /// Forms a navigable graph for O(kD log L) reads instead of O(LD) brute force.
+    #[serde(default)]
+    pub neighbors: Vec<u64>,
 }
 
 impl HardLocation {
@@ -24,6 +28,7 @@ impl HardLocation {
             address,
             counter: vec![0.0; d],
             write_count: 0.0,
+            neighbors: Vec::new(),
         }
     }
 

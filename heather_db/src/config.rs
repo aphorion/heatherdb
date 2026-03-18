@@ -10,8 +10,6 @@ pub struct EAMConfig {
     pub d: usize,
     /// Initial number of hard locations
     pub l_0: usize,
-    /// Maximum number of hard locations
-    pub l_max: usize,
     /// Number of nearest neighbors for activation
     pub k: usize,
     /// Initial learning rate
@@ -36,6 +34,12 @@ pub struct EAMConfig {
     pub t_max: usize,
     /// Convergence threshold
     pub epsilon: f64,
+    /// Max neighbors per location for the navigable graph (default D/4, min 20).
+    /// Sweet spot is D/4 to D/2. Beyond D saturates.
+    /// Set to 0 to disable graph construction.
+    pub neighbor_cap: usize,
+    /// Number of landmark entry points for graph search (default 32)
+    pub num_landmarks: usize,
 }
 
 impl EAMConfig {
@@ -43,7 +47,6 @@ impl EAMConfig {
         let config = EAMConfig {
             d,
             l_0: 1000,
-            l_max: 2000,
             k: 20,
             eta_0: 0.01,
             lambda: 0.9999,
@@ -56,6 +59,8 @@ impl EAMConfig {
             beta: 5.0,
             t_max: 10,
             epsilon: 1e-6,
+            neighbor_cap: (d / 4).max(20),
+            num_landmarks: 32,
         };
         config.validate()?;
         Ok(config)
@@ -67,11 +72,6 @@ impl EAMConfig {
         }
         if self.l_0 == 0 {
             return Err(HeatherError::InvalidConfig("l_0 must be > 0".into()));
-        }
-        if self.l_max < self.l_0 {
-            return Err(HeatherError::InvalidConfig(
-                format!("l_max ({}) must be >= l_0 ({})", self.l_max, self.l_0),
-            ));
         }
         if self.k == 0 {
             return Err(HeatherError::InvalidConfig("k must be > 0".into()));
@@ -119,6 +119,11 @@ impl EAMConfig {
         if self.epsilon <= 0.0 || !self.epsilon.is_finite() {
             return Err(HeatherError::InvalidConfig("epsilon must be > 0 and finite".into()));
         }
+        if self.neighbor_cap > 0 && self.num_landmarks == 0 {
+            return Err(HeatherError::InvalidConfig(
+                "num_landmarks must be > 0 when neighbor_cap > 0".into(),
+            ));
+        }
         Ok(())
     }
 }
@@ -135,14 +140,6 @@ mod tests {
     #[test]
     fn test_d_zero_rejected() {
         assert!(EAMConfig::new(0).is_err());
-    }
-
-    #[test]
-    fn test_l_max_less_than_l_0_rejected() {
-        let mut config = EAMConfig::new(64).unwrap();
-        config.l_max = 10;
-        config.l_0 = 100;
-        assert!(config.validate().is_err());
     }
 
     #[test]

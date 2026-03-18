@@ -97,7 +97,6 @@ fn generate_data(rng: &mut impl Rng) -> SyntheticData {
 fn make_config() -> EAMConfig {
     let mut config = EAMConfig::new(D).unwrap();
     config.l_0 = 100;
-    config.l_max = 500;
     config.k = 20;
     config.beta = 5.0;
     config.tau_split = 0.3;
@@ -138,8 +137,7 @@ fn train_sdm(patterns: &[Vec<f64>], dir: &std::path::Path, name: &str) -> EAMSna
 fn make_pooled(a: &EAMSnapshot, b: &EAMSnapshot) -> EAMSnapshot {
     let mut locations = a.locations.clone();
     locations.extend(b.locations.clone());
-    let mut config = a.config.clone();
-    config.l_max = config.l_max.max(locations.len());
+    let config = a.config.clone();
     let mut snap = EAMSnapshot { locations, config };
     snap.reindex();
     snap

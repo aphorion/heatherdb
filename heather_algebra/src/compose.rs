@@ -208,17 +208,13 @@ pub fn compose(
     all_locations.extend(b.locations.clone());
     all_locations.extend(hybrid_locs);
 
-    let mut config = a.config.clone();
-    config.l_max = config.l_max.max(b.config.l_max).max(all_locations.len());
+    let config = a.config.clone();
     let mut c = EAMSnapshot {
         locations: all_locations,
         config,
     };
     c.reindex();
     let post_dream = c.num_locations();
-
-    // Restore reasonable l_max
-    c.config.l_max = a.config.l_max.max(b.config.l_max);
 
     // Step 6: Validate via fingerprints
     let fp_c = compute_fingerprint(&c);
@@ -645,7 +641,6 @@ mod tests {
     fn make_snapshot(locations: Vec<HardLocation>, d: usize) -> EAMSnapshot {
         let mut config = EAMConfig::new(d).unwrap();
         config.l_0 = 1;
-        config.l_max = locations.len().max(1) * 10;
         config.k = locations.len().min(20).max(1);
         config.beta = 5.0;
         config.t_max = 10;
@@ -910,7 +905,6 @@ mod tests {
         // Create many redundant locations around the same point
         let locs = make_cluster(0, &center, &center, 30, 0.02);
         let mut config = EAMConfig::new(d).unwrap();
-        config.l_max = 100;
         config.k = 10;
         config.tau_merge = 0.95;
         let mut snap = EAMSnapshot {

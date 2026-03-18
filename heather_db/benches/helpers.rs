@@ -16,7 +16,6 @@ pub fn bench_config(d: usize) -> EAMConfig {
 pub fn medium_config(d: usize) -> EAMConfig {
     let mut config = EAMConfig::new(d).unwrap();
     config.l_0 = 200;
-    config.l_max = 500;
     config
 }
 

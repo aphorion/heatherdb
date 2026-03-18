@@ -17,10 +17,8 @@ fn check_dims(a: &EAMSnapshot, b: &EAMSnapshot) -> Result<()> {
 }
 
 /// Resolve config for binary operations.
-fn result_config(a: &EAMSnapshot, b: &EAMSnapshot) -> EAMConfig {
-    let mut config = a.config.clone();
-    config.l_max = config.l_max.max(b.config.l_max);
-    config
+fn result_config(a: &EAMSnapshot, _b: &EAMSnapshot) -> EAMConfig {
+    a.config.clone()
 }
 
 /// Extract the normalized pattern (counter / write_count) from each location.
@@ -141,19 +139,12 @@ pub fn add_with_limit(
         return Ok(a.clone());
     }
 
-    let mut config = result_config(a, b);
+    let config = result_config(a, b);
     let locations = pairwise_combine(a, b, 1.0, max_cross_k);
-
-    // Ensure l_max can accommodate the pairwise products during consolidation
-    let pre_consolidation_count = locations.len();
-    config.l_max = config.l_max.max(pre_consolidation_count);
 
     let mut snap = EAMSnapshot { locations, config };
     snap.reindex();
     consolidate(&mut snap);
-
-    // Restore a reasonable l_max for the output EAM
-    snap.config.l_max = result_config(a, b).l_max;
 
     Ok(snap)
 }
@@ -183,17 +174,12 @@ pub fn sub_with_limit(
         return Ok(a.clone());
     }
 
-    let mut config = result_config(a, b);
+    let config = result_config(a, b);
     let locations = pairwise_combine(a, b, -1.0, max_cross_k);
-
-    let pre_consolidation_count = locations.len();
-    config.l_max = config.l_max.max(pre_consolidation_count);
 
     let mut snap = EAMSnapshot { locations, config };
     snap.reindex();
     consolidate(&mut snap);
-
-    snap.config.l_max = result_config(a, b).l_max;
 
     Ok(snap)
 }
@@ -282,7 +268,7 @@ mod tests {
     fn make_snapshot(locations: Vec<HardLocation>, d: usize) -> EAMSnapshot {
         let mut config = EAMConfig::new(d).unwrap();
         config.l_0 = 1;
-        config.l_max = locations.len().max(1) * 4;
+        config.l_0 = locations.len().max(1);
         config.k = locations.len().min(20).max(1);
         EAMSnapshot { locations, config }
     }

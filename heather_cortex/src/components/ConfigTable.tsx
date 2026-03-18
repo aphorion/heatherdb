@@ -3,7 +3,6 @@ import type { EAMConfig } from '../api/types';
 const CONFIG_DESCRIPTIONS: Record<string, string> = {
   d: 'Dimensionality',
   l_0: 'Initial locations',
-  l_max: 'Max locations',
   k: 'k-NN activation',
   eta_0: 'Initial learning rate',
   lambda: 'Learning rate decay',

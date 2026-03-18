@@ -195,7 +195,6 @@ mod tests {
     fn test_config() -> EAMConfig {
         let mut config = EAMConfig::new(16).unwrap();
         config.l_0 = 50;
-        config.l_max = 100;
         config.k = 5;
         config
     }

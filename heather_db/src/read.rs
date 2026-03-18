@@ -94,6 +94,259 @@ pub fn activate(
     (indices, similarities)
 }
 
+/// Select landmark locations: the most-written-to locations, spread across the space.
+/// These are the most stable and central by construction.
+pub fn select_landmarks(locations: &[HardLocation], num_landmarks: usize) -> Vec<usize> {
+    if locations.len() <= num_landmarks {
+        return (0..locations.len()).collect();
+    }
+
+    let mut indexed: Vec<(usize, f64)> = locations
+        .iter()
+        .enumerate()
+        .map(|(i, loc)| (i, loc.write_count))
+        .collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+    indexed.truncate(num_landmarks);
+    indexed.into_iter().map(|(i, _)| i).collect()
+}
+
+/// Build a flat LocationId → index lookup array.
+/// O(1) lookup by indexing directly: `id_lookup[location_id] = index`.
+/// Invalid entries are `u32::MAX`.
+pub fn build_id_lookup(locations: &[HardLocation]) -> Vec<u32> {
+    let max_id = locations.iter().map(|l| l.id.0).max().unwrap_or(0) as usize;
+    let mut lookup = vec![u32::MAX; max_id + 1];
+    for (i, loc) in locations.iter().enumerate() {
+        lookup[loc.id.0 as usize] = i as u32;
+    }
+    lookup
+}
+
+/// Check if the neighbor graph is populated enough for graph search.
+/// Requires at least 100 locations and average neighbor count >= k/2.
+pub fn is_graph_ready(locations: &[HardLocation], k: usize) -> bool {
+    if locations.len() < 100 {
+        return false;
+    }
+    let sample_count = 20.min(locations.len());
+    let step = locations.len() / sample_count;
+    let total_neighbors: usize = (0..sample_count)
+        .map(|i| locations[i * step].neighbors.len())
+        .sum();
+    let avg = total_neighbors as f64 / sample_count as f64;
+    avg >= k as f64 / 2.0
+}
+
+/// Single-probe greedy graph search for k-nearest neighbors.
+///
+/// Follows the manifold: one entry point (nearest landmark), greedy descent
+/// through neighbor edges. Each hop gathers unvisited neighbor addresses into
+/// a contiguous buffer and computes similarities as a batched dot product
+/// (addresses are unit-normalized, so dot = cosine similarity).
+///
+/// Per hop: one batched mat-vec multiply over ~neighbor_cap rows × D columns.
+/// Hops are sequential (each depends on the previous), work within each hop
+/// is embarrassingly parallel.
+///
+/// Cost: O(landmarks·D + hops·neighbor_cap·D), hops ≈ O(log L).
+pub fn graph_activate(
+    query: &[f64],
+    locations: &[HardLocation],
+    k: usize,
+    landmarks: &[usize],
+    id_lookup: &[u32],
+) -> (Vec<usize>, Vec<f64>) {
+    let n = locations.len();
+    let d = query.len();
+    if landmarks.is_empty() || n == 0 {
+        return activate(query, locations, k);
+    }
+
+    // Normalize query once — all addresses are unit vectors,
+    // so dot product = cosine similarity. Saves 2D FLOPs per comparison.
+    let q = vec_ops::normalize(query);
+
+    // ── Entry point: nearest landmark via batched dot ────────────
+    let mut lm_buf = Vec::with_capacity(landmarks.len() * d);
+    for &lm in landmarks {
+        lm_buf.extend_from_slice(&locations[lm].address);
+    }
+    let lm_sims = vec_ops::batch_dot_unit(&q, &lm_buf, d);
+
+    let mut best_lm = 0usize;
+    let mut best_lm_sim = lm_sims[0];
+    for (i, &sim) in lm_sims.iter().enumerate().skip(1) {
+        if sim > best_lm_sim {
+            best_lm_sim = sim;
+            best_lm = i;
+        }
+    }
+    let entry = landmarks[best_lm];
+
+    // ── State: bitset visited, min-heap result ───────────────────
+    let mut visited = vec![false; n];
+    visited[entry] = true;
+
+    let mut result: BinaryHeap<MinEntry> = BinaryHeap::with_capacity(k + 1);
+    result.push(MinEntry {
+        index: entry,
+        similarity: best_lm_sim,
+    });
+
+    let mut current = entry;
+
+    // Scratch buffers — reused across hops, no allocation per hop
+    let mut neighbor_buf: Vec<f64> = Vec::with_capacity(40 * d);
+    let mut neighbor_indices: Vec<usize> = Vec::with_capacity(40);
+
+    // ── Greedy descent ───────────────────────────────────────────
+    loop {
+        neighbor_buf.clear();
+        neighbor_indices.clear();
+
+        // Gather unvisited neighbors into contiguous buffer
+        let loc = &locations[current];
+        for &neighbor_id in &loc.neighbors {
+            let nid = neighbor_id as usize;
+            if nid >= id_lookup.len() {
+                continue;
+            }
+            let v = id_lookup[nid];
+            if v == u32::MAX {
+                continue;
+            }
+            let idx = v as usize;
+            if idx >= n || visited[idx] {
+                continue;
+            }
+            visited[idx] = true;
+            neighbor_indices.push(idx);
+            neighbor_buf.extend_from_slice(&locations[idx].address);
+        }
+
+        if neighbor_indices.is_empty() {
+            break;
+        }
+
+        // Batched dot product: query · [neighbor addresses]
+        let sims = vec_ops::batch_dot_unit(&q, &neighbor_buf, d);
+
+        // Update result heap and find best unvisited neighbor for greedy step
+        let mut best_next: Option<(usize, f64)> = None;
+        for (i, &sim) in sims.iter().enumerate() {
+            let idx = neighbor_indices[i];
+
+            if result.len() < k {
+                result.push(MinEntry {
+                    index: idx,
+                    similarity: sim,
+                });
+            } else if let Some(worst) = result.peek() {
+                if sim > worst.similarity {
+                    result.pop();
+                    result.push(MinEntry {
+                        index: idx,
+                        similarity: sim,
+                    });
+                }
+            }
+
+            match best_next {
+                None => best_next = Some((idx, sim)),
+                Some((_, bs)) if sim > bs => best_next = Some((idx, sim)),
+                _ => {}
+            }
+        }
+
+        match best_next {
+            None => break,
+            Some((next_idx, next_sim)) => {
+                // Stop if best neighbor can't improve our k-th best
+                if result.len() >= k {
+                    if let Some(worst) = result.peek() {
+                        if next_sim < worst.similarity {
+                            break;
+                        }
+                    }
+                }
+                current = next_idx;
+            }
+        }
+    }
+
+    // Extract sorted descending
+    let mut entries: Vec<(usize, f64)> = result
+        .into_iter()
+        .map(|e| (e.index, e.similarity))
+        .collect();
+    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+    let indices = entries.iter().map(|(i, _)| *i).collect();
+    let similarities = entries.iter().map(|(_, s)| *s).collect();
+    (indices, similarities)
+}
+
+/// Activate using graph search if the graph is ready, otherwise brute force.
+pub fn activate_auto(
+    query: &[f64],
+    locations: &[HardLocation],
+    k: usize,
+    landmarks: &[usize],
+    id_lookup: &[u32],
+) -> (Vec<usize>, Vec<f64>) {
+    if is_graph_ready(locations, k) && !landmarks.is_empty() {
+        graph_activate(query, locations, k, landmarks, id_lookup)
+    } else {
+        activate(query, locations, k)
+    }
+}
+
+/// Hopfield iterative read from pre-computed activation set.
+/// Same as `hopfield_iter` but skips the activate step.
+pub fn hopfield_iter_from(
+    query: &[f64],
+    locations: &[HardLocation],
+    config: &EAMConfig,
+    indices: &[usize],
+) -> Result<Vec<f64>> {
+    if indices.is_empty() {
+        return Err(HeatherError::EmptyMemory);
+    }
+
+    let patterns: Vec<Vec<f64>> = indices
+        .iter()
+        .map(|&i| locations[i].unit_pattern())
+        .collect();
+
+    let addresses: Vec<&[f64]> = indices
+        .iter()
+        .map(|&i| locations[i].address.as_slice())
+        .collect();
+
+    let mut xi = vec_ops::normalize(query);
+
+    for _t in 0..config.t_max {
+        let sims: Vec<f64> = addresses
+            .iter()
+            .map(|addr| vec_ops::cosine_similarity(&xi, addr))
+            .collect();
+
+        let alpha = vec_ops::softmax(&sims, config.beta);
+        let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
+        let xi_new = vec_ops::normalize(&vec_ops::weighted_sum(&pattern_refs, &alpha));
+
+        let sim = vec_ops::cosine_similarity(&xi, &xi_new);
+        xi = xi_new;
+
+        if sim > 1.0 - config.epsilon {
+            break;
+        }
+    }
+
+    Ok(xi)
+}
+
 /// Hopfield iterative read (Eq. 13-14).
 /// Fixed activation set, iterate softmax reweighting until convergence.
 pub fn hopfield_iter(

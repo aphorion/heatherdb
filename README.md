@@ -78,7 +78,7 @@ curl -X POST http://localhost:6380/collections/my_collection/read \
 
 The query doesn't need to be exact. Noisy, partial, or approximate queries reconstruct the closest stored pattern. That's the point — HeatherDB is content-addressable memory with error correction built in.
 
-## Proven across 14 domains
+## Proven across 15 domains
 
 Each project uses the same two operations — write and read — against the same server. No domain-specific models, no retraining between use cases.
 
@@ -99,6 +99,7 @@ Each project uses the same two operations — write and read — against the sam
 | **Whisper** | Lossy semantic compression | 384 | Meaning-preserving dimensionality reduction |
 | **Oracle** | Diagnostic pattern completion | 64 | Partial symptom → full diagnosis reconstruction |
 | **Cortex** | Thinking notebook (Next.js + FastAPI) | 384 | Web app comparing EAM vs vector search |
+| **Emergence** | Zero-shot capability via memory composition | 384 | Coder+Writer→Documentation without training |
 
 See `sample_projects/` for full source code and READMEs.
 
@@ -115,13 +116,15 @@ This single metric enables anomaly detection (Sentinel), cold-start detection (C
 
 HeatherDB is not a key-value store or a vector search engine. It is an *associative memory* — a system that stores patterns distributed across a network of hard locations and reconstructs them from approximate queries.
 
-**Writing:** When you write a vector, it activates the k=20 nearest hard locations, weighted by similarity. Each location accumulates a weighted sum of all vectors written to it. The memory self-organizes: locations migrate toward frequently written patterns via competitive learning, overloaded locations split (tau_overload=100), novel patterns trigger new locations (tau_split=0.3), and similar locations merge automatically.
+**Writing (three phases):** When you write a vector, the write cycle runs in three phases. *Select:* activate the k=20 nearest hard locations with conscience-based winner selection. *Update:* accumulate weighted counters and migrate addresses via competitive learning in a single pass. *Regulate:* novelty splits spawn new locations for unseen regions (tau_split=0.3), overload splits distribute saturated locations (tau_overload=100), and local dedup cleans up. The memory self-organizes its own topology — location count is a diagnostic of data complexity, not a tunable parameter.
 
-**Reading:** Given a query vector, the system activates nearby locations and uses an energy-based Hopfield network (beta=5.0 softmax temperature) to iteratively reconstruct the best-matching stored pattern. This creates basins of attraction around stored memories — noisy queries are pulled toward the correct pattern.
+**Navigable graph search:** Every write produces neighborhood knowledge as a free byproduct. The k activated locations learn who they co-activated with, building a navigable graph that mirrors the data manifold. At query time, instead of comparing against all L locations (O(LD)), the system enters the graph at the nearest landmark and follows neighbor edges via greedy descent — one batched matrix-vector multiply per hop. Query cost: ~17-22 µs at d=128 regardless of collection size, vs linear growth for brute force. The graph isn't bolted on — it's what competitive learning was building all along.
+
+**Reading:** Given a query vector, graph search finds the k most relevant locations on the learned manifold. An energy-based Hopfield network (beta=5.0 softmax temperature) iteratively reconstructs the best-matching stored pattern from these locations. This creates basins of attraction around stored memories — noisy queries are pulled toward the correct pattern.
 
 **Persistence:** All writes are immediately persisted to disk via LMDB in atomic transactions. The server can crash and restart without data loss.
 
-**Adaptive capacity:** Starts with 1,000 hard locations, grows to 2,000 max. The memory manages its own topology — no manual tuning required.
+**Self-regulating capacity:** Starts with 1,000 hard locations. Splits are self-limiting (novelty splits consume the void that caused them, overload splits distribute the load that triggered them). Merges consolidate redundancy. No maximum location cap — the system finds its own equilibrium.
 
 ## Dimension guidelines
 
@@ -337,16 +340,40 @@ All errors return `{ "error": "<message>" }` with an appropriate HTTP status cod
 
 ## Performance
 
-Measured on Apple Silicon. Config: l_0=1000, l_max=2000, k=20.
+Measured on Apple Silicon (M-series). Config: l_0=1000, k=20, neighbor_cap=40, 32 landmarks.
 
 ### Throughput
 
 | Operation | d=64 | d=128 | d=384 |
 |---|---|---|---|
-| Single write | 3.45 ms | 3.68 ms | 5.24 ms |
-| Sustained write (per op) | — | 4.1 ms | — |
-| Single read (iterative) | 55 µs | 153 µs | 644 µs |
-| Reads/sec (sustained) | 14,604 | 3,479 | 945 |
+| Single write | 4.2 ms | 3.9 ms | 4.6 ms |
+| Warmed write (post-200) | — | 4.9 ms | 5.5 ms |
+| Single read (iterative) | 18 µs | 43 µs | 153 µs |
+| Single read (single-step) | — | 20 µs | — |
+| Reads/sec (sustained) | 19,418 | 9,336 | 3,473 |
+
+### Graph search vs. brute force
+
+Activation latency (d=128, the step that finds relevant locations):
+
+| Collection size (L) | Brute force (sequential) | Brute force (rayon) | Graph search | Graph vs. rayon |
+|---|---|---|---|---|
+| 1,384 | 143 µs | 131 µs | **18 µs** | **7.4x faster** |
+| 1,696 | 178 µs | 64 µs | **19 µs** | **3.4x faster** |
+| 2,251 | 237 µs | 76 µs | **19 µs** | **3.9x faster** |
+| 3,607 | 402 µs | 102 µs | **19 µs** | **5.3x faster** |
+| 5,097 | 538 µs | 124 µs | **22 µs** | **5.7x faster** |
+
+Graph search is near-constant (~17-22 µs) regardless of L. It beats multi-threaded brute force at every data point because it follows the learned manifold structure instead of scanning all locations.
+
+Across dimensions (5000 writes):
+
+| Dimension | Brute force (rayon) | Graph search | Speedup |
+|---|---|---|---|
+| 64 | 36 µs | **8 µs** | **4.3x** |
+| 128 | 98 µs | **18 µs** | **5.4x** |
+| 256 | 312 µs | **49 µs** | **6.3x** |
+| 384 | 475 µs | **90 µs** | **5.3x** |
 
 ### Scaling
 
@@ -354,17 +381,16 @@ Measured on Apple Silicon. Config: l_0=1000, l_max=2000, k=20.
 |---|---|
 | Read latency vs. collection count | Constant (LMDB prefix isolation) |
 | Write latency vs. fill level | Flat from 1000→1800 locations |
-| Read latency vs. fill level | Linear with location count |
-| Flush to disk (1000 writes, d=128) | 17.7 ms |
-| Cold reload (1000 writes) | 2.6 ms |
-| Memory footprint (2000 writes, d=128) | 4.0 MB |
+| Read latency vs. fill level | Near-constant (graph search) |
+| Flush to disk (1000 writes, d=128) | 7.6 ms |
+| Memory footprint (2000 writes, d=128) | 4.5 MB |
 
 ### Capacity stress test
 
 ```
-d=64:  1000 locs, 1.0 MB,  ~4.1 ms/write, 14,604 reads/sec
-d=128: 2000 locs, 4.0 MB,  ~4.4 ms/write,  3,479 reads/sec
-d=384: 2000 locs, 11.8 MB, ~5.4 ms/write,    945 reads/sec
+d=64:  1002 locs, 1.0 MB,  ~4.2 ms/write, 19,418 reads/sec
+d=128: 2284 locs, 4.5 MB,  ~4.3 ms/write,  9,336 reads/sec
+d=384: 3000 locs, 17.6 MB, ~4.7 ms/write,  3,473 reads/sec
 ```
 
 Sub-millisecond reads. Single-digit millisecond writes. Megabytes, not gigabytes. Runs on a Raspberry Pi.
@@ -378,9 +404,9 @@ heather_db/
     src/
       lib.rs              # Public API
       config.rs           # EAM configuration
-      memory.rs           # Main engine (thread-safe, persistent)
-      read.rs             # Hopfield iterative + single-step read
-      write.rs            # 6-step adaptive write pipeline
+      collection.rs       # Main engine (thread-safe, persistent, graph-accelerated)
+      read.rs             # Hopfield read + navigable graph search
+      write.rs            # Three-phase adaptive write pipeline (select → update → regulate)
       merge.rs            # KNN location merging
       store.rs            # LMDB persistence layer (5 databases: registry, locations, metadata, documents, doc_index)
       location.rs         # Hard location data model
@@ -391,7 +417,7 @@ heather_db/
       main.rs             # CLI, startup, configuration
       routes.rs           # Request handlers
       models.rs           # JSON request/response types
-  sample_projects/        # 14 demo applications
+  sample_projects/        # 15 demo applications
 ```
 
 ## Running tests
@@ -406,6 +432,7 @@ cargo test --workspace
 cargo bench -p heather_db                              # all benchmarks
 cargo bench -p heather_db --bench write_throughput     # single category
 cargo bench -p heather_db --bench capacity             # stress test
+cargo bench -p heather_db --bench graph_search         # graph vs flat activation
 ```
 
 ## Based on

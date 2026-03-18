@@ -223,7 +223,6 @@ mod tests {
     fn make_snapshot(locations: Vec<HardLocation>, d: usize) -> EAMSnapshot {
         let mut config = EAMConfig::new(d).unwrap();
         config.l_0 = 1;
-        config.l_max = locations.len().max(1) * 10;
         config.k = locations.len().min(20).max(1);
         config.beta = 5.0;
         config.t_max = 10;

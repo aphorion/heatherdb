@@ -123,23 +123,6 @@ pub async fn write(
     })
     .await;
 
-    // Auto-merge in background when locations exceed 80% of l_max
-    let config = hive.config();
-    let l_max = config.l_max;
-    if col.num_locations().unwrap_or(0) > l_max * 4 / 5 {
-        tracing::info!(
-            collection = %name,
-            locations = col.num_locations().unwrap_or(0),
-            l_max,
-            "Triggering auto-merge"
-        );
-        let col_bg = col.clone();
-        tokio::task::spawn_blocking(move || match col_bg.merge() {
-            Ok(count) => tracing::info!(merged = count, "Auto-merge completed"),
-            Err(e) => tracing::warn!(error = %e, "Auto-merge failed"),
-        });
-    }
-
     match result {
         Ok(Ok((count, ids))) => {
             tracing::info!(

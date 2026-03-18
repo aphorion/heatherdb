@@ -58,7 +58,6 @@ export interface DropCollectionResponse {
 export interface EAMConfig {
   d: number;
   l_0: number;
-  l_max: number;
   k: number;
   eta_0: number;
   lambda: number;

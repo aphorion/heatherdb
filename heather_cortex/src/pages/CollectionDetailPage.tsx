@@ -63,7 +63,6 @@ export function CollectionDetailPage() {
             <StatCard
               label="Locations"
               value={stats.num_locations}
-              subtitle={config ? `/ ${config.l_max} max` : undefined}
             />
             <StatCard
               label="Total Writes"
@@ -81,36 +80,6 @@ export function CollectionDetailPage() {
               label="Max Write Count"
               value={stats.max_write_count.toFixed(2)}
             />
-          </div>
-        </div>
-      )}
-
-      {/* Capacity Bar */}
-      {stats && config && (
-        <div>
-          <p className="label mb-3">CAPACITY</p>
-          <div className="card">
-            <div className="flex justify-between text-xs text-text-secondary mb-2">
-              <span>{stats.num_locations} locations</span>
-              <span>{config.l_max} max</span>
-            </div>
-            <div className="w-full bg-bg-tertiary rounded-full h-2">
-              <div
-                className="h-2 rounded-full transition-all duration-500"
-                style={{
-                  width: `${Math.min(100, (stats.num_locations / config.l_max) * 100)}%`,
-                  backgroundColor:
-                    stats.num_locations / config.l_max > 0.8
-                      ? '#ef4444'
-                      : stats.num_locations / config.l_max > 0.6
-                      ? '#eab308'
-                      : '#22c55e',
-                }}
-              />
-            </div>
-            <p className="text-xs text-text-muted mt-1">
-              {((stats.num_locations / config.l_max) * 100).toFixed(1)}% utilized
-            </p>
           </div>
         </div>
       )}

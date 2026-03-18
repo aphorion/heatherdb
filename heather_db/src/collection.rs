@@ -43,6 +43,31 @@ pub(crate) struct EAMInner {
     pub(crate) next_id: u64,
     pub(crate) eta: f64,
     pub(crate) doc_next_id: u64,
+    /// Cached landmark indices for graph search entry points
+    pub(crate) landmarks: Vec<usize>,
+    /// Flat LocationId → index lookup array for O(1) graph traversal
+    pub(crate) id_lookup: Vec<u32>,
+}
+
+impl EAMInner {
+    /// Full rebuild of landmarks + id_lookup. Use after merge/load_snapshot.
+    pub(crate) fn rebuild_graph_cache(&mut self) {
+        self.id_lookup = read::build_id_lookup(&self.locations);
+        self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
+    }
+
+    /// Incremental update after appending new locations.
+    /// O(new_count) instead of O(L). Landmarks are not rebuilt —
+    /// existing landmarks are stable enough entry points for graph search.
+    pub(crate) fn extend_id_lookup(&mut self, start_idx: usize) {
+        for i in start_idx..self.locations.len() {
+            let id = self.locations[i].id.0 as usize;
+            if id >= self.id_lookup.len() {
+                self.id_lookup.resize(id + 1, u32::MAX);
+            }
+            self.id_lookup[id] = i as u32;
+        }
+    }
 }
 
 /// A single EAM collection, scoped to a collection_id within a shared Store.
@@ -97,6 +122,9 @@ impl Collection {
         )?;
         txn.commit()?;
 
+        let id_lookup = read::build_id_lookup(&locations);
+        let landmarks = read::select_landmarks(&locations, config.num_landmarks);
+
         Ok(Collection {
             collection_id,
             name,
@@ -106,6 +134,8 @@ impl Collection {
                 next_id,
                 eta,
                 doc_next_id: 0,
+                landmarks,
+                id_lookup,
             }),
             store,
         })
@@ -148,6 +178,9 @@ impl Collection {
             }
         }
 
+        let id_lookup = read::build_id_lookup(&locations);
+        let landmarks = read::select_landmarks(&locations, config.num_landmarks);
+
         Ok(Collection {
             collection_id,
             name,
@@ -157,6 +190,8 @@ impl Collection {
                 next_id,
                 eta,
                 doc_next_id,
+                landmarks,
+                id_lookup,
             }),
             store,
         })
@@ -199,15 +234,7 @@ impl Collection {
 
         inner.eta = result.eta;
 
-        // Determine which new locations to add (respect l_max)
-        let new_locs: Vec<HardLocation> = if inner.locations.len() + result.new_locations.len()
-            > inner.config.l_max
-        {
-            let space = inner.config.l_max.saturating_sub(inner.locations.len());
-            result.new_locations.into_iter().take(space).collect()
-        } else {
-            result.new_locations
-        };
+        let new_locs = result.new_locations;
 
         // Persist everything in a single atomic transaction
         let mut txn = self.store.write_txn()?;
@@ -237,12 +264,17 @@ impl Collection {
 
         txn.commit()?;
 
-        inner.locations.extend(new_locs);
+        if !new_locs.is_empty() {
+            let start = inner.locations.len();
+            inner.locations.extend(new_locs);
+            inner.extend_id_lookup(start);
+        }
 
         Ok(())
     }
 
     /// Read (reconstruct) a pattern from the collection.
+    /// Automatically uses graph-accelerated activation when the neighbor graph is ready.
     pub fn read(&self, query: &[f64], strategy: ReadStrategy) -> Result<Vec<f64>> {
         vec_ops::validate_vector(query)?;
 
@@ -255,11 +287,39 @@ impl Collection {
             });
         }
 
+        if inner.locations.is_empty() {
+            return Err(HeatherError::EmptyMemory);
+        }
+
+        let k = inner.config.k.min(inner.locations.len());
+        let (indices, _sims) = read::activate_auto(
+            query,
+            &inner.locations,
+            k,
+            &inner.landmarks,
+            &inner.id_lookup,
+        );
+
         match strategy {
             ReadStrategy::HopfieldIter => {
-                read::hopfield_iter(query, &inner.locations, &inner.config)
+                read::hopfield_iter_from(query, &inner.locations, &inner.config, &indices)
             }
-            ReadStrategy::HopfieldSS => read::hopfield_ss(query, &inner.locations, &inner.config),
+            ReadStrategy::HopfieldSS => {
+                let sims: Vec<f64> = indices
+                    .iter()
+                    .map(|&i| vec_ops::cosine_similarity(query, &inner.locations[i].address))
+                    .collect();
+                let alpha = vec_ops::softmax(&sims, inner.config.beta);
+                let patterns: Vec<Vec<f64>> = indices
+                    .iter()
+                    .map(|&i| inner.locations[i].normalized_pattern())
+                    .collect();
+                let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
+                Ok(vec_ops::normalize(&vec_ops::weighted_sum(
+                    &pattern_refs,
+                    &alpha,
+                )))
+            }
         }
     }
 
@@ -301,6 +361,11 @@ impl Collection {
                     .delete_location(&mut txn, self.collection_id, LocationId(id))?;
             }
             txn.commit()?;
+        }
+
+        // Rebuild graph cache after topology change
+        if !result.removed_ids.is_empty() {
+            inner.rebuild_graph_cache();
         }
 
         Ok(result.merge_count)
@@ -369,15 +434,7 @@ impl Collection {
             .map(|&idx| inner.locations[idx].id.0)
             .collect();
 
-        // Determine new locations (respect l_max)
-        let new_locs: Vec<HardLocation> = if inner.locations.len() + result.new_locations.len()
-            > inner.config.l_max
-        {
-            let space = inner.config.l_max.saturating_sub(inner.locations.len());
-            result.new_locations.into_iter().take(space).collect()
-        } else {
-            result.new_locations
-        };
+        let new_locs = result.new_locations;
 
         // Assign document ID
         let doc_id = inner.doc_next_id;
@@ -429,7 +486,11 @@ impl Collection {
 
         txn.commit()?;
 
-        inner.locations.extend(new_locs);
+        if !new_locs.is_empty() {
+            let start = inner.locations.len();
+            inner.locations.extend(new_locs);
+            inner.extend_id_lookup(start);
+        }
 
         Ok(doc_id)
     }
@@ -476,9 +537,15 @@ impl Collection {
             return Ok(Vec::new());
         }
 
-        // Step 1: Activate query against hard locations
+        // Step 1: Activate query against hard locations (graph-accelerated when ready)
         let k = inner.config.k.min(inner.locations.len());
-        let (indices, _sims) = read::activate(query, &inner.locations, k);
+        let (indices, _sims) = read::activate_auto(
+            query,
+            &inner.locations,
+            k,
+            &inner.landmarks,
+            &inner.id_lookup,
+        );
 
         // Step 2: Gather candidate doc IDs from posting lists (deduplicated)
         let mut candidate_ids = std::collections::HashSet::new();
@@ -676,11 +743,13 @@ impl Collection {
         inner.locations = locations;
         inner.config = config;
         inner.next_id = next_id;
+        inner.rebuild_graph_cache();
 
         Ok(())
     }
 
     /// Perform a traced read with full activation details.
+    /// Uses graph-accelerated activation when available.
     pub fn analyze_read(&self, query: &[f64], strategy: ReadStrategy) -> Result<ReadTrace> {
         vec_ops::validate_vector(query)?;
         let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
@@ -692,16 +761,83 @@ impl Collection {
             });
         }
 
+        if inner.locations.is_empty() {
+            return Err(HeatherError::EmptyMemory);
+        }
+
+        let k = inner.config.k.min(inner.locations.len());
+        let (indices, sims) = read::activate_auto(
+            query,
+            &inner.locations,
+            k,
+            &inner.landmarks,
+            &inner.id_lookup,
+        );
+
         match strategy {
             ReadStrategy::HopfieldIter => {
-                read::hopfield_iter_traced(query, &inner.locations, &inner.config)
+                // Run iterative read from the (possibly graph-found) activation set
+                let patterns: Vec<Vec<f64>> = indices
+                    .iter()
+                    .map(|&i| inner.locations[i].unit_pattern())
+                    .collect();
+                let addresses: Vec<&[f64]> = indices
+                    .iter()
+                    .map(|&i| inner.locations[i].address.as_slice())
+                    .collect();
+
+                let mut xi = vec_ops::normalize(query);
+                let mut converged = false;
+                let mut iterations = 0;
+                let mut final_weights = vec_ops::softmax(&sims, inner.config.beta);
+
+                for t in 0..inner.config.t_max {
+                    iterations = t + 1;
+                    let step_sims: Vec<f64> = addresses
+                        .iter()
+                        .map(|addr| vec_ops::cosine_similarity(&xi, addr))
+                        .collect();
+                    let alpha = vec_ops::softmax(&step_sims, inner.config.beta);
+                    final_weights = alpha.clone();
+                    let pattern_refs: Vec<&[f64]> =
+                        patterns.iter().map(|p| p.as_slice()).collect();
+                    let xi_new = vec_ops::normalize(&vec_ops::weighted_sum(&pattern_refs, &alpha));
+                    let sim = vec_ops::cosine_similarity(&xi, &xi_new);
+                    xi = xi_new;
+                    if sim > 1.0 - inner.config.epsilon {
+                        converged = true;
+                        break;
+                    }
+                }
+
+                let activated_locations = indices
+                    .iter()
+                    .zip(final_weights.iter())
+                    .map(|(&idx, &weight)| {
+                        let sim = vec_ops::cosine_similarity(&xi, &inner.locations[idx].address);
+                        read::ActivatedLocation {
+                            id: idx,
+                            similarity: sim,
+                            weight,
+                        }
+                    })
+                    .collect();
+
+                Ok(ReadTrace {
+                    iterations,
+                    converged,
+                    activated_locations,
+                    result: xi,
+                })
             }
             ReadStrategy::HopfieldSS => {
-                // For single-step, wrap in a trace
-                let k = inner.config.k.min(inner.locations.len());
-                let (indices, sims) = read::activate(query, &inner.locations, k);
                 let alpha = vec_ops::softmax(&sims, inner.config.beta);
-                let result = read::hopfield_ss(query, &inner.locations, &inner.config)?;
+                let patterns: Vec<Vec<f64>> = indices
+                    .iter()
+                    .map(|&i| inner.locations[i].normalized_pattern())
+                    .collect();
+                let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
+                let result = vec_ops::normalize(&vec_ops::weighted_sum(&pattern_refs, &alpha));
 
                 let activated_locations = indices
                     .iter()
@@ -733,7 +869,6 @@ mod tests {
     fn test_config() -> EAMConfig {
         let mut config = EAMConfig::new(16).unwrap();
         config.l_0 = 50;
-        config.l_max = 100;
         config.k = 5;
         config
     }

@@ -74,6 +74,24 @@ pub fn knn_merge(locations: &mut Vec<HardLocation>, config: &EAMConfig) -> Merge
         vec_ops::add_scaled(&mut locations[i].counter, &j_counter, 1.0);
         locations[i].write_count += locations[j].write_count;
 
+        // Merge neighbor lists: survivor takes union, capped at neighbor_cap
+        let j_neighbors = locations[j].neighbors.clone();
+        let j_id = locations[j].id.0;
+        let i_id = locations[i].id.0;
+        for &n in &j_neighbors {
+            if n != i_id && !locations[i].neighbors.contains(&n) {
+                locations[i].neighbors.push(n);
+            }
+        }
+        // Remove the merged location from survivor's neighbor list
+        locations[i].neighbors.retain(|&n| n != j_id);
+        // Cap at neighbor_cap
+        if config.neighbor_cap > 0 && locations[i].neighbors.len() > config.neighbor_cap {
+            locations[i]
+                .neighbors
+                .truncate(config.neighbor_cap);
+        }
+
         merged[j] = true;
         merge_map.push((locations[j].id.0, locations[i].id.0));
         removed_ids.push(locations[j].id.0);
