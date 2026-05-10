@@ -1,0 +1,37 @@
+# Build artefacts
+target/
+**/target/
+
+# Rust analysis
+**/*.rlib
+**/*.rmeta
+
+# Editor / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# VCS
+.git/
+.gitignore
+.github/
+
+# Docs / sample projects (not needed in the image)
+*.md
+sample_projects/
+zero-shot-capability.md
+
+# Local data dirs
+data/
+*.lmdb
+
+# Docker artefacts
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Python venvs
+.venv/
+venv/
+__pycache__/

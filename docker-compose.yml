@@ -1,0 +1,33 @@
+version: "3.9"
+
+# HeatherDB — single-service Compose for local + small-VPS deploys.
+#
+#   docker compose up -d           # build + run
+#   docker compose logs -f          # tail logs
+#   docker compose exec heatherdb sh
+#   docker compose down             # stop (data persists in the named volume)
+
+services:
+  heatherdb:
+    build: .
+    image: heatherdb:latest
+    container_name: heatherdb
+    restart: unless-stopped
+    ports:
+      - "6380:6380"
+    volumes:
+      - heatherdb_data:/var/lib/heatherdb
+    environment:
+      HEATHER_DIMENSION: "128"
+      HEATHER_MAP_SIZE_MB: "4096"
+      HEATHER_REQUEST_TIMEOUT: "600"
+      RUST_LOG: "info"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:6380/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+volumes:
+  heatherdb_data:

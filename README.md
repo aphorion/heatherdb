@@ -337,6 +337,146 @@ All errors return `{ "error": "<message>" }` with an appropriate HTTP status cod
 | `--dimension` | `HEATHER_DIMENSION` | *(required)* | Vector dimension |
 | `--port` | `HEATHER_PORT` | `6380` | Listen port |
 | `--host` | `HEATHER_HOST` | `0.0.0.0` | Bind address |
+| `--map-size-mb` | `HEATHER_MAP_SIZE_MB` | `4096` | LMDB map size — set to ~2× expected on-disk dataset |
+| `--request-timeout` | `HEATHER_REQUEST_TIMEOUT` | `600` | Seconds, for long algebra ops |
+| — | `RUST_LOG` | `info` | `debug` for verbose tracing |
+
+## Deployment
+
+HeatherDB is a single statically-linked Rust binary. It needs no system
+dependencies, no GPU, and no accelerator. Three production paths, simplest
+first.
+
+### Path A — Docker (recommended)
+
+A multi-stage `Dockerfile` ships in this repo. Final image is ~25 MB on
+`debian:bookworm-slim`, runs as a non-root user, exposes `6380`, has a
+healthcheck, and persists data in a named volume.
+
+```bash
+# Build
+docker build -t heatherdb:latest .
+
+# Run (named volume keeps your data across restarts)
+docker run -d --name heatherdb \
+  -p 6380:6380 \
+  -v heatherdb_data:/var/lib/heatherdb \
+  -e HEATHER_DIMENSION=128 \
+  heatherdb:latest
+
+# Smoke test
+curl http://127.0.0.1:6380/health
+```
+
+Or with the bundled Compose file:
+
+```bash
+docker compose up -d        # build + run
+docker compose logs -f      # tail
+docker compose down         # stop (data persists in the volume)
+```
+
+Override config via env in `docker-compose.yml` or with `-e` on `docker run`.
+Common overrides:
+
+```bash
+-e HEATHER_DIMENSION=384 \
+-e HEATHER_MAP_SIZE_MB=8192 \
+-e RUST_LOG=debug
+```
+
+### Path B — Bare metal / $5 VPS (Hetzner / DO / Linode)
+
+```bash
+# Install Rust on the VPS (or build elsewhere and ship the binary)
+curl -sSL https://sh.rustup.rs | sh -s -- -y
+source $HOME/.cargo/env
+
+# Build
+git clone https://github.com/aphorion/heather-db
+cd heather-db
+cargo build --release -p heather_server
+
+# Install
+sudo useradd -r -m -d /opt/heatherdb heatherdb
+sudo mkdir -p /opt/heatherdb/data /etc/heatherdb
+sudo chown -R heatherdb:heatherdb /opt/heatherdb
+sudo cp target/release/heather_server /opt/heatherdb/
+
+# systemd unit — adapt or copy from heatherdb-pi-demo/deploy/systemd/
+sudo tee /etc/systemd/system/heatherdb.service > /dev/null <<'EOF'
+[Unit]
+Description=HeatherDB
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=heatherdb
+Group=heatherdb
+WorkingDirectory=/opt/heatherdb
+ExecStart=/opt/heatherdb/heather_server
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+
+EnvironmentFile=-/etc/heatherdb/env
+Environment=HEATHER_DATA_DIR=/opt/heatherdb/data
+Environment=HEATHER_DIMENSION=128
+Environment=HEATHER_PORT=6380
+Environment=HEATHER_HOST=0.0.0.0
+Environment=HEATHER_MAP_SIZE_MB=4096
+Environment=HEATHER_REQUEST_TIMEOUT=600
+Environment=RUST_LOG=info
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/opt/heatherdb/data
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now heatherdb
+curl http://127.0.0.1:6380/health
+```
+
+### Path C — Raspberry Pi 5 (cross-compiled)
+
+Production-grade scripts (cross, snapshot bake, rsync deploy, smoke test) live
+in the [`heatherdb-pi-demo`](https://github.com/aphorion/heatherdb-pi-demo) repo
+under `deploy/`. Quick version:
+
+```bash
+# In heatherdb-pi-demo/
+./deploy/cross-compile.sh                                   # builds aarch64 binary
+./deploy/bake_snapshot.sh                                   # warm LMDB snapshot
+./deploy/deploy.sh pi@heatherdb-pi.local --with-snapshot    # rsync + restart
+./deploy/smoke-test.sh pi@heatherdb-pi.local
+```
+
+### Reverse proxy (HTTPS)
+
+HeatherDB speaks plain HTTP. Front it with Caddy for free auto-HTTPS:
+
+```caddy
+api.heather.example.com {
+  reverse_proxy 127.0.0.1:6380
+  encode zstd gzip
+}
+```
+
+### Operational notes
+
+| Concern | What to do |
+|---------|------------|
+| **Backups**     | The data dir is a single LMDB env. `tar -czf` it while the service is stopped, or use `mdb_copy` for a live copy. |
+| **Memory**      | ~1.5× the on-disk LMDB size at steady state. |
+| **Sizing**      | A Pi 5 (8 GB) comfortably runs the 25M MovieLens demo (≈ 187k attractors). For larger workloads, scale `HEATHER_MAP_SIZE_MB` up before first write. |
+| **Updates**     | Replace the binary, `systemctl restart heatherdb`. Restart is < 1 s — LMDB hydrates lazily. |
+| **Monitoring**  | Scrape `/health` and `/stats`. The `/analyze` endpoint is your built-in explainability — no extra tooling required. |
 
 ## Performance
 
