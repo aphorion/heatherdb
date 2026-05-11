@@ -370,13 +370,21 @@ docker run -d --name heatherdb \
 curl http://127.0.0.1:6380/health
 ```
 
-Or with the bundled Compose file:
+Or with the bundled Compose file — brings up **engine + Fovea** (the
+operator GUI) in one shot:
 
 ```bash
-docker compose up -d        # build + run
+docker compose up -d        # build + run both
 docker compose logs -f      # tail
 docker compose down         # stop (data persists in the volume)
 ```
+
+After it's up:
+
+| URL                    | What's there |
+|------------------------|--------------|
+| http://localhost:6380  | HeatherDB engine HTTP API |
+| http://localhost:8080  | **Fovea** — open this; it talks to the engine over a Caddy reverse-proxy so there's no CORS to configure. |
 
 Override config via env in `docker-compose.yml` or with `-e` on `docker run`.
 Common overrides:
@@ -541,6 +549,13 @@ heather_db/
       routes.rs           # Request handlers
       models.rs           # JSON request/response types
 ```
+
+## Inside this repo
+
+- **`heather_db/`** · **`heather_server/`** · **`heather_algebra/`** · **`heather_fornix/`** — the engine (Rust workspace).
+- **`fovea/`** — the operator GUI (Tauri 2 + React 19). Run `npm run tauri:dev` for the desktop app, or `docker compose up` to get the web build alongside the engine. See [fovea/README.md](./fovea/README.md).
+- **`deploy/`** — `deploy/deploy` script for in-VPS deploys + the systemd unit.
+- **`docs/`** — RFCs and architecture notes.
 
 ## Related repos
 

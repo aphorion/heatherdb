@@ -1,15 +1,24 @@
 version: "3.9"
 
-# HeatherDB — single-service Compose for local + small-VPS deploys.
+# HeatherDB stack — engine + Fovea (the operator instrument, web build).
 #
-#   docker compose up -d           # build + run
+#   docker compose up -d           # build + run both services
 #   docker compose logs -f          # tail logs
-#   docker compose exec heatherdb sh
-#   docker compose down             # stop (data persists in the named volume)
+#   docker compose down             # stop (data persists in the volume)
+#
+# After it's up:
+#   Engine HTTP   http://localhost:6380   (or via Fovea's reverse proxy)
+#   Fovea UI      http://localhost:8080   ← open this in a browser
+#
+# Fovea ships its own Caddy that serves the SPA AND reverse-proxies
+# /api/* to the engine — no CORS gymnastics. The connection-form
+# default in browser mode is `/api`, so the very first run "just works".
 
 services:
   heatherdb:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: heatherdb:latest
     container_name: heatherdb
     restart: unless-stopped
@@ -28,6 +37,37 @@ services:
       timeout: 3s
       retries: 3
       start_period: 5s
+    networks:
+      - heather
+
+  fovea:
+    build:
+      context: ./fovea
+      dockerfile: Dockerfile
+    image: fovea:latest
+    container_name: fovea
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    environment:
+      # Caddy proxies /api/* to this upstream. Inside the compose network,
+      # `heatherdb` resolves to the engine container.
+      HEATHER_HOST: "heatherdb:6380"
+    # Loads AUTH_USER + AUTH_PASS_HASH from fovea/.env if it exists.
+    # Missing file is non-fatal — the entrypoint runs in no-auth mode
+    # and prints a loud warning. Copy fovea/.env.example to start.
+    env_file:
+      - path: ./fovea/.env
+        required: false
+    depends_on:
+      heatherdb:
+        condition: service_started
+    networks:
+      - heather
+
+networks:
+  heather:
+    driver: bridge
 
 volumes:
   heatherdb_data:

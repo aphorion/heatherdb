@@ -1,0 +1,21 @@
+# Don't ship dev artefacts into the build context.
+node_modules/
+dist/
+.vite/
+.cinema-logs/
+.git/
+.gitignore
+
+# Tauri side — the Docker image only ships the web build.
+src-tauri/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+
+# Generated
+vite.config.js
+vite.config.d.ts
+*.tsbuildinfo
+*.log
