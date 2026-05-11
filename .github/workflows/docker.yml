@@ -1,13 +1,22 @@
 name: Docker
 
-# Build and publish multi-arch container images to ghcr.io.
+# Build and publish multi-arch container images to TWO registries:
+#
+#   ghcr.io/<owner>/heather-db
+#   docker.io/aphorion/heatherdb
 #
 # Triggers:
-#   - push to main:        ghcr.io/<owner>/heather-db:edge
-#   - push tag v*.*.*:     ghcr.io/<owner>/heather-db:vX.Y.Z + :vX.Y + :latest
-#   - PR (build only, no push) so we catch Dockerfile breakage early
+#   - push to main:        :edge      (both registries)
+#   - push tag v*.*.*:     :vX.Y.Z + :vX.Y + :latest  (both registries)
+#   - PR:                  build-only, no push  (catches Dockerfile breakage)
 #
 # Architectures: linux/amd64 + linux/arm64 (covers VPS + Pi 5 + most clouds).
+#
+# Required secrets (set under Settings → Secrets → Actions):
+#   DOCKERHUB_USERNAME   Docker Hub account or org name (e.g. "aphorion")
+#   DOCKERHUB_TOKEN      Access token from https://hub.docker.com/settings/security
+#
+# GHCR uses the workflow's auto-generated GITHUB_TOKEN — no extra secret needed.
 
 on:
   push:
@@ -32,8 +41,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository_owner }}/heather-db
+  GHCR_IMAGE:      ghcr.io/${{ github.repository_owner }}/heather-db
+  DOCKERHUB_IMAGE: docker.io/aphorion/heatherdb
 
 jobs:
   build:
@@ -49,17 +58,28 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # Skip auth on PR (we're not pushing). Otherwise log in to GHCR with the
-      # workflow's auto-generated token.
+      # Skip auth on PR (we're not pushing). Otherwise log in to BOTH
+      # registries — GHCR with the workflow's GITHUB_TOKEN, Docker Hub with
+      # the DOCKERHUB_USERNAME/TOKEN secrets.
       - name: Log in to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Generate the tag set + OCI labels from refs.
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Generate the tag set + OCI labels from refs. The metadata action
+      # accepts multiple `images:` entries — every tag rule then expands
+      # across both registries automatically (one push, mirrored output).
       #   - main          → :edge + :sha-<short>
       #   - v1.2.3        → :v1.2.3 + :v1.2 + :latest
       #   - PR            → :pr-<n>  (built but not pushed)
@@ -67,7 +87,9 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.GHCR_IMAGE }}
+            ${{ env.DOCKERHUB_IMAGE }}
           tags: |
             type=ref,event=pr
             type=ref,event=branch,enable=${{ github.ref == 'refs/heads/main' }},priority=900,prefix=,suffix=,value=edge
@@ -80,6 +102,7 @@ jobs:
             org.opencontainers.image.description=Memory that learns — associative-memory database
             org.opencontainers.image.vendor=Aphorion Labs
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.url=https://github.com/${{ github.repository }}
             org.opencontainers.image.licenses=TBD
 
       - name: Build (and push outside PR)
@@ -103,13 +126,17 @@ jobs:
         if: github.event_name != 'pull_request'
         uses: sigstore/cosign-installer@v3
 
-      - name: Sign published image
+      - name: Sign published images (both registries)
         if: github.event_name != 'pull_request'
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          # `tags` is one tag per line, covering both ghcr.io and docker.io
+          # entries (metadata-action expands the `images:` list × `tags:` rules).
           while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            echo "Signing ${tag}@${DIGEST}"
             cosign sign --yes "${tag}@${DIGEST}"
           done <<< "$TAGS"
