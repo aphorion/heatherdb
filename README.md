@@ -595,29 +595,24 @@ tar -xzf "heather_server-${VERSION}-${TARGET}.tar.gz"
 ./heather_server-${VERSION}-${TARGET}/heather_server --help
 ```
 
-Container images are published to **two registries** on every tag and on
-`main` — pick whichever you prefer:
+Container images are published to GHCR on every tag and on `main`:
 
 ```bash
-# Docker Hub
-docker pull aphorion/heatherdb:latest        # stable
-docker pull aphorion/heatherdb:v0.1.0        # pinned
-docker pull aphorion/heatherdb:edge          # bleeding-edge from main
-
-# GitHub Container Registry
+# Latest stable
 docker pull ghcr.io/aphorion/heather-db:latest
+
+# A specific tag
 docker pull ghcr.io/aphorion/heather-db:v0.1.0
+
+# Bleeding edge (auto-built from main)
 docker pull ghcr.io/aphorion/heather-db:edge
 ```
 
-Both registries get the same multi-arch (`linux/amd64` + `linux/arm64`)
-manifest from a single build — no drift.
-
 All published images are signed with [cosign](https://github.com/sigstore/cosign)
-keyless. Verify either one:
+keyless. Verify:
 
 ```bash
-cosign verify aphorion/heatherdb:v0.1.0 \
+cosign verify ghcr.io/aphorion/heather-db:v0.1.0 \
   --certificate-identity-regexp "^https://github.com/aphorion/heather-db/" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
