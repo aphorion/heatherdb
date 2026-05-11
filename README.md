@@ -389,61 +389,29 @@ Common overrides:
 
 ### Path B — Bare metal / $5 VPS (Hetzner / DO / Linode)
 
-```bash
-# Install Rust on the VPS (or build elsewhere and ship the binary)
-curl -sSL https://sh.rustup.rs | sh -s -- -y
-source $HOME/.cargo/env
+SSH into a fresh VPS and run **one** command. The script ([`deploy/deploy`](./deploy/deploy))
+installs system deps, Rust if missing, the `heatherdb` user, the binary, the
+systemd unit, and smoke-tests `/health`. Idempotent — re-run any time to update.
 
-# Build
+```bash
+# Option 1 — clone first (if you want to inspect or pin a ref)
 git clone https://github.com/aphorion/heather-db
 cd heather-db
-cargo build --release -p heather_server
+sudo ./deploy/deploy
 
-# Install
-sudo useradd -r -m -d /opt/heatherdb heatherdb
-sudo mkdir -p /opt/heatherdb/data /etc/heatherdb
-sudo chown -R heatherdb:heatherdb /opt/heatherdb
-sudo cp target/release/heather_server /opt/heatherdb/
-
-# systemd unit — adapt or copy from heatherdb-pi-demo/deploy/systemd/
-sudo tee /etc/systemd/system/heatherdb.service > /dev/null <<'EOF'
-[Unit]
-Description=HeatherDB
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=heatherdb
-Group=heatherdb
-WorkingDirectory=/opt/heatherdb
-ExecStart=/opt/heatherdb/heather_server
-Restart=always
-RestartSec=2
-LimitNOFILE=65536
-
-EnvironmentFile=-/etc/heatherdb/env
-Environment=HEATHER_DATA_DIR=/opt/heatherdb/data
-Environment=HEATHER_DIMENSION=128
-Environment=HEATHER_PORT=6380
-Environment=HEATHER_HOST=0.0.0.0
-Environment=HEATHER_MAP_SIZE_MB=4096
-Environment=HEATHER_REQUEST_TIMEOUT=600
-Environment=RUST_LOG=info
-
-NoNewPrivileges=true
-PrivateTmp=true
-ProtectSystem=strict
-ReadWritePaths=/opt/heatherdb/data
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now heatherdb
-curl http://127.0.0.1:6380/health
+# Option 2 — one-liner from the internet
+curl -fsSL https://raw.githubusercontent.com/aphorion/heather-db/main/deploy/deploy | sudo bash
 ```
+
+Common env overrides:
+
+```bash
+HEATHER_VERSION=v0.1.0 HEATHER_DIM=384 \
+  sudo -E ./deploy/deploy
+```
+
+See [`deploy/README.md`](./deploy/README.md) for the full env-var table and
+post-install operational notes.
 
 ### Path C — Raspberry Pi 5 (cross-compiled)
 

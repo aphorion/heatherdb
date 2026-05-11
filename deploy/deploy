@@ -1,0 +1,347 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+#
+#                   ▄█    █▄       ▄████████  ▄██████▄  ▄██████▄
+#                  ███    ███     ███    ███ ███    ███ ███    ███
+#                  ███    ███     ███    █▀  ███    ███ ███    █▀
+#                 ▄███▄▄▄▄███▄▄  ▄███▄▄▄     ███    ███ ███
+#                ▀▀███▀▀▀▀███▀  ▀▀███▀▀▀     ███    ███ ███
+#                  ███    ███     ███    █▄  ███    ███ ███    █▄
+#                  ███    ███     ███    ███ ███    ███ ███    ███
+#                  ███    █▀      ██████████  ▀██████▀   ▀██████▀
+#
+#                       deploy — five bucks, all your memories
+#
+#  Run this ON the VPS.
+#
+#    SSH into your VPS, then either:
+#
+#      # Option 1 — you cloned the repo
+#      cd heather_db && sudo ./deploy/deploy
+#
+#      # Option 2 — one-liner from the internet
+#      curl -fsSL https://raw.githubusercontent.com/aphorion/heather-db/main/deploy/deploy | sudo bash
+#
+#  What it does (idempotent — safe to re-run):
+#    · ensures git + rust + curl are installed
+#    · creates the 'heatherdb' user, /opt/heatherdb tree, /etc/heatherdb/env
+#    · clones (or pulls) heather-db at $HEATHER_VERSION
+#    · cargo build --release -p heather_server, installs the binary
+#    · drops the systemd unit, enables + restarts the service
+#    · smoke-tests /health on :6380 before declaring victory
+#
+#  Env overrides (all optional):
+#    HEATHER_VERSION   git ref to check out (default: main)
+#    HEATHER_DIM       vector dimension (default: 128)
+#    INSTALL_DIR       install root (default: /opt/heatherdb)
+#    SERVICE_USER      systemd user (default: heatherdb)
+#    SRC_DIR           where to clone heather-db (default: /usr/local/src/heather-db)
+#    SKIP_SMOKE_TEST   set to 1 to skip /health
+# ─────────────────────────────────────────────────────────────────────────────
+
+set -euo pipefail
+
+# ─── colours ──────────────────────────────────────────────────────────────────
+B="\033[1m"; D="\033[2m"; X="\033[0m"
+RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
+BLUE="\033[34m"; MAG="\033[35m"; CYAN="\033[36m"; PURPLE="\033[38;5;177m"
+
+banner() {
+  printf "${PURPLE}"
+  cat <<'EOF'
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │                                                                 │
+  │      ░█░█░█▀▀░█▀█░▀█▀░█░█░█▀▀░█▀▄░█▀▄░█▀▄                       │
+  │      ░█▀█░█▀▀░█▀█░░█░░█▀█░█▀▀░█▀▄░█░█░█▀▄                       │
+  │      ░▀░▀░▀▀▀░▀░▀░░▀░░▀░▀░▀▀▀░▀░▀░▀▀░░▀▀░                       │
+  │                                                                 │
+  │      memory that learns ⋅ at the price of a fancy sandwich      │
+  │                                                                 │
+  └─────────────────────────────────────────────────────────────────┘
+
+EOF
+  printf "${X}"
+}
+
+step()    { printf "\n${B}${BLUE}━━ %s${X}\n" "$*"; }
+ok()      { printf "  ${GREEN}✓${X} %s\n" "$*"; }
+warn()    { printf "  ${YELLOW}!${X} %s\n" "$*"; }
+err()     { printf "  ${RED}✗${X} %s\n" "$*" >&2; }
+say()     { printf "  ${D}%s${X}\n" "$*"; }
+note()    { printf "  ${CYAN}∙${X} %s\n" "$*"; }
+goofy()   { printf "  ${MAG}♪${X} ${D}%s${X}\n" "$*"; }
+
+spinner() {
+  local pid=$1 msg="$2"
+  local frames=( '·    ' ' ·   ' '  ·  ' '   · ' '    ·' '   · ' '  ·  ' ' ·   ' )
+  local i=0
+  while kill -0 "$pid" 2>/dev/null; do
+    printf "\r  ${CYAN}[%s]${X} %s" "${frames[i % ${#frames[@]}]}" "$msg"
+    i=$((i+1))
+    sleep 0.12
+  done
+  printf "\r  ${GREEN}[ ✓ ]${X} %s\n" "$msg"
+}
+
+# ─── must be root ─────────────────────────────────────────────────────────────
+if [ "$(id -u)" -ne 0 ]; then
+  banner
+  err "This script needs root. Try:  ${B}sudo $0${X}"
+  goofy "(it has to invent a user, write systemd files, that sort of thing)"
+  exit 1
+fi
+
+# ─── settings ─────────────────────────────────────────────────────────────────
+HEATHER_VERSION="${HEATHER_VERSION:-main}"
+HEATHER_DIM="${HEATHER_DIM:-128}"
+INSTALL_DIR="${INSTALL_DIR:-/opt/heatherdb}"
+SERVICE_USER="${SERVICE_USER:-heatherdb}"
+SRC_DIR="${SRC_DIR:-/usr/local/src/heather-db}"
+SKIP_SMOKE_TEST="${SKIP_SMOKE_TEST:-0}"
+REPO_URL="https://github.com/aphorion/heather-db"
+
+# If we're being invoked from inside an already-cloned repo (Option 1 in the
+# header), reuse it instead of cloning again. Detected by checking whether
+# this script lives inside a git work tree with our crates present.
+SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]:-$0}" )" 2>/dev/null && pwd || echo "" )"
+LOCAL_REPO=""
+if [ -n "$SCRIPT_DIR" ] \
+   && [ -d "$SCRIPT_DIR/../heather_server" ] \
+   && [ -f "$SCRIPT_DIR/../Cargo.toml" ]; then
+  LOCAL_REPO="$( cd "$SCRIPT_DIR/.." && pwd )"
+fi
+
+# ─── go ───────────────────────────────────────────────────────────────────────
+banner
+
+step "Preflight"
+say "Install dir   ${B}$INSTALL_DIR${X}"
+say "Service user  ${B}$SERVICE_USER${X}"
+say "Source dir    ${B}${LOCAL_REPO:-$SRC_DIR}${X}"
+say "Engine        ${B}heather_server${X}  (dim=$HEATHER_DIM, port=6380)"
+[ -n "$LOCAL_REPO" ] && say "Source        ${YELLOW}local checkout${X}" \
+                     || say "Source        ${YELLOW}clone${X}  (ref=$HEATHER_VERSION)"
+echo
+note "Press Ctrl-C in the next 3 seconds to back out."
+sleep 3 || true
+
+# ─── system deps ──────────────────────────────────────────────────────────────
+step "Installing system dependencies"
+
+if command -v apt-get >/dev/null 2>&1; then
+  PKG_MGR=apt
+elif command -v dnf >/dev/null 2>&1; then
+  PKG_MGR=dnf
+elif command -v yum >/dev/null 2>&1; then
+  PKG_MGR=yum
+else
+  err "No supported package manager (apt, dnf, yum). Install git + curl + a C toolchain manually, then re-run."
+  exit 1
+fi
+
+case "$PKG_MGR" in
+  apt)
+    DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null
+    DEBIAN_FRONTEND=noninteractive apt-get install -qq -y \
+      git curl ca-certificates build-essential pkg-config libssl-dev >/dev/null &
+    spinner $! "apt: git, curl, build-essential, libssl-dev"
+    ;;
+  dnf|yum)
+    $PKG_MGR install -y -q git curl ca-certificates gcc gcc-c++ make pkgconfig openssl-devel >/dev/null &
+    spinner $! "$PKG_MGR: git, curl, gcc, openssl-devel"
+    ;;
+esac
+ok "system deps in place ($PKG_MGR)"
+
+# ─── rust toolchain ───────────────────────────────────────────────────────────
+step "Rust toolchain"
+
+# Use SERVICE_USER's cargo dir if it exists, otherwise install for root.
+CARGO_BIN=""
+for candidate in /root/.cargo/bin/cargo /usr/local/cargo/bin/cargo $(command -v cargo); do
+  if [ -x "$candidate" ]; then CARGO_BIN="$candidate"; break; fi
+done
+
+if [ -z "$CARGO_BIN" ]; then
+  warn "rustup not found — installing as root (default toolchain stable, profile minimal)"
+  curl -sSf https://sh.rustup.rs | \
+    sh -s -- -y --profile minimal --default-toolchain stable >/dev/null 2>&1 &
+  spinner $! "installing rustup (one-time, ~3 min)"
+  CARGO_BIN="/root/.cargo/bin/cargo"
+fi
+
+if [ ! -x "$CARGO_BIN" ]; then
+  err "Couldn't locate cargo after install. Manual fix needed."
+  exit 1
+fi
+ok "cargo: $($CARGO_BIN --version)"
+
+# ─── service user + dirs ──────────────────────────────────────────────────────
+step "Carving out a home for HeatherDB"
+
+if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
+  useradd --system --shell /usr/sbin/nologin --home-dir "$INSTALL_DIR" "$SERVICE_USER"
+  ok "created user ${B}$SERVICE_USER${X}"
+else
+  ok "user ${B}$SERVICE_USER${X} already exists"
+fi
+
+mkdir -p "$INSTALL_DIR/data" /etc/heatherdb
+chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+
+if [ ! -f /etc/heatherdb/env ]; then
+  cat > /etc/heatherdb/env <<ENV
+HEATHER_DATA_DIR=$INSTALL_DIR/data
+HEATHER_DIMENSION=$HEATHER_DIM
+HEATHER_PORT=6380
+HEATHER_HOST=0.0.0.0
+HEATHER_MAP_SIZE_MB=4096
+HEATHER_REQUEST_TIMEOUT=600
+RUST_LOG=info
+ENV
+  chmod 0644 /etc/heatherdb/env
+  ok "wrote default /etc/heatherdb/env"
+else
+  ok "/etc/heatherdb/env already exists — leaving it alone"
+fi
+
+# ─── source ───────────────────────────────────────────────────────────────────
+step "Source code"
+
+if [ -n "$LOCAL_REPO" ]; then
+  BUILD_DIR="$LOCAL_REPO"
+  ok "using local checkout at ${B}$BUILD_DIR${X}"
+else
+  if [ ! -d "$SRC_DIR/.git" ]; then
+    say "cloning $REPO_URL → $SRC_DIR"
+    git clone --depth 1 --branch "$HEATHER_VERSION" "$REPO_URL" "$SRC_DIR" >/dev/null 2>&1 &
+    spinner $! "git clone (depth 1)"
+  else
+    say "updating existing checkout at $SRC_DIR"
+    ( cd "$SRC_DIR" \
+      && git fetch --depth 1 origin "$HEATHER_VERSION" >/dev/null 2>&1 \
+      && git reset --hard FETCH_HEAD >/dev/null 2>&1 ) &
+    spinner $! "git fetch + reset"
+  fi
+  BUILD_DIR="$SRC_DIR"
+  ok "source ready at ${B}$BUILD_DIR${X}  (ref=$HEATHER_VERSION)"
+fi
+
+# ─── build ────────────────────────────────────────────────────────────────────
+step "Building heather_server (release)"
+( cd "$BUILD_DIR" && "$CARGO_BIN" build --release -p heather_server >/dev/null 2>&1 ) &
+spinner $! "cargo build --release (slow on cold cache)"
+
+BIN_SRC="$BUILD_DIR/target/release/heather_server"
+if [ ! -x "$BIN_SRC" ]; then
+  err "Build appeared to succeed but $BIN_SRC is missing. Re-run with RUST_LOG=debug for verbose output."
+  exit 1
+fi
+install -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$BIN_SRC" "$INSTALL_DIR/heather_server"
+ok "binary installed: ${B}$INSTALL_DIR/heather_server${X}"
+
+# ─── systemd unit ─────────────────────────────────────────────────────────────
+step "Wiring up the systemd unit"
+
+UNIT_SRC=""
+if [ -f "$BUILD_DIR/deploy/systemd/heatherdb.service" ]; then
+  UNIT_SRC="$BUILD_DIR/deploy/systemd/heatherdb.service"
+elif [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/systemd/heatherdb.service" ]; then
+  UNIT_SRC="$SCRIPT_DIR/systemd/heatherdb.service"
+fi
+
+if [ -z "$UNIT_SRC" ]; then
+  warn "Couldn't find a packaged unit file — synthesising one."
+  cat > /etc/systemd/system/heatherdb.service <<UNIT
+[Unit]
+Description=HeatherDB
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=$SERVICE_USER
+Group=$SERVICE_USER
+WorkingDirectory=$INSTALL_DIR
+ExecStart=$INSTALL_DIR/heather_server
+Restart=always
+RestartSec=2
+LimitNOFILE=65536
+EnvironmentFile=-/etc/heatherdb/env
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=$INSTALL_DIR/data
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+else
+  install -m 0644 -o root -g root "$UNIT_SRC" /etc/systemd/system/heatherdb.service
+fi
+
+systemctl daemon-reload
+systemctl enable heatherdb >/dev/null 2>&1 || true
+systemctl restart heatherdb
+ok "systemctl restart heatherdb — unit enabled, boot-persistent, and running."
+
+# ─── smoke test ───────────────────────────────────────────────────────────────
+if [ "$SKIP_SMOKE_TEST" = "1" ]; then
+  warn "Skipping smoke test (SKIP_SMOKE_TEST=1)"
+else
+  step "Smoke test — does the database remember anything?"
+  for try in 1 2 3 4 5; do
+    if curl -fsS http://127.0.0.1:6380/health > /tmp/heatherdb_health 2>/dev/null; then
+      ok "/health responded:"
+      sed 's/^/      /' /tmp/heatherdb_health
+      rm -f /tmp/heatherdb_health
+      break
+    fi
+    say "attempt $try/5 — waiting for the server to wake up…"
+    sleep 1
+    if [ "$try" = 5 ]; then
+      err "/health never responded. Recent logs:"
+      journalctl -u heatherdb -n 30 --no-pager | sed 's/^/      /' || true
+      goofy "the database is having a moment. give it a minute then re-run, or check the logs above."
+      exit 1
+    fi
+  done
+fi
+
+# ─── confetti ─────────────────────────────────────────────────────────────────
+PUBLIC_IP="$(curl -fsS https://api.ipify.org 2>/dev/null || hostname -I 2>/dev/null | awk '{print $1}' || echo "this-vps")"
+
+echo
+printf "${GREEN}"
+cat <<'EOF'
+
+       ╔══════════════════════════════════════════════════════════════╗
+       ║                                                              ║
+       ║            DEPLOYED.  Memory is online.                      ║
+       ║                                                              ║
+       ║                .・゜゜・✧・゜゜・.                            ║
+       ║                                                              ║
+       ╚══════════════════════════════════════════════════════════════╝
+
+EOF
+printf "${X}"
+
+echo
+note "Engine reachable at:"
+echo "      ${B}http://${PUBLIC_IP}:6380${X}"
+echo
+note "Quick sanity:"
+echo "      ${D}curl http://127.0.0.1:6380/health${X}"
+echo "      ${D}curl http://127.0.0.1:6380/stats${X}"
+echo
+note "Logs:"
+echo "      ${D}journalctl -u heatherdb -f${X}"
+echo
+note "Tweak config:  ${B}/etc/heatherdb/env${X}  then  ${D}systemctl restart heatherdb${X}"
+echo
+note "Want HTTPS? Drop a Caddy reverse proxy in front. Two lines."
+echo
+goofy "go bother it with some vectors. it has been waiting."
+echo
