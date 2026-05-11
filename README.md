@@ -550,6 +550,20 @@ heather_db/
       models.rs           # JSON request/response types
 ```
 
+## Documentation
+
+Operator-grade docs live in [`docs/`](./docs/):
+
+| | |
+|---|---|
+| [Getting started](./docs/getting-started.md)         | Install → first authenticated request → first multi-DB setup |
+| [Authentication](./docs/auth.md)                     | HTTP Basic + scopes + the `user` CLI + **TLS guidance** |
+| [Databases](./docs/databases.md)                     | Multi-tenancy, per-DB dimensions, lifecycle, backup |
+| [HTTP API](./docs/api.md)                            | Every route, scope rules per endpoint, error matrix |
+| [Operations](./docs/operations.md)                   | Deploy / monitor / back up / upgrade |
+| [Fovea operator GUI](./docs/fovea.md)                | Desktop + web modes, all screens, state files |
+| [RFC 0001 — Multi-tenancy](./docs/0001-multi-tenancy.md) | Why the database layer exists, design tradeoffs |
+
 ## Inside this repo
 
 - **`heather_db/`** · **`heather_server/`** · **`heather_algebra/`** · **`heather_fornix/`** — the engine (Rust workspace).
