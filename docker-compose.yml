@@ -92,9 +92,6 @@ services:
     # operationally an Application — the platform doesn't currently
     # support custom Database providers.
 
-networks:
-  heather:
-    driver: bridge
 
 volumes:
   heatherdb_data:
