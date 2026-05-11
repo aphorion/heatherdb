@@ -139,29 +139,52 @@ fn deny_403(msg: &str) -> Response {
 
 /* ─── boot helpers ────────────────────────────────────────────────────────── */
 
-/// Bootstrap the user store. If empty, mint an `admin` user with a random
-/// password and print it once to stderr — operators have one chance to
-/// catch it.
-pub fn bootstrap_admin_if_needed(users: &UserStore) -> Result<(), String> {
+/// Bootstrap the user store on first boot.
+///
+/// - If the store is non-empty, this is a no-op.
+/// - Otherwise creates one Root-scoped user. The username defaults to
+///   `admin` (override with `--admin-user` / `HEATHER_ADMIN_USER`).
+/// - The password comes from `--admin-password` / `HEATHER_ADMIN_PASSWORD`
+///   when set, otherwise a 24-char random string is generated.
+/// - When the password was generated (no env), it's printed once in a
+///   fenced ASCII box on stderr — that's the operator's only chance to
+///   catch it. When supplied via env, nothing is printed (the operator
+///   already has it).
+pub fn bootstrap_admin_if_needed(
+    users: &UserStore,
+    user_name: &str,
+    explicit_password: Option<&str>,
+) -> Result<(), String> {
     if !users.is_empty() {
         return Ok(());
     }
-    let password = crate::users::generate_password(24);
-    users.create("admin", &password, Scope::Root)?;
+    let (password, was_generated) = match explicit_password {
+        Some(p) if !p.is_empty() => (p.to_string(), false),
+        _ => (crate::users::generate_password(24), true),
+    };
+    users.create(user_name, &password, Scope::Root)?;
 
-    eprintln!();
-    eprintln!("┌─────────────────────────────────────────────────────────────────────┐");
-    eprintln!("│ HeatherDB ⋅ first-boot admin user created.                          │");
-    eprintln!("│                                                                     │");
-    eprintln!("│   user      admin                                                   │");
-    eprintln!("│   password  {:<55}     │", password);
-    eprintln!("│   scope     root                                                    │");
-    eprintln!("│                                                                     │");
-    eprintln!("│ Save this password — it's NOT printed again.                        │");
-    eprintln!("│ Rotate any time with:                                               │");
-    eprintln!("│   heather_server user passwd admin --password '<new>'               │");
-    eprintln!("└─────────────────────────────────────────────────────────────────────┘");
-    eprintln!();
+    if was_generated {
+        eprintln!();
+        eprintln!("┌─────────────────────────────────────────────────────────────────────┐");
+        eprintln!("│ HeatherDB ⋅ first-boot admin user created.                          │");
+        eprintln!("│                                                                     │");
+        eprintln!("│   user      {:<55}     │", user_name);
+        eprintln!("│   password  {:<55}     │", password);
+        eprintln!("│   scope     root                                                    │");
+        eprintln!("│                                                                     │");
+        eprintln!("│ Save this password — it's NOT printed again.                        │");
+        eprintln!("│ Set HEATHER_ADMIN_USER + HEATHER_ADMIN_PASSWORD next time to skip   │");
+        eprintln!("│ the random-password dance, or rotate this one with:                 │");
+        eprintln!("│   heather_server user passwd <user> --password '<new>'              │");
+        eprintln!("└─────────────────────────────────────────────────────────────────────┘");
+        eprintln!();
+    } else {
+        tracing::info!(
+            user = user_name,
+            "Auth: bootstrapped admin user from HEATHER_ADMIN_USER + HEATHER_ADMIN_PASSWORD"
+        );
+    }
     Ok(())
 }
 

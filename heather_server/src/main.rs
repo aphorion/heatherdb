@@ -62,6 +62,18 @@ struct Args {
     #[arg(long, env = "HEATHER_AUTH_DISABLED", default_value = "false")]
     auth_disabled: bool,
 
+    /// First-boot admin username. Used only when the user store is empty
+    /// (i.e. brand-new data dir). After the user exists, this is ignored —
+    /// rename via `heather_server user delete <old> && user create <new>`.
+    #[arg(long, env = "HEATHER_ADMIN_USER", default_value = "admin")]
+    admin_user: String,
+
+    /// First-boot admin password. Used only when the user store is empty.
+    /// If unset and the store is empty, the engine generates a random
+    /// password and prints it ONCE to stderr.
+    #[arg(long, env = "HEATHER_ADMIN_PASSWORD")]
+    admin_password: Option<String>,
+
     #[command(subcommand)]
     command: Option<Cmd>,
 }
@@ -167,9 +179,14 @@ async fn serve(args: Args) -> std::process::ExitCode {
         );
         auth::AuthState::disabled(user_store.clone())
     } else {
-        // First-boot bootstrap: mint an admin user with a random password
-        // and print it once to stderr.
-        if let Err(e) = auth::bootstrap_admin_if_needed(&user_store) {
+        // First-boot bootstrap: mint an admin user. If the operator gave
+        // us HEATHER_ADMIN_USER + HEATHER_ADMIN_PASSWORD use those;
+        // otherwise generate a random password and print it once.
+        if let Err(e) = auth::bootstrap_admin_if_needed(
+            &user_store,
+            &args.admin_user,
+            args.admin_password.as_deref(),
+        ) {
             eprintln!("error: bootstrap admin user: {e}");
             return std::process::ExitCode::FAILURE;
         }
