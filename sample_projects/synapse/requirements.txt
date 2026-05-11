@@ -1,5 +1,0 @@
-httpx
-torch
-torchvision
-numpy
-python-dotenv

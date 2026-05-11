@@ -1,4 +1,0 @@
-sentence-transformers
-httpx
-python-dotenv
-numpy
