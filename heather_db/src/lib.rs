@@ -35,18 +35,22 @@
 
 pub mod collection;
 pub mod config;
+pub mod db_config;
 pub mod error;
 pub mod hive;
 pub mod location;
 pub mod merge;
 pub mod read;
+pub mod server;
 pub mod store;
 pub mod vec_ops;
 pub mod write;
 
 pub use collection::{Collection, LocationSummary, ReadStrategy, EAMStats};
 pub use config::EAMConfig;
+pub use db_config::{validate_db_name, DbConfig, DEFAULT_MAP_SIZE_MB};
 pub use error::HeatherError;
 pub use hive::Hive;
 pub use location::{HardLocation, LocationId};
 pub use read::{ActivatedLocation, ReadTrace};
+pub use server::{default_db_config, Server, DEFAULT_DB};

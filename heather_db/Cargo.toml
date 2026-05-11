@@ -11,9 +11,13 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 rayon = "1"
+# Per-database persisted config (db.toml) — see db_config.rs.
+toml = "0.8"
+# Used by `Server`'s tests AND by downstream tooling that wants scratch
+# dirs for spin-up scripts; cheap, leave in default deps.
+tempfile = "3"
 
 [dev-dependencies]
-tempfile = "3"
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [[bench]]

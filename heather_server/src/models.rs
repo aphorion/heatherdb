@@ -67,6 +67,36 @@ pub struct CreateCollectionResponse {
     pub created: bool,
 }
 
+// ─── Database (multi-tenancy) ─────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize)]
+pub struct CreateDatabaseRequest {
+    pub name: String,
+    pub dimension: usize,
+    /// Optional LMDB map size in MB (default: 4096).
+    #[serde(default)]
+    pub map_size_mb: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DatabaseInfo {
+    pub name: String,
+    pub created_at: u64,
+    pub dimension: usize,
+    pub map_size_mb: usize,
+    pub collections: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ListDatabasesResponse {
+    pub databases: Vec<DatabaseInfo>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DropDatabaseResponse {
+    pub dropped: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ListCollectionsResponse {
     pub collections: Vec<String>,
