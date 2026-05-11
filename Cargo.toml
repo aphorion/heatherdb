@@ -1,3 +1,7 @@
 [workspace]
 members = ["heather_db", "heather_server", "heather_algebra", "heather_fornix"]
+# fovea/ is a Tauri 2 + React app — its src-tauri/Cargo.toml is its own
+# package and should not be pulled into this engine workspace (different
+# resolver, different deps, different build cadence).
+exclude = ["fovea/src-tauri"]
 resolver = "3"

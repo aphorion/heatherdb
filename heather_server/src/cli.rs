@@ -105,7 +105,7 @@ pub fn run(data_dir: &PathBuf, cmd: &UserCmd) -> ExitCode {
 
 /// Tiny YYYY-MM-DD HH:MM:SSZ formatter — avoids pulling in `chrono`. Good
 /// enough for `user list` output. Treats input as Unix epoch seconds.
-fn chrono_format(epoch_secs: u64) -> String {
+pub(crate) fn chrono_format(epoch_secs: u64) -> String {
     // Days from 1970-01-01 to compute the calendar date (proleptic
     // Gregorian). Ports a small chunk of Howard Hinnant's date algorithms.
     let days = (epoch_secs / 86_400) as i64;

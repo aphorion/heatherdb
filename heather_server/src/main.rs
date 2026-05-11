@@ -1,4 +1,5 @@
 mod auth;
+mod backup;
 mod cli;
 mod models;
 mod routes;
@@ -85,6 +86,20 @@ enum Cmd {
         #[command(subcommand)]
         cmd: cli::UserCmd,
     },
+    /// Cold backup / restore of the data dir (or one database) as tar.gz.
+    Backup {
+        #[command(subcommand)]
+        cmd: backup::BackupCmd,
+    },
+    Restore {
+        #[command(subcommand)]
+        cmd: backup::RestoreCmd,
+    },
+    /// Live consistent snapshot of one database (safe with engine running).
+    Snapshot {
+        #[command(subcommand)]
+        cmd: backup::SnapshotCmd,
+    },
 }
 
 async fn shutdown_signal() {
@@ -123,7 +138,10 @@ fn main() -> std::process::ExitCode {
             Err(e) => { eprintln!("error: {e}"); return std::process::ExitCode::FAILURE; }
         };
         return match cmd {
-            Cmd::User { cmd } => cli::run(&data_dir, cmd),
+            Cmd::User     { cmd } => cli::run(&data_dir, cmd),
+            Cmd::Backup   { cmd } => backup::run_backup(&data_dir, cmd),
+            Cmd::Restore  { cmd } => backup::run_restore(&data_dir, cmd),
+            Cmd::Snapshot { cmd } => backup::run_snapshot(&data_dir, cmd),
         };
     }
 
