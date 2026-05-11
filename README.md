@@ -570,6 +570,53 @@ cargo bench -p heather_db --bench graph_search         # graph vs flat activatio
 
 *"Adaptive Elastic Associative Memory: Self-Organizing Indexing with Energy-Based Retrieval"*
 
+## Releases
+
+Pre-built binaries for every tagged release land on
+[GitHub Releases](https://github.com/aphorion/heather-db/releases).
+Eight targets per release:
+
+```
+linux-x86_64-gnu       linux-x86_64-musl       (Linux glibc / Alpine-static)
+linux-aarch64-gnu      linux-aarch64-musl      (Linux arm64, glibc / static)
+macos-x86_64           macos-aarch64           (Intel / Apple Silicon)
+windows-x86_64         freebsd-x86_64          (MSVC / FreeBSD 14)
+```
+
+Each `.tar.gz`/`.zip` ships next to a combined `SHA256SUMS.txt`:
+
+```bash
+VERSION=v0.1.0
+TARGET=linux-x86_64-musl
+curl -fsSLO "https://github.com/aphorion/heather-db/releases/download/${VERSION}/heather_server-${VERSION}-${TARGET}.tar.gz"
+curl -fsSLO "https://github.com/aphorion/heather-db/releases/download/${VERSION}/SHA256SUMS.txt"
+sha256sum --check SHA256SUMS.txt --ignore-missing
+tar -xzf "heather_server-${VERSION}-${TARGET}.tar.gz"
+./heather_server-${VERSION}-${TARGET}/heather_server --help
+```
+
+Container images are published to GHCR on every tag and on `main`:
+
+```bash
+# Latest stable
+docker pull ghcr.io/aphorion/heather-db:latest
+
+# A specific tag
+docker pull ghcr.io/aphorion/heather-db:v0.1.0
+
+# Bleeding edge (auto-built from main)
+docker pull ghcr.io/aphorion/heather-db:edge
+```
+
+All published images are signed with [cosign](https://github.com/sigstore/cosign)
+keyless. Verify:
+
+```bash
+cosign verify ghcr.io/aphorion/heather-db:v0.1.0 \
+  --certificate-identity-regexp "^https://github.com/aphorion/heather-db/" \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
 ## License
 
 TBD

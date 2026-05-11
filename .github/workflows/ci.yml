@@ -1,0 +1,142 @@
+name: CI
+
+# Build, lint, and test on every push to main and every PR. Three OSes
+# (Linux, macOS, Windows) on stable + beta. FreeBSD is exercised in the
+# release workflow only — booting a VM per PR is overkill.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**", ".github/ISSUE_TEMPLATE/**"]
+  pull_request:
+    paths-ignore: ["**.md", "docs/**", ".github/ISSUE_TEMPLATE/**"]
+  workflow_dispatch:
+
+# Don't pile up CI runs for the same branch — supersede in-flight ones.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  CARGO_INCREMENTAL: 0          # CI = no incremental, tighter caches
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ─── fast feedback: format check, runs first, kills bad PRs early ───────────
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # ─── lint: clippy with deny-warnings, on stable Linux ──────────────────────
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-linux
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  # ─── tests: matrix across OS × toolchain ────────────────────────────────────
+  test:
+    name: test (${{ matrix.os }} · ${{ matrix.rust }})
+    needs: fmt
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+        rust: [stable]
+        include:
+          # Beta on Linux only — cheaper than full matrix, still catches
+          # regressions early.
+          - os: ubuntu-latest
+            rust: beta
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ${{ matrix.rust }} toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-${{ matrix.os }}
+
+      - name: Build
+        run: cargo build --workspace --release --locked
+
+      - name: Run tests
+        run: cargo test --workspace --release --locked --no-fail-fast
+
+  # ─── docs: catch broken intra-doc links ─────────────────────────────────────
+  doc:
+    name: doc
+    runs-on: ubuntu-latest
+    needs: fmt
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-linux
+      - run: cargo doc --workspace --no-deps --document-private-items
+
+  # ─── audit: cargo-audit nightly DB sweep against Cargo.lock ─────────────────
+  audit:
+    name: audit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # ─── msrv: ensure we still build on the documented minimum supported Rust ──
+  # Set MSRV to the Cargo.toml `rust-version` if present, otherwise pick a
+  # known-good floor. Adjust as needed.
+  msrv:
+    name: msrv (1.84)
+    runs-on: ubuntu-latest
+    needs: fmt
+    steps:
+      - uses: actions/checkout@v4
+      # Cargo workspace uses resolver = "3", which requires Rust 1.84+.
+      # Bump alongside any Cargo.toml `rust-version` change.
+      - uses: dtolnay/rust-toolchain@1.84
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-msrv
+      - run: cargo build --workspace --locked
+
+  # ─── final gate: every other job must pass for the PR to be mergeable ──────
+  ci-success:
+    name: CI passed
+    if: always()
+    runs-on: ubuntu-latest
+    needs: [fmt, clippy, test, doc, msrv]
+    steps:
+      - name: Aggregate results
+        env:
+          NEEDS: ${{ toJson(needs) }}
+        run: |
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          echo "$NEEDS" | jq -e 'all(.[]; .result == "success")' >/dev/null

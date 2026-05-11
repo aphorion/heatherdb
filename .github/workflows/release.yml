@@ -1,0 +1,316 @@
+name: Release
+
+# Triggered by tags shaped like v*.*.* (e.g. v0.1.0, v1.2.3-rc.1).
+#
+# Builds heather_server for every supported target, packages each as a
+# .tar.gz (Unix) or .zip (Windows), generates SHA-256 checksums, and
+# attaches everything to a GitHub Release.
+#
+# Targets:
+#   linux-x86_64-gnu      Linux glibc 2.31+
+#   linux-x86_64-musl     Linux static (works on Alpine + everything)
+#   linux-aarch64-gnu     Linux glibc 2.31+, arm64
+#   linux-aarch64-musl    Linux static, arm64
+#   macos-x86_64          macOS Intel
+#   macos-aarch64         macOS Apple Silicon
+#   windows-x86_64        Windows MSVC
+#   freebsd-x86_64        FreeBSD 14, built inside a QEMU VM
+#
+# Manual trigger: workflow_dispatch with a version input lets you cut a
+# release without pushing a tag (useful for hotfix experiments).
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write          # needed to create the GitHub Release
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: short
+  CARGO_INCREMENTAL: 0
+  BINARY_NAME: heather_server
+
+jobs:
+  # ─── derive a single canonical version string for downstream jobs ───────────
+  prep:
+    name: Prepare release metadata
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.derive.outputs.version }}
+    steps:
+      - id: derive
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "version=${{ inputs.version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+  # ─── linux + macOS + windows: standard cross-compile matrix ────────────────
+  build:
+    name: ${{ matrix.label }}
+    needs: prep
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: linux-x86_64-gnu
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cross: false
+          - label: linux-x86_64-musl
+            os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            cross: true                         # use cross-rs for static musl
+          - label: linux-aarch64-gnu
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            cross: true
+          - label: linux-aarch64-musl
+            os: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            cross: true
+          - label: macos-x86_64
+            os: macos-13                        # Intel runners (last available)
+            target: x86_64-apple-darwin
+            cross: false
+          - label: macos-aarch64
+            os: macos-14                        # Apple Silicon runners
+            target: aarch64-apple-darwin
+            cross: false
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+            ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (stable, target ${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-rs (for ${{ matrix.target }})
+        if: matrix.cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        shell: bash
+        run: |
+          set -euxo pipefail
+          if [ "${{ matrix.cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }} -p ${{ env.BINARY_NAME }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.BINARY_NAME }}
+          fi
+
+      - name: Strip binary (Unix only)
+        if: runner.os != 'Windows' && !matrix.cross
+        shell: bash
+        run: |
+          BIN=target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
+          strip "$BIN" || true
+
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+          LABEL:   ${{ matrix.label }}
+          EXT:     ${{ matrix.ext }}
+        run: |
+          set -euxo pipefail
+
+          STAGE="${BINARY_NAME}-${VERSION}-${LABEL}"
+          mkdir -p "dist/$STAGE"
+
+          BIN="target/${{ matrix.target }}/release/${BINARY_NAME}${EXT}"
+          cp "$BIN" "dist/$STAGE/"
+          cp README.md     "dist/$STAGE/" 2>/dev/null || true
+          cp LICENSE*      "dist/$STAGE/" 2>/dev/null || true
+          cp CHANGELOG*    "dist/$STAGE/" 2>/dev/null || true
+
+          cd dist
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            ASSET="${STAGE}.zip"
+            7z a -tzip "$ASSET" "$STAGE" >/dev/null
+          else
+            ASSET="${STAGE}.tar.gz"
+            tar -czf "$ASSET" "$STAGE"
+          fi
+
+          # SHA-256 sidecar — portable across mac/linux runners.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ASSET" > "${ASSET}.sha256"
+          else
+            shasum -a 256 "$ASSET" > "${ASSET}.sha256"
+          fi
+
+          echo "asset=dist/$ASSET"        >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/$ASSET.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ─── FreeBSD: build inside a QEMU-driven FreeBSD 14 VM ──────────────────────
+  build-freebsd:
+    name: freebsd-x86_64
+    needs: prep
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build inside FreeBSD VM
+        id: build
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "14.1"
+          usesh: true
+          mem: 4096
+          cpu: 4
+          # Sync workspace into the VM read-write so the build artefact
+          # we need is reachable after the VM exits.
+          sync: rsync
+          copyback: true
+          prepare: |
+            pkg install -y curl bash gmake pkgconf openssl
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+              | sh -s -- -y --profile minimal --default-toolchain stable
+          run: |
+            . "$HOME/.cargo/env"
+            cargo --version
+            cargo build --release --locked -p ${{ env.BINARY_NAME }}
+            strip target/release/${{ env.BINARY_NAME }} || true
+
+      - name: Package FreeBSD asset
+        id: package
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          set -euxo pipefail
+          LABEL=freebsd-x86_64
+          STAGE="${BINARY_NAME}-${VERSION}-${LABEL}"
+          mkdir -p "dist/$STAGE"
+          cp target/release/${BINARY_NAME} "dist/$STAGE/"
+          cp README.md "dist/$STAGE/" 2>/dev/null || true
+          cp LICENSE*  "dist/$STAGE/" 2>/dev/null || true
+
+          cd dist
+          tar -czf "${STAGE}.tar.gz" "$STAGE"
+          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
+          echo "asset=dist/${STAGE}.tar.gz"        >> "$GITHUB_OUTPUT"
+          echo "checksum=dist/${STAGE}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: freebsd-x86_64
+          path: |
+            ${{ steps.package.outputs.asset }}
+            ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # ─── publish: collect artifacts, generate one combined SHA file, release ────
+  release:
+    name: Publish GitHub Release
+    needs: [prep, build, build-freebsd]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0           # need history for the changelog
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Combined SHA-256 manifest
+        working-directory: dist
+        run: |
+          set -euxo pipefail
+          sha256sum *.tar.gz *.zip 2>/dev/null > SHA256SUMS.txt || true
+          cat SHA256SUMS.txt
+          # Drop per-asset .sha256 sidecars now that we have a single manifest.
+          rm -f *.sha256
+
+      - name: Generate changelog (commits since last tag)
+        id: changelog
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          set -e
+          PREV="$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || echo "")"
+          {
+            echo "## What's in $VERSION"
+            echo
+            if [ -n "$PREV" ]; then
+              echo "Changes since \`$PREV\`:"
+              echo
+              git log --pretty=format:"- %s (%h)" "$PREV..$VERSION" \
+                | grep -v -e '^- Merge ' -e '^- chore: bump' || true
+            else
+              echo "Initial release."
+            fi
+            echo
+            echo "## Downloads"
+            echo
+            echo "| Platform | Asset |"
+            echo "|----------|-------|"
+            for f in dist/*.tar.gz dist/*.zip; do
+              [ -f "$f" ] || continue
+              name="$(basename "$f")"
+              # crude label parse — strip BIN_NAME-VERSION- prefix
+              plat="${name#${BINARY_NAME}-${VERSION}-}"
+              plat="${plat%.tar.gz}"; plat="${plat%.zip}"
+              echo "| \`$plat\` | [\`$name\`](https://github.com/${{ github.repository }}/releases/download/${VERSION}/${name}) |"
+            done
+            echo
+            echo "Verify with the bundled \`SHA256SUMS.txt\`:"
+            echo
+            echo '```sh'
+            echo "curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${VERSION}/SHA256SUMS.txt"
+            echo "sha256sum --check SHA256SUMS.txt --ignore-missing"
+            echo '```'
+          } > RELEASE_NOTES.md
+          echo "notes_path=RELEASE_NOTES.md" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: ${{ needs.prep.outputs.version }}
+          tag_name: ${{ needs.prep.outputs.version }}
+          body_path: ${{ steps.changelog.outputs.notes_path }}
+          draft: false
+          prerelease: ${{ contains(needs.prep.outputs.version, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS.txt
