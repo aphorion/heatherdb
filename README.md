@@ -101,7 +101,9 @@ Each project uses the same two operations — write and read — against the sam
 | **Cortex** | Thinking notebook (Next.js + FastAPI) | 384 | Web app comparing EAM vs vector search |
 | **Emergence** | Zero-shot capability via memory composition | 384 | Coder+Writer→Documentation without training |
 
-See `sample_projects/` for full source code and READMEs.
+Source code + per-project READMEs live in the standalone
+[`heatherdb-samples`](https://github.com/aphorion/heatherdb-samples) repo
+(formerly `sample_projects/` here).
 
 ## The fidelity signal
 
@@ -570,8 +572,16 @@ heather_db/
       main.rs             # CLI, startup, configuration
       routes.rs           # Request handlers
       models.rs           # JSON request/response types
-  sample_projects/        # 15 demo applications
 ```
+
+## Related repos
+
+- [`heatherdb-samples`](https://github.com/aphorion/heatherdb-samples) — 26
+  example apps (Memoria, Cinema2, Lexicon, Sentinel, Cortex, Emergence, …).
+- [`heatherdb-pi-demo`](https://github.com/aphorion/heatherdb-pi-demo) —
+  conference / demo-day rig: recommender catalog, FastAPI proxy, Pi cross-compile.
+- [`heatherdb-landing`](https://github.com/aphorion/heatherdb-landing) — the
+  product website at heather.aphorion.co.
 
 ## Running tests
 
