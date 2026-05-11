@@ -10,6 +10,15 @@ are different from a plain `docker compose` deploy.
 
 ## One-time: create the application
 
+> Coolify's "Database" resource type is reserved for one-click
+> managed services it provisions itself (Postgres, MariaDB, MongoDB,
+> Redis, etc.) — it has its own backup widget, scheduled snapshots,
+> connection-string generator. Compose-from-git deploys (this) are
+> always Applications. HeatherDB is semantically a database but
+> operationally an Application; we get the same backups + snapshots
+> via the [`heather backup` / `snapshot` CLI](./operations.md#backups)
+> instead of Coolify's database widget.
+
 1. **New Resource → Application → Public Repository** (or Private if you
    wired your GitHub PAT into Coolify already).
 2. Pick the repo (`aphorion/heather-db`). Branch: `main` (or pin a tag).

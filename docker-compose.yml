@@ -85,14 +85,12 @@ services:
     networks:
       - heather
 
-    # Coolify reads these labels for its dashboard. Adding them
-    # explicitly so the application name + description are sensible
-    # without manual UI tweaking. Custom labels under `coolify.*`
-    # are ignored by other compose runners.
-    labels:
-      coolify.managed: "true"
-      coolify.name: "heatherdb"
-      coolify.type: "application"
+    # Note on Coolify's resource taxonomy: an "Application" in Coolify
+    # is anything deployed from a git repo (this), and a "Database" is
+    # a one-click managed service Coolify provisions itself (Postgres,
+    # Redis, etc.). HeatherDB is semantically a database but it's
+    # operationally an Application — the platform doesn't currently
+    # support custom Database providers.
 
 networks:
   heather:
