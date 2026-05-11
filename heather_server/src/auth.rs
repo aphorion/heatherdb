@@ -1,15 +1,21 @@
-//! Optional bearer-token auth.
+//! HTTP Basic Auth + per-database scope.
 //!
-//! Activated by setting `HEATHER_AUTH_TOKEN` (or `--auth-token`). When set,
-//! every request except `/health` must carry `Authorization: Bearer <token>`
-//! with an exact match. When unset, the engine runs unauthenticated and
-//! emits a one-time warning at boot — fine for a single-user laptop or
-//! a Docker network, dangerous on anything internet-facing.
+//! Auth is **on by default**. On a fresh boot the engine creates an
+//! `admin` user with a random 24-char password and prints it ONCE to
+//! stderr — that's the operator's chance to copy it. Subsequent boots
+//! never reprint; rotate via `heather_server user passwd admin`.
 //!
-//! Why bearer + simple equality and not JWT/OAuth? The engine is a
-//! single-tenant secret right now (token == admin). When real per-DB auth
-//! lands (RFC 0001 v0.3) this gets replaced with scoped keys; the
-//! middleware shape will stay similar.
+//! Every request except `/health` carries `Authorization: Basic
+//! base64(user:password)`. The middleware verifies the credentials
+//! against the user store and then checks the user's scope against the
+//! request path:
+//!
+//!   - `Scope::Root`               → any route.
+//!   - `Scope::Database("default")`→ /db/default/*, /collections/*, /algebra/*, /compose/*
+//!   - `Scope::Database(name)`     → /db/{name}/* only.
+//!
+//! Auth can be disabled for local dev with `HEATHER_AUTH_DISABLED=1`
+//! (the engine emits a loud one-time warning at boot in that mode).
 
 use std::sync::Arc;
 
@@ -19,39 +25,29 @@ use axum::http::{header, Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 
 use crate::models::ErrorResponse;
+use crate::users::{is_authorized, Scope, UserStore};
 
-/// Auth state shared across handlers via axum's [`State`] extractor.
-///
-/// Cheap to clone — the token is wrapped in `Arc<str>`. Comparison happens
-/// in `O(n)` per request which is fine because tokens are tens of bytes
-/// and we don't accept high request rates from unauthenticated clients
-/// (we reject before doing any expensive work).
+/// What the auth middleware needs at runtime. Cheap to clone (`Arc`s).
 #[derive(Clone)]
-pub struct AuthConfig {
-    /// `None` → no auth enforcement (warn-only).
-    /// `Some(t)` → all routes (except [`unauth_routes`]) require Bearer t.
-    pub token: Option<Arc<str>>,
+pub struct AuthState {
+    pub users: Arc<UserStore>,
+    pub disabled: bool,
 }
 
-impl AuthConfig {
-    pub fn disabled() -> Self {
-        Self { token: None }
+impl AuthState {
+    pub fn enabled(users: Arc<UserStore>) -> Self {
+        Self { users, disabled: false }
     }
-    pub fn with_token(token: impl Into<String>) -> Self {
-        Self {
-            token: Some(Arc::from(token.into())),
-        }
-    }
-    #[allow(dead_code)]
-    pub fn is_enabled(&self) -> bool {
-        self.token.is_some()
+    pub fn disabled(users: Arc<UserStore>) -> Self {
+        Self { users, disabled: true }
     }
 }
 
-/// Routes that should never trigger auth — health/liveness checks need to
-/// work for monitoring agents that don't carry credentials.
+/// Routes that always pass without a credential check.
 pub fn is_unauth_route(path: &str) -> bool {
     matches!(path, "/health" | "/healthz" | "/ready" | "/readyz")
 }
@@ -59,68 +55,114 @@ pub fn is_unauth_route(path: &str) -> bool {
 /// Axum middleware. Plug in via:
 ///
 /// ```ignore
-/// .layer(middleware::from_fn_with_state(auth_state.clone(), auth::middleware))
+/// .layer(middleware::from_fn_with_state(auth.clone(), auth::middleware))
 /// ```
 pub async fn middleware(
-    State(auth): State<AuthConfig>,
+    State(auth): State<AuthState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    // No-auth fast path.
-    let Some(expected) = auth.token.as_deref() else {
-        return next.run(req).await;
-    };
+    let path = req.uri().path().to_string();
 
-    // Health-style routes always pass.
-    if is_unauth_route(req.uri().path()) {
+    if auth.disabled || is_unauth_route(&path) {
         return next.run(req).await;
     }
 
-    // Extract `Authorization: Bearer <token>`.
-    let presented = req
+    // Parse the Authorization header.
+    let header_val = req
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.strip_prefix("Bearer "))
-        .map(|s| s.trim());
+        .and_then(|v| v.to_str().ok());
 
-    match presented {
-        Some(t) if constant_time_eq(t.as_bytes(), expected.as_bytes()) => next.run(req).await,
-        Some(_) => deny(StatusCode::FORBIDDEN, "invalid bearer token"),
-        None => {
-            // 401 with WWW-Authenticate per RFC 6750 §3.
-            let mut resp = deny(StatusCode::UNAUTHORIZED, "missing Authorization header");
-            resp.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                "Bearer realm=\"heatherdb\"".parse().unwrap(),
-            );
-            resp
-        }
+    let creds = match header_val.and_then(parse_basic) {
+        Some(c) => c,
+        None => return deny_401("missing or malformed Authorization header"),
+    };
+
+    // Verify the credentials.
+    let user = match auth.users.verify(&creds.user, &creds.password) {
+        Some(u) => u,
+        None => return deny_401("invalid credentials"),
+    };
+
+    // Check scope vs route.
+    if !is_authorized(&user.scope, &path) {
+        return deny_403(&format!(
+            "user '{}' (scope {}) is not authorised for {}",
+            user.name,
+            user.scope.label(),
+            path
+        ));
     }
+
+    next.run(req).await
 }
 
-fn deny(status: StatusCode, msg: &str) -> Response {
+/* ─── plumbing ────────────────────────────────────────────────────────────── */
+
+struct BasicCreds {
+    user: String,
+    password: String,
+}
+
+fn parse_basic(header_value: &str) -> Option<BasicCreds> {
+    let token = header_value.strip_prefix("Basic ")?.trim();
+    let raw = B64.decode(token).ok()?;
+    let decoded = String::from_utf8(raw).ok()?;
+    let (u, p) = decoded.split_once(':')?;
+    Some(BasicCreds {
+        user: u.to_string(),
+        password: p.to_string(),
+    })
+}
+
+fn deny_401(msg: &str) -> Response {
+    let mut resp = (
+        StatusCode::UNAUTHORIZED,
+        Json(ErrorResponse { error: msg.to_string() }),
+    )
+        .into_response();
+    resp.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        "Basic realm=\"heatherdb\", charset=\"UTF-8\"".parse().unwrap(),
+    );
+    resp
+}
+
+fn deny_403(msg: &str) -> Response {
     (
-        status,
-        Json(ErrorResponse {
-            error: msg.to_string(),
-        }),
+        StatusCode::FORBIDDEN,
+        Json(ErrorResponse { error: msg.to_string() }),
     )
         .into_response()
 }
 
-/// Constant-time byte equality. Avoids leaking token length / prefix
-/// information through the timing side-channel. Cheap; no need for a
-/// dedicated crate.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+/* ─── boot helpers ────────────────────────────────────────────────────────── */
+
+/// Bootstrap the user store. If empty, mint an `admin` user with a random
+/// password and print it once to stderr — operators have one chance to
+/// catch it.
+pub fn bootstrap_admin_if_needed(users: &UserStore) -> Result<(), String> {
+    if !users.is_empty() {
+        return Ok(());
     }
-    let mut diff: u8 = 0;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+    let password = crate::users::generate_password(24);
+    users.create("admin", &password, Scope::Root)?;
+
+    eprintln!();
+    eprintln!("┌─────────────────────────────────────────────────────────────────────┐");
+    eprintln!("│ HeatherDB ⋅ first-boot admin user created.                          │");
+    eprintln!("│                                                                     │");
+    eprintln!("│   user      admin                                                   │");
+    eprintln!("│   password  {:<55}     │", password);
+    eprintln!("│   scope     root                                                    │");
+    eprintln!("│                                                                     │");
+    eprintln!("│ Save this password — it's NOT printed again.                        │");
+    eprintln!("│ Rotate any time with:                                               │");
+    eprintln!("│   heather_server user passwd admin --password '<new>'               │");
+    eprintln!("└─────────────────────────────────────────────────────────────────────┘");
+    eprintln!();
+    Ok(())
 }
 
 #[cfg(test)]
@@ -128,22 +170,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ct_eq_same_len_match() {
-        assert!(constant_time_eq(b"abcdef", b"abcdef"));
+    fn parse_basic_ok() {
+        let c = parse_basic("Basic YWRtaW46aHVudGVyMjI=").unwrap(); // admin:hunter22
+        assert_eq!(c.user, "admin");
+        assert_eq!(c.password, "hunter22");
     }
     #[test]
-    fn ct_eq_diff() {
-        assert!(!constant_time_eq(b"abcdef", b"abcdez"));
+    fn parse_basic_with_colon_in_password() {
+        // base64("alice:p:a:s:s")
+        let c = parse_basic("Basic YWxpY2U6cDphOnM6cw==").unwrap();
+        assert_eq!(c.user, "alice");
+        assert_eq!(c.password, "p:a:s:s");
     }
     #[test]
-    fn ct_eq_diff_len() {
-        assert!(!constant_time_eq(b"abc", b"abcd"));
+    fn parse_basic_rejects_non_basic() {
+        assert!(parse_basic("Bearer abc").is_none());
+        assert!(parse_basic("Digest x").is_none());
     }
     #[test]
     fn unauth_routes() {
         assert!(is_unauth_route("/health"));
-        assert!(is_unauth_route("/readyz"));
         assert!(!is_unauth_route("/db"));
-        assert!(!is_unauth_route("/collections/foo/write"));
     }
 }

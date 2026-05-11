@@ -1,7 +1,9 @@
 mod auth;
+mod cli;
 mod models;
 mod routes;
 mod routes_db;
+mod users;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -11,7 +13,7 @@ use axum::extract::{DefaultBodyLimit, Extension};
 use axum::middleware;
 use axum::routing::{delete, get, post};
 use axum::Router;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use heather_db::{Server, DEFAULT_DB};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
@@ -22,14 +24,15 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(name = "heather_server", about = "HeatherDB server")]
 struct Args {
-    /// Directory for database storage (root for `db/<name>/...`).
-    #[arg(long, env = "HEATHER_DATA_DIR")]
-    data_dir: PathBuf,
+    /// Directory for database storage (root for `db/<name>/...` and the
+    /// users.json file).
+    #[arg(long, env = "HEATHER_DATA_DIR", global = true)]
+    data_dir: Option<PathBuf>,
 
     /// Vector dimension for the auto-created `default` database. Once
     /// `default` exists on disk this value is ignored — the persisted
     /// `db.toml` wins. Other databases set their own dimension at create.
-    #[arg(long, env = "HEATHER_DIMENSION")]
+    #[arg(long, env = "HEATHER_DIMENSION", default_value = "128", global = true)]
     dimension: usize,
 
     /// Listen port
@@ -53,11 +56,23 @@ struct Args {
     #[arg(long, env = "HEATHER_MAP_SIZE_MB", default_value = "256")]
     map_size_mb: usize,
 
-    /// Optional bearer token. When set, every route except /health requires
-    /// `Authorization: Bearer <token>`. When unset, the server runs
-    /// unauthenticated (a one-time warning is printed at boot).
-    #[arg(long, env = "HEATHER_AUTH_TOKEN")]
-    auth_token: Option<String>,
+    /// DANGER: disable HTTP Basic Auth entirely. Local dev only — anyone
+    /// who can reach the port has full read+write access. Refuses to
+    /// accept silently: emits a one-time loud warning at boot.
+    #[arg(long, env = "HEATHER_AUTH_DISABLED", default_value = "false")]
+    auth_disabled: bool,
+
+    #[command(subcommand)]
+    command: Option<Cmd>,
+}
+
+#[derive(Subcommand)]
+enum Cmd {
+    /// Manage HTTP Basic Auth users (created in $HEATHER_DATA_DIR/users.json).
+    User {
+        #[command(subcommand)]
+        cmd: cli::UserCmd,
+    },
 }
 
 async fn shutdown_signal() {
@@ -86,54 +101,88 @@ async fn shutdown_signal() {
     tracing::info!("Shutdown signal received, starting graceful shutdown");
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> std::process::ExitCode {
+    let args = Args::parse();
+
+    // Sub-commands run synchronously and exit, no HTTP server.
+    if let Some(cmd) = &args.command {
+        let data_dir = match resolve_data_dir(&args) {
+            Ok(d) => d,
+            Err(e) => { eprintln!("error: {e}"); return std::process::ExitCode::FAILURE; }
+        };
+        return match cmd {
+            Cmd::User { cmd } => cli::run(&data_dir, cmd),
+        };
+    }
+
+    serve(args)
+}
+
+fn resolve_data_dir(args: &Args) -> Result<PathBuf, String> {
+    args.data_dir
+        .clone()
+        .ok_or_else(|| "--data-dir / HEATHER_DATA_DIR is required".into())
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn serve(args: Args) -> std::process::ExitCode {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
-    let args = Args::parse();
+    let data_dir = match resolve_data_dir(&args) {
+        Ok(d) => d,
+        Err(e) => { eprintln!("error: {e}"); return std::process::ExitCode::FAILURE; }
+    };
 
     // Open the multi-tenant server. On a fresh boot this lazily creates
     // the `default` database with the dimension we pass here.
-    let server = Server::open(&args.data_dir, args.dimension).expect("failed to open server");
+    let server = Server::open(&data_dir, args.dimension).expect("failed to open server");
 
     let databases = server.databases().unwrap_or_default();
     tracing::info!(
-        path = %args.data_dir.display(),
+        path = %data_dir.display(),
         databases = databases.len(),
         names = ?databases,
         "Opened server"
     );
 
-    // The legacy /collections/... routes target the `default` database.
-    // Resolve that now and pass it as State to the existing handlers; the
-    // new /db/{db}/... routes get the full `Server` via Extension.
     let server = Arc::new(server);
     let default_hive = server
         .database(DEFAULT_DB)
         .expect("default database missing immediately after open");
 
-    // Auth.
-    let auth_state = match &args.auth_token {
-        Some(t) if !t.is_empty() => {
-            tracing::info!("Auth: bearer token enabled");
-            auth::AuthConfig::with_token(t.clone())
+    // Auth — load (or create) the user store.
+    let user_store = match users::UserStore::load(&data_dir) {
+        Ok(s) => Arc::new(s),
+        Err(e) => { eprintln!("error: load user store: {e}"); return std::process::ExitCode::FAILURE; }
+    };
+    let auth_state = if args.auth_disabled {
+        tracing::warn!(
+            "Auth: DISABLED (HEATHER_AUTH_DISABLED=1). Anyone who can reach \
+             this port has full read+write access. Drop the env var or the \
+             flag to re-enable."
+        );
+        auth::AuthState::disabled(user_store.clone())
+    } else {
+        // First-boot bootstrap: mint an admin user with a random password
+        // and print it once to stderr.
+        if let Err(e) = auth::bootstrap_admin_if_needed(&user_store) {
+            eprintln!("error: bootstrap admin user: {e}");
+            return std::process::ExitCode::FAILURE;
         }
-        _ => {
-            tracing::warn!(
-                "Auth: DISABLED (HEATHER_AUTH_TOKEN unset). Anyone who can reach \
-                 this port has full read+write access. Set HEATHER_AUTH_TOKEN to \
-                 enable Bearer-token auth on every route except /health."
-            );
-            auth::AuthConfig::disabled()
-        }
+        tracing::info!(
+            users = user_store.list().len(),
+            store = %user_store.path().display(),
+            "Auth: HTTP Basic enabled"
+        );
+        auth::AuthState::enabled(user_store.clone())
     };
 
     // Legacy default-DB router — every existing /collections/... and
-    // /algebra/... route, unchanged. State is the default DB's Hive.
+    // /algebra/... route, unchanged.
     let legacy_router = Router::new()
         .route("/collections", post(routes::create_collection))
         .route("/collections", get(routes::list_collections))
@@ -190,14 +239,10 @@ async fn main() {
         .merge(legacy_router)
         .merge(db_admin_router)
         .merge(db_scoped_router)
-        // Auth middleware sees every request and short-circuits unauthorized
-        // ones before any handler runs. /health is whitelisted in-middleware.
         .layer(middleware::from_fn_with_state(
             auth_state,
             auth::middleware,
         ))
-        // Server is needed by the /db/* routes — pass via extension so it
-        // doesn't fight the legacy State<Arc<Hive>>.
         .layer(Extension(server.clone()))
         .layer(
             ServiceBuilder::new()
@@ -219,14 +264,19 @@ async fn main() {
         "HeatherDB server listening"
     );
 
-    let listener = tokio::net::TcpListener::bind(&addr)
-        .await
-        .expect("failed to bind");
+    let listener = match tokio::net::TcpListener::bind(&addr).await {
+        Ok(l) => l,
+        Err(e) => { eprintln!("bind error: {e}"); return std::process::ExitCode::FAILURE; }
+    };
 
-    axum::serve(listener, app)
+    if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await
-        .expect("server error");
+    {
+        eprintln!("server error: {e}");
+        return std::process::ExitCode::FAILURE;
+    }
 
     tracing::info!("Server shut down cleanly");
+    std::process::ExitCode::SUCCESS
 }
