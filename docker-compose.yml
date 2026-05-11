@@ -82,8 +82,6 @@ services:
       retries: 3
       start_period: 5s
 
-    networks:
-      - heather
 
     # Note on Coolify's resource taxonomy: an "Application" in Coolify
     # is anything deployed from a git repo (this), and a "Database" is
