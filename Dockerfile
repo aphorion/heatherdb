@@ -22,8 +22,9 @@
 #     heatherdb:latest --dimension 384 --port 6380
 
 # ─── builder ──────────────────────────────────────────────────────────────────
-# Rust 1.84+ required: workspace uses `resolver = "3"`.
-FROM rust:1.84-bookworm AS builder
+# Rust 1.85+ required: heather_db/Cargo.toml uses `edition = "2024"`
+# (also workspace uses `resolver = "3"`).
+FROM rust:1.85-bookworm AS builder
 
 WORKDIR /src
 
