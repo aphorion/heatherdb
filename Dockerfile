@@ -26,18 +26,18 @@ FROM rust:1.81-bookworm AS builder
 
 WORKDIR /src
 
-# Cache deps separately — copy manifests first.
+# Cache deps separately — copy manifests first. The four crates listed
+# in the workspace `members` field of the root Cargo.toml.
 COPY Cargo.toml Cargo.lock ./
 COPY heather_db/Cargo.toml      ./heather_db/
 COPY heather_server/Cargo.toml  ./heather_server/
 COPY heather_algebra/Cargo.toml ./heather_algebra/
-COPY heather_cortex/Cargo.toml  ./heather_cortex/
 COPY heather_fornix/Cargo.toml  ./heather_fornix/
 
 # Stub mains so dep resolution succeeds before the real source lands.
-RUN mkdir -p heather_db/src heather_server/src heather_algebra/src heather_cortex/src heather_fornix/src \
+RUN mkdir -p heather_db/src heather_server/src heather_algebra/src heather_fornix/src \
  && echo "fn main() {}"     > heather_server/src/main.rs \
- && for c in heather_db heather_algebra heather_cortex heather_fornix; do \
+ && for c in heather_db heather_algebra heather_fornix; do \
       echo "pub fn _stub() {}" > $c/src/lib.rs; \
     done \
  && cargo build --release -p heather_server || true
@@ -46,7 +46,6 @@ RUN mkdir -p heather_db/src heather_server/src heather_algebra/src heather_corte
 COPY heather_db       ./heather_db
 COPY heather_server   ./heather_server
 COPY heather_algebra  ./heather_algebra
-COPY heather_cortex   ./heather_cortex
 COPY heather_fornix   ./heather_fornix
 
 # Force rebuild of the stub-replaced crates.

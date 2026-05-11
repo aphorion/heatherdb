@@ -22,6 +22,11 @@ target/
 sample_projects/
 zero-shot-capability.md
 
+# heather_cortex is a Node sample app, not a Rust workspace member.
+# Excluding it keeps the build context small and avoids accidentally
+# shipping its node_modules into the image.
+heather_cortex/
+
 # Local data dirs
 data/
 *.lmdb
