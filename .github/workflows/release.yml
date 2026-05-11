@@ -302,7 +302,7 @@ jobs:
           echo "notes_path=RELEASE_NOTES.md" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: ${{ needs.prep.outputs.version }}
           tag_name: ${{ needs.prep.outputs.version }}
