@@ -7,6 +7,11 @@ to keep HeatherDB alive and authenticated.
 
 Pick one — they're not mutually exclusive but mixing is rare.
 
+> **For Coolify deploys, jump straight to [coolify.md](./coolify.md).**
+> The compose file in this repo is already Coolify-friendly; that page
+> is the focused walkthrough (env vars, domain assignment, day-2 ops
+> via the container terminal, backups against the persistent volume).
+
 ### A. Docker (recommended)
 
 `docker compose up` brings up the **engine + Fovea** in two services

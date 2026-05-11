@@ -1,23 +1,24 @@
-version: "3.9"
-
 # HeatherDB stack.
 #
-#   docker compose up -d           # build + run
-#   docker compose logs -f          # tail logs
-#   docker compose down             # stop (data persists in the named volume)
+# Works two ways:
 #
-# After it's up:
-#   Engine HTTP   http://localhost:6380   (auth-required by default)
+#   • Local:   `docker compose up -d` (uses .env at repo root if present).
+#   • Coolify: import this compose file as a "Docker Compose" application;
+#              set the env vars below in Coolify's UI; assign a domain to
+#              port 6380. Coolify's Traefik proxy fronts the engine with
+#              auto-managed TLS. See docs/coolify.md.
 #
-# Auth is on by default. Provide credentials via a `.env` file at the
-# repo root (copy `.env.example` to `.env` and fill in the blanks). If
-# `.env` is missing or empty, the engine mints a random admin password
-# on first boot and prints it ONCE in the container logs:
+# Auth is on by default. Provide credentials via:
+#
+#   • Local:   .env at repo root (`cp .env.example .env`)
+#   • Coolify: Environment Variables tab on the application page
+#
+# If unset, the engine mints a random admin password on first boot and
+# prints it ONCE in the container log:
 #
 #   docker compose logs heatherdb 2>&1 | grep -A8 first-boot
 #
-# Once the system/ env is initialised the password is hashed and
-# settled — operators rotate via:
+# Rotate any time:
 #
 #   docker compose exec heatherdb heather user passwd admin --password '...'
 
@@ -26,58 +27,72 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: heatherdb:latest
+    # Image tag is overridable so Coolify (or a CI pipeline) can pin
+    # to a specific build by setting HEATHERDB_IMAGE_TAG.
+    image: heatherdb:${HEATHERDB_IMAGE_TAG:-latest}
     container_name: heatherdb
     restart: unless-stopped
+
+    # Direct host port for local dev. Coolify ignores host port mappings
+    # when its proxy is in front — the container's `expose` is what
+    # matters for routing. Override HEATHERDB_HOST_PORT to bind to a
+    # different host port (or empty string '' to skip publishing
+    # entirely on a Coolify deploy if you prefer Coolify-only ingress).
     ports:
-      - "6380:6380"
+      - "${HEATHERDB_HOST_PORT:-6380}:6380"
+    expose:
+      - "6380"
+
     volumes:
+      # Named volume — Coolify maps this into its persistent storage
+      # area automatically; locally docker manages it.
       - heatherdb_data:/var/lib/heatherdb
+
     environment:
-      HEATHER_DIMENSION: "128"
-      HEATHER_MAP_SIZE_MB: "4096"
-      HEATHER_REQUEST_TIMEOUT: "600"
-      RUST_LOG: "info"
-    # Optional: HEATHER_ADMIN_USER + HEATHER_ADMIN_PASSWORD live in
-    # .env at the repo root. Missing file is non-fatal — the engine
-    # falls back to its random-admin-password-on-first-boot path.
+      # Tunables — every value below can be overridden via Coolify's
+      # Environment Variables UI (or the local .env file).
+      HEATHER_DIMENSION:        "${HEATHER_DIMENSION:-128}"
+      HEATHER_MAP_SIZE_MB:      "${HEATHER_MAP_SIZE_MB:-4096}"
+      HEATHER_REQUEST_TIMEOUT:  "${HEATHER_REQUEST_TIMEOUT:-600}"
+      HEATHER_HOST:             "${HEATHER_HOST:-0.0.0.0}"
+      HEATHER_PORT:             "${HEATHER_PORT:-6380}"
+      RUST_LOG:                 "${RUST_LOG:-info}"
+
+      # First-boot HTTP Basic Auth admin. After the user store is
+      # initialised, both vars are ignored — rotate via:
+      #   docker compose exec heatherdb heather user passwd admin --password '...'
+      HEATHER_ADMIN_USER:       "${HEATHER_ADMIN_USER:-admin}"
+      HEATHER_ADMIN_PASSWORD:   "${HEATHER_ADMIN_PASSWORD:-}"
+
+      # DEV ONLY — set to '1' to skip auth entirely. Engine prints a
+      # loud warning at boot in this mode.
+      HEATHER_AUTH_DISABLED:    "${HEATHER_AUTH_DISABLED:-}"
+
+    # Optional fallback for local dev. Missing .env is non-fatal — the
+    # engine falls back to its random-admin-password-on-first-boot path.
+    # Coolify ignores this; it injects vars from its UI directly.
     env_file:
       - path: .env
         required: false
-    healthcheck:
 
+    healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:6380/health"]
       interval: 30s
       timeout: 3s
       retries: 3
       start_period: 5s
+
     networks:
       - heather
 
-  # fovea:
-  #   build:
-  #     context: ./fovea
-  #     dockerfile: Dockerfile
-  #   image: fovea:latest
-  #   container_name: fovea
-  #   restart: unless-stopped
-  #   ports:
-  #     - "8080:80"
-  #   environment:
-  #     # Caddy proxies /api/* to this upstream. Inside the compose network,
-  #     # `heatherdb` resolves to the engine container.
-  #     HEATHER_HOST: "heatherdb:6380"
-  #   # Loads AUTH_USER + AUTH_PASS_HASH from fovea/.env if it exists.
-  #   # Missing file is non-fatal — the entrypoint runs in no-auth mode
-  #   # and prints a loud warning. Copy fovea/.env.example to start.
-  #   env_file:
-  #     - path: ./fovea/.env
-  #       required: false
-  #   depends_on:
-  #     heatherdb:
-  #       condition: service_started
-  #   networks:
-  #     - heather
+    # Coolify reads these labels for its dashboard. Adding them
+    # explicitly so the application name + description are sensible
+    # without manual UI tweaking. Custom labels under `coolify.*`
+    # are ignored by other compose runners.
+    labels:
+      coolify.managed: "true"
+      coolify.name: "heatherdb"
+      coolify.type: "application"
 
 networks:
   heather:

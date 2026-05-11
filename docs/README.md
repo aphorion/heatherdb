@@ -14,7 +14,10 @@ the marketing surface; everything below is for people running it.
 4. [**HTTP API reference**](./api.md) — every route + request/response
    shape, scope rules per endpoint.
 5. [**Operations**](./operations.md) — deploy, monitor, back up, upgrade.
-6. [**Fovea operator GUI**](./fovea.md) — desktop app for browsing,
+6. [**Coolify deploy**](./coolify.md) — the canonical production path:
+   one-time app setup, env vars, domain + TLS, day-2 ops via the
+   container terminal.
+7. [**Fovea operator GUI**](./fovea.md) — desktop app for browsing,
    composing, and inspecting any HeatherDB instance.
 
 ## Background reading

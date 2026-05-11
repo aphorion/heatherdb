@@ -98,6 +98,14 @@ docker compose logs -f
 The `fovea` service may be commented out in `docker-compose.yml` — leave
 it however the user has it.
 
+**Production target is Coolify** (self-hosted PaaS, Docker-Compose
+runner). The compose file is already Coolify-friendly: every tunable
+is `${VAR:-default}` so Coolify's UI can override; named volume
+`heatherdb_data` maps to Coolify's persistent storage; healthcheck
+drives Coolify's app-up status. Don't introduce host-port hardcoding
+or hostname assumptions that would break behind Coolify's Traefik.
+Full guide: `docs/coolify.md`.
+
 ## Architecture (the bits that span files)
 
 ### Engine crate split
