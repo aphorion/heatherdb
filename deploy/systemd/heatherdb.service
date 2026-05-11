@@ -9,14 +9,14 @@ Type=simple
 User=heatherdb
 Group=heatherdb
 WorkingDirectory=/opt/heatherdb
-ExecStart=/opt/heatherdb/heather_server
+ExecStart=/opt/heatherdb/heather
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
 
-# Override any of these in /etc/heatherdb/env (deploy-vps.sh creates that file
-# on first deploy with sensible defaults — edit there, then `systemctl restart
-# heatherdb`).
+# Override any of these in /etc/heatherdb/env (deploy/deploy creates that
+# file on first deploy with sensible defaults + a generated admin password,
+# mode 0600 — edit there, then `systemctl restart heatherdb`).
 EnvironmentFile=-/etc/heatherdb/env
 Environment=HEATHER_DATA_DIR=/opt/heatherdb/data
 Environment=HEATHER_DIMENSION=128

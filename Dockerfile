@@ -22,7 +22,8 @@
 #     heatherdb:latest --dimension 384 --port 6380
 
 # ─── builder ──────────────────────────────────────────────────────────────────
-FROM rust:1.81-bookworm AS builder
+# Rust 1.84+ required: workspace uses `resolver = "3"`.
+FROM rust:1.84-bookworm AS builder
 
 WORKDIR /src
 
@@ -49,9 +50,11 @@ COPY heather_algebra  ./heather_algebra
 COPY heather_fornix   ./heather_fornix
 
 # Force rebuild of the stub-replaced crates.
+# The crate is named `heather_server` but its binary is `heather`
+# (set by [[bin]] in heather_server/Cargo.toml).
 RUN touch heather_db/src/lib.rs heather_server/src/main.rs \
  && cargo build --release -p heather_server \
- && strip target/release/heather_server
+ && strip target/release/heather
 
 # ─── runtime ──────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim AS runtime
@@ -70,7 +73,7 @@ RUN groupadd --system --gid 65532 heatherdb \
  && mkdir -p /var/lib/heatherdb \
  && chown -R heatherdb:heatherdb /var/lib/heatherdb
 
-COPY --from=builder /src/target/release/heather_server /usr/local/bin/heather_server
+COPY --from=builder /src/target/release/heather /usr/local/bin/heather
 
 ENV HEATHER_DATA_DIR=/var/lib/heatherdb \
     HEATHER_DIMENSION=128 \
@@ -79,6 +82,13 @@ ENV HEATHER_DATA_DIR=/var/lib/heatherdb \
     HEATHER_MAP_SIZE_MB=4096 \
     HEATHER_REQUEST_TIMEOUT=600 \
     RUST_LOG=info
+# AUTH IS ON BY DEFAULT. On a fresh data-volume the engine mints an
+# `admin` user with a random password and prints it ONCE on stderr —
+# `docker logs heatherdb 2>&1 | grep -A8 first-boot` to retrieve.
+# Override by passing on `docker run`:
+#   -e HEATHER_ADMIN_USER=admin -e HEATHER_ADMIN_PASSWORD='<your-pw>'
+# Or disable entirely (DEV ONLY):
+#   -e HEATHER_AUTH_DISABLED=1
 
 VOLUME ["/var/lib/heatherdb"]
 EXPOSE 6380
@@ -87,4 +97,4 @@ USER heatherdb
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD curl -fsS http://127.0.0.1:6380/health || exit 1
 
-ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/heather_server"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/heather"]

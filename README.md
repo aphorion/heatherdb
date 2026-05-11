@@ -617,11 +617,11 @@ Each `.tar.gz`/`.zip` ships next to a combined `SHA256SUMS.txt`:
 ```bash
 VERSION=v0.1.0
 TARGET=linux-x86_64-musl
-curl -fsSLO "https://github.com/aphorion/heather-db/releases/download/${VERSION}/heather_server-${VERSION}-${TARGET}.tar.gz"
+curl -fsSLO "https://github.com/aphorion/heather-db/releases/download/${VERSION}/heather-${VERSION}-${TARGET}.tar.gz"
 curl -fsSLO "https://github.com/aphorion/heather-db/releases/download/${VERSION}/SHA256SUMS.txt"
 sha256sum --check SHA256SUMS.txt --ignore-missing
-tar -xzf "heather_server-${VERSION}-${TARGET}.tar.gz"
-./heather_server-${VERSION}-${TARGET}/heather_server --help
+tar -xzf "heather-${VERSION}-${TARGET}.tar.gz"
+./heather-${VERSION}-${TARGET}/heather --help
 ```
 
 Container images are published to GHCR on every tag and on `main`:

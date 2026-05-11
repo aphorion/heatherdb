@@ -191,17 +191,35 @@ mkdir -p "$INSTALL_DIR/data" /etc/heatherdb
 chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
 
 if [ ! -f /etc/heatherdb/env ]; then
+  # Generate a one-time admin password unless the operator already
+  # exported HEATHER_ADMIN_PASSWORD before invoking this script.
+  if [ -z "${HEATHER_ADMIN_PASSWORD:-}" ]; then
+    HEATHER_ADMIN_PASSWORD=$(LC_ALL=C tr -dc 'A-HJ-NP-Za-km-z2-9' </dev/urandom | head -c 24)
+    ADMIN_GENERATED=1
+  fi
+  : "${HEATHER_ADMIN_USER:=admin}"
+
   cat > /etc/heatherdb/env <<ENV
 HEATHER_DATA_DIR=$INSTALL_DIR/data
 HEATHER_DIMENSION=$HEATHER_DIM
 HEATHER_PORT=6380
+# 0.0.0.0 is fine when the engine is firewalled off and only a TLS
+# reverse proxy (Caddy/nginx) hits it. If you don't have that proxy
+# in place yet, switch to 127.0.0.1 and restart.
 HEATHER_HOST=0.0.0.0
 HEATHER_MAP_SIZE_MB=4096
 HEATHER_REQUEST_TIMEOUT=600
 RUST_LOG=info
+
+# First-boot HTTP Basic Auth admin. Only used when the user store is
+# empty. After the user exists, both vars are ignored — rotate via:
+#   heather user passwd $HEATHER_ADMIN_USER --password '<new>'
+HEATHER_ADMIN_USER=$HEATHER_ADMIN_USER
+HEATHER_ADMIN_PASSWORD=$HEATHER_ADMIN_PASSWORD
 ENV
-  chmod 0644 /etc/heatherdb/env
-  ok "wrote default /etc/heatherdb/env"
+  chmod 0600 /etc/heatherdb/env   # contains a credential
+  chown root:"$SERVICE_USER" /etc/heatherdb/env || true
+  ok "wrote /etc/heatherdb/env (mode 0600)"
 else
   ok "/etc/heatherdb/env already exists — leaving it alone"
 fi
@@ -233,13 +251,16 @@ step "Building heather_server (release)"
 ( cd "$BUILD_DIR" && "$CARGO_BIN" build --release -p heather_server >/dev/null 2>&1 ) &
 spinner $! "cargo build --release (slow on cold cache)"
 
-BIN_SRC="$BUILD_DIR/target/release/heather_server"
+BIN_SRC="$BUILD_DIR/target/release/heather"
 if [ ! -x "$BIN_SRC" ]; then
   err "Build appeared to succeed but $BIN_SRC is missing. Re-run with RUST_LOG=debug for verbose output."
   exit 1
 fi
-install -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$BIN_SRC" "$INSTALL_DIR/heather_server"
-ok "binary installed: ${B}$INSTALL_DIR/heather_server${X}"
+install -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$BIN_SRC" "$INSTALL_DIR/heather"
+# Convenience symlink so operators can run `heather user create …` and
+# `heather backup create --output …` without the install-dir prefix.
+ln -sf "$INSTALL_DIR/heather" /usr/local/bin/heather
+ok "binary installed: ${B}$INSTALL_DIR/heather${X}  (symlinked to /usr/local/bin/heather)"
 
 # ─── systemd unit ─────────────────────────────────────────────────────────────
 step "Wiring up the systemd unit"
@@ -332,9 +353,30 @@ echo
 note "Engine reachable at:"
 echo "      ${B}http://${PUBLIC_IP}:6380${X}"
 echo
+
+# Surface the freshly-generated admin password (if we made one this run).
+if [ "${ADMIN_GENERATED:-0}" = "1" ]; then
+  note "First-boot admin credentials:"
+  echo "      user      ${B}${HEATHER_ADMIN_USER}${X}"
+  echo "      password  ${B}${HEATHER_ADMIN_PASSWORD}${X}"
+  echo "      ${D}(also persisted in /etc/heatherdb/env, mode 0600)${X}"
+  echo
+fi
+
 note "Quick sanity:"
 echo "      ${D}curl http://127.0.0.1:6380/health${X}"
-echo "      ${D}curl http://127.0.0.1:6380/stats${X}"
+echo "      ${D}curl -u ${HEATHER_ADMIN_USER:-admin}:'<password>' http://127.0.0.1:6380/db${X}"
+echo
+note "User management (the binary is just ${B}heather${X}):"
+echo "      ${D}heather --data-dir $INSTALL_DIR/data user list${X}"
+echo "      ${D}heather --data-dir $INSTALL_DIR/data user create alice --password '...' --scope root${X}"
+echo "      ${D}heather --data-dir $INSTALL_DIR/data user passwd ${HEATHER_ADMIN_USER:-admin} --password '...'${X}"
+echo "      ${D}(LMDB-backed user store — changes are visible to the live engine immediately)${X}"
+echo
+note "Backup / restore / live snapshot:"
+echo "      ${D}heather --data-dir $INSTALL_DIR/data backup create --output /backups/h-\$(date +%F).tar.gz${X}"
+echo "      ${D}heather --data-dir $INSTALL_DIR/data snapshot create --db default${X}"
+echo "      ${D}heather --data-dir $INSTALL_DIR/data restore restore --input /backups/h-2026-05-11.tar.gz${X}"
 echo
 note "Logs:"
 echo "      ${D}journalctl -u heatherdb -f${X}"

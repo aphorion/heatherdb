@@ -3,6 +3,18 @@ name = "heather_server"
 version = "0.1.0"
 edition = "2024"
 
+# The binary is named `heather` (not `heather_server`) — operators get
+# a short, memorable command:
+#
+#     heather user create alice --password '...'
+#     heather backup create --output ...
+#
+# The crate keeps the longer name for cargo / dependency clarity; only
+# the artefact differs.
+[[bin]]
+name = "heather"
+path = "src/main.rs"
+
 [dependencies]
 heather_db = { path = "../heather_db" }
 heather_algebra = { path = "../heather_algebra" }

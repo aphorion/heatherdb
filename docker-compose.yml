@@ -1,18 +1,25 @@
 version: "3.9"
 
-# HeatherDB stack — engine + Fovea (the operator instrument, web build).
+# HeatherDB stack.
 #
-#   docker compose up -d           # build + run both services
+#   docker compose up -d           # build + run
 #   docker compose logs -f          # tail logs
-#   docker compose down             # stop (data persists in the volume)
+#   docker compose down             # stop (data persists in the named volume)
 #
 # After it's up:
-#   Engine HTTP   http://localhost:6380   (or via Fovea's reverse proxy)
-#   Fovea UI      http://localhost:8080   ← open this in a browser
+#   Engine HTTP   http://localhost:6380   (auth-required by default)
 #
-# Fovea ships its own Caddy that serves the SPA AND reverse-proxies
-# /api/* to the engine — no CORS gymnastics. The connection-form
-# default in browser mode is `/api`, so the very first run "just works".
+# Auth is on by default. Provide credentials via a `.env` file at the
+# repo root (copy `.env.example` to `.env` and fill in the blanks). If
+# `.env` is missing or empty, the engine mints a random admin password
+# on first boot and prints it ONCE in the container logs:
+#
+#   docker compose logs heatherdb 2>&1 | grep -A8 first-boot
+#
+# Once the system/ env is initialised the password is hashed and
+# settled — operators rotate via:
+#
+#   docker compose exec heatherdb heather user passwd admin --password '...'
 
 services:
   heatherdb:
@@ -31,6 +38,12 @@ services:
       HEATHER_MAP_SIZE_MB: "4096"
       HEATHER_REQUEST_TIMEOUT: "600"
       RUST_LOG: "info"
+    # Optional: HEATHER_ADMIN_USER + HEATHER_ADMIN_PASSWORD live in
+    # .env at the repo root. Missing file is non-fatal — the engine
+    # falls back to its random-admin-password-on-first-boot path.
+    env_file:
+      - path: .env
+        required: false
     healthcheck:
 
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:6380/health"]

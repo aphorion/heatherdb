@@ -2,7 +2,8 @@ name: Release
 
 # Triggered by tags shaped like v*.*.* (e.g. v0.1.0, v1.2.3-rc.1).
 #
-# Builds heather_server for every supported target, packages each as a
+# Builds the `heather` binary (from the `heather_server` crate) for every
+# supported target, packages each as a
 # .tar.gz (Unix) or .zip (Windows), generates SHA-256 checksums, and
 # attaches everything to a GitHub Release.
 #
@@ -36,7 +37,10 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
   CARGO_INCREMENTAL: 0
-  BINARY_NAME: heather_server
+  # The cargo package to build (-p flag) and the binary file it produces.
+  # The crate is named `heather_server` historically; the binary is `heather`.
+  CARGO_PACKAGE: heather_server
+  BINARY_NAME: heather
 
 jobs:
   # ─── derive a single canonical version string for downstream jobs ───────────
@@ -116,9 +120,9 @@ jobs:
         run: |
           set -euxo pipefail
           if [ "${{ matrix.cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.target }} -p ${{ env.BINARY_NAME }}
+            cross build --release --locked --target ${{ matrix.target }} -p ${{ env.CARGO_PACKAGE }}
           else
-            cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.BINARY_NAME }}
+            cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.CARGO_PACKAGE }}
           fi
 
       - name: Strip binary (Unix only)
@@ -204,7 +208,7 @@ jobs:
           run: |
             . "$HOME/.cargo/env"
             cargo --version
-            cargo build --release --locked -p ${{ env.BINARY_NAME }}
+            cargo build --release --locked -p ${{ env.CARGO_PACKAGE }}
             strip target/release/${{ env.BINARY_NAME }} || true
 
       - name: Package FreeBSD asset

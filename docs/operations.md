@@ -46,7 +46,7 @@ The script:
 
 1. Installs system deps (`build-essential`, OpenSSL, Rust if missing).
 2. Creates the `heatherdb` user, `/opt/heatherdb/data`, `/etc/heatherdb/env`.
-3. Builds + installs the binary at `/opt/heatherdb/heather_server`.
+3. Builds + installs the binary at `/opt/heatherdb/heather`.
 4. Drops the systemd unit at `/etc/systemd/system/heatherdb.service`.
 5. Enables + restarts the service.
 6. Smoke-tests `/health`.
@@ -74,7 +74,7 @@ front (see [auth.md](./auth.md#-tls-is-mandatory-in-production)).
 cargo build --release -p heather_server
 HEATHER_DATA_DIR=/tmp/heatherdb HEATHER_DIMENSION=128 \
 HEATHER_AUTH_DISABLED=1 \
-  ./target/release/heather_server
+  ./target/release/heather
 ```
 
 Auth disabled is fine for `127.0.0.1` development. Don't bind to `0.0.0.0`
@@ -128,7 +128,7 @@ Type=simple
 User=heatherdb
 Group=heatherdb
 WorkingDirectory=/opt/heatherdb
-ExecStart=/opt/heatherdb/heather_server
+ExecStart=/opt/heatherdb/heather
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
@@ -212,7 +212,7 @@ $HEATHER_DATA_DIR/
 ### Cold backup (engine running fine — but expect a brief pause)
 
 ```bash
-sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+sudo -u heatherdb heather --data-dir /var/lib/heatherdb \
   backup create --output /backups/heatherdb-$(date +%F).tar.gz
 ```
 
@@ -229,7 +229,7 @@ db/<name>/data/{data,lock}.mdb
 Per-database flavour:
 
 ```bash
-sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+sudo -u heatherdb heather --data-dir /var/lib/heatherdb \
   backup create --db memoria --output /backups/memoria-$(date +%F).tar.gz
 ```
 
@@ -244,11 +244,11 @@ Wraps LMDB's `Env::copy_to_file` (the same primitive `mdb_copy` uses) —
 **safe with active writers**:
 
 ```bash
-sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+sudo -u heatherdb heather --data-dir /var/lib/heatherdb \
   snapshot create --db memoria
 # ✓ snapshot: /var/lib/heatherdb/snapshots/memoria-1730000000
 
-sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+sudo -u heatherdb heather --data-dir /var/lib/heatherdb \
   snapshot list
 # NAME                                       SIZE  CREATED
 # memoria-1730000000                       2.7 MB  2026-05-11 09:42:07Z
@@ -260,7 +260,7 @@ durable, restorable artefact.
 
 ```bash
 # Drop a snapshot when you're done with it.
-sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+sudo -u heatherdb heather --data-dir /var/lib/heatherdb \
   snapshot delete memoria-1730000000
 ```
 
@@ -274,15 +274,15 @@ restoring into).
 sudo systemctl stop heatherdb
 
 # Full data-dir restore (tarball — covers every DB + the user store).
-sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+sudo -u heatherdb heather --data-dir /var/lib/heatherdb \
   restore restore --input /backups/heatherdb-2026-05-11.tar.gz
 
 # Single-database restore from a full backup.
-sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+sudo -u heatherdb heather --data-dir /var/lib/heatherdb \
   restore restore --input /backups/heatherdb-2026-05-11.tar.gz --db memoria
 
 # Restore a live snapshot directory.
-sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+sudo -u heatherdb heather --data-dir /var/lib/heatherdb \
   restore restore --input /var/lib/heatherdb/snapshots/memoria-1730000000
 
 sudo systemctl start heatherdb
@@ -304,7 +304,7 @@ Description=HeatherDB nightly cold backup
 [Service]
 Type=oneshot
 User=heatherdb
-ExecStart=/usr/local/bin/heather_server \
+ExecStart=/usr/local/bin/heather \
   --data-dir /var/lib/heatherdb \
   backup create --output /backups/heatherdb-%%i.tar.gz
 ```
@@ -347,7 +347,7 @@ cd /opt/heatherdb-src
 sudo -u heatherdb git pull
 sudo -u heatherdb cargo build --release -p heather_server
 sudo install -m 0755 -o heatherdb -g heatherdb \
-  target/release/heather_server /opt/heatherdb/heather_server
+  target/release/heather /opt/heatherdb/heather
 # 3. Restart.
 sudo systemctl restart heatherdb
 # 4. Verify.
