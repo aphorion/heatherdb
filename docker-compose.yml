@@ -32,6 +32,7 @@ services:
       HEATHER_REQUEST_TIMEOUT: "600"
       RUST_LOG: "info"
     healthcheck:
+
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:6380/health"]
       interval: 30s
       timeout: 3s
@@ -40,30 +41,30 @@ services:
     networks:
       - heather
 
-  fovea:
-    build:
-      context: ./fovea
-      dockerfile: Dockerfile
-    image: fovea:latest
-    container_name: fovea
-    restart: unless-stopped
-    ports:
-      - "8080:80"
-    environment:
-      # Caddy proxies /api/* to this upstream. Inside the compose network,
-      # `heatherdb` resolves to the engine container.
-      HEATHER_HOST: "heatherdb:6380"
-    # Loads AUTH_USER + AUTH_PASS_HASH from fovea/.env if it exists.
-    # Missing file is non-fatal — the entrypoint runs in no-auth mode
-    # and prints a loud warning. Copy fovea/.env.example to start.
-    env_file:
-      - path: ./fovea/.env
-        required: false
-    depends_on:
-      heatherdb:
-        condition: service_started
-    networks:
-      - heather
+  # fovea:
+  #   build:
+  #     context: ./fovea
+  #     dockerfile: Dockerfile
+  #   image: fovea:latest
+  #   container_name: fovea
+  #   restart: unless-stopped
+  #   ports:
+  #     - "8080:80"
+  #   environment:
+  #     # Caddy proxies /api/* to this upstream. Inside the compose network,
+  #     # `heatherdb` resolves to the engine container.
+  #     HEATHER_HOST: "heatherdb:6380"
+  #   # Loads AUTH_USER + AUTH_PASS_HASH from fovea/.env if it exists.
+  #   # Missing file is non-fatal — the entrypoint runs in no-auth mode
+  #   # and prints a loud warning. Copy fovea/.env.example to start.
+  #   env_file:
+  #     - path: ./fovea/.env
+  #       required: false
+  #   depends_on:
+  #     heatherdb:
+  #       condition: service_started
+  #   networks:
+  #     - heather
 
 networks:
   heather:

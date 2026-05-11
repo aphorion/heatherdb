@@ -65,7 +65,10 @@ of every legacy non-`/db/` route. You cannot drop it via the HTTP API
 ```
 $HEATHER_DATA_DIR/
 ├── server.toml             # marker: "this is a v0.2 root"
-├── users.json              # auth credentials
+├── system/
+│   └── data/               # LMDB env: HTTP Basic Auth user store
+│       ├── data.mdb
+│       └── lock.mdb
 ├── db/
 │   ├── default/
 │   │   ├── db.toml         # per-DB config (dimension, EAM knobs)
@@ -76,6 +79,8 @@ $HEATHER_DATA_DIR/
 │   │   ├── db.toml
 │   │   └── data/
 │   └── navigator/…
+├── snapshots/              # default landing zone for `snapshot create`
+│   └── memoria-1730000000/
 └── _trash/                 # dropped DBs land here, recoverable by
     └── memoria-1730000000/ #   moving back into db/<name>/
 ```
@@ -205,22 +210,29 @@ re-encode and re-write into a single shared database first.
 
 ## Backup + restore
 
-Per-database backup is a directory tar:
+Three CLI subcommands cover this:
 
 ```bash
-# Stop the engine first to guarantee a consistent snapshot.
-systemctl stop heatherdb
-tar -czf memoria-2026-05-11.tar.gz -C /var/lib/heatherdb db/memoria
-systemctl start heatherdb
+# Cold per-DB tarball.
+heather_server --data-dir /var/lib/heatherdb \
+  backup create --db memoria --output /backups/memoria-$(date +%F).tar.gz
 
-# Restore on the same or a different host.
-tar -xzf memoria-2026-05-11.tar.gz -C /var/lib/heatherdb
-# Engine picks it up on next boot.
+# Live consistent snapshot (engine can stay up).
+heather_server --data-dir /var/lib/heatherdb \
+  snapshot create --db memoria
+# → /var/lib/heatherdb/snapshots/memoria-1730000000/
+
+# Restore (engine must be stopped — LMDB locks the env).
+systemctl stop heatherdb
+heather_server --data-dir /var/lib/heatherdb \
+  restore restore --input /backups/memoria-2026-05-11.tar.gz
+systemctl start heatherdb
 ```
 
-For a live backup (no engine downtime), use LMDB's `mdb_copy` against
-`$ROOT/db/memoria/data/`. The resulting copy is a consistent snapshot
-even while writers are active.
+Snapshots are safe to take while writers are active — they wrap LMDB's
+`Env::copy_to_file` (the same primitive `mdb_copy` uses). See
+[operations.md → Backups](./operations.md#backups) for the full flow,
+scheduling, and per-DB-from-full-backup restore.
 
 ## Limits
 

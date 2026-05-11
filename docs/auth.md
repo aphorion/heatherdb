@@ -15,7 +15,7 @@ not get burned.
        request                 user store              scope check
 ┌────────────────┐    ┌────────────────────────┐    ┌────────────────┐
 │ Authorization: │ →  │ argon2id verify        │ →  │ is_authorized( │
-│ Basic <b64>    │    │ $DATA/users.json       │    │   user.scope,  │
+│ Basic <b64>    │    │ $DATA/system/  (LMDB)  │    │   user.scope,  │
 └────────────────┘    └────────────────────────┘    │   request.path)│
                                                     └────────────────┘
                                                           ↓
@@ -62,7 +62,8 @@ heather_server --data-dir /var/lib/heatherdb --dimension 128
 
 The user is created silently. A `tracing::info` line confirms which
 env it came from. Both vars are ignored on subsequent boots — the
-user is already in `users.json` with the password hashed.
+user is already persisted in the LMDB-backed user store at
+`$ROOT/system/data/`, with the password Argon2id-hashed.
 
 ### B. Random password (good for laptops + interactive boots)
 
@@ -81,9 +82,10 @@ password and prints it once on stderr in a fenced ASCII box:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-Copy it now. It's hashed in `users.json` immediately and never
-reprinted; if you lose it, your only recovery is to delete
-`users.json` and let first-boot run again.
+Copy it now. It's Argon2id-hashed into the user store immediately and
+never reprinted; if you lose it, your only recovery is to stop the
+engine, `rm -rf $HEATHER_DATA_DIR/system/`, and let first-boot run
+again. (Per-DB data under `db/` is untouched.)
 
 ## The `user` CLI
 

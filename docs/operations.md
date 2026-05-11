@@ -90,7 +90,7 @@ All accept either a CLI flag or an env var. Env wins when both are set.
 
 | Flag                       | Env                           | Default       | Notes |
 |----------------------------|-------------------------------|---------------|-------|
-| `--data-dir`               | `HEATHER_DATA_DIR`            | (required)    | Root for `db/` + `users.json`. |
+| `--data-dir`               | `HEATHER_DATA_DIR`            | (required)    | Root for `db/`, `system/` (user store), and snapshots/backups. |
 | `--dimension`              | `HEATHER_DIMENSION`           | 128           | Used only when first-creating the `default` DB. |
 | `--port`                   | `HEATHER_PORT`                | 6380          | TCP listen port. |
 | `--host`                   | `HEATHER_HOST`                | 0.0.0.0       | Bind address. **Set to `127.0.0.1`** when behind a reverse proxy. |
@@ -186,52 +186,148 @@ A `/metrics` endpoint is on the v0.3 roadmap.
 
 ## Backups
 
-The engine stores everything in two places:
+The engine ships three subcommands that handle this end-to-end —
+no `mdb_copy` ceremonies, no "did you remember the user store?"
+gotchas (the `system/` env is just another LMDB env that the backup
+walks alongside `db/<name>/`). Pick the one that matches the
+situation:
 
-1. `$HEATHER_DATA_DIR/users.json` — credentials.
-2. `$HEATHER_DATA_DIR/db/<name>/` — per-database state.
+| Need                                                        | Use |
+|-------------------------------------------------------------|-----|
+| Nightly cold archive (everything: DBs + users + config)     | `backup create` |
+| Just one database, packaged for transfer                    | `backup create --db NAME` |
+| **Live consistent copy** of one DB while the engine serves  | `snapshot create --db NAME` |
+| Pull a backup or snapshot back into a data dir              | `restore restore --input ...` |
 
-### Cold backup (engine stopped)
+The engine stores everything under `$HEATHER_DATA_DIR/`:
+
+```
+$HEATHER_DATA_DIR/
+├── server.toml             # tag file
+├── system/data/            # user store (LMDB env)
+├── db/<name>/              # per-database state
+└── snapshots/              # default landing zone for `snapshot create`
+```
+
+### Cold backup (engine running fine — but expect a brief pause)
+
+```bash
+sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+  backup create --output /backups/heatherdb-$(date +%F).tar.gz
+```
+
+Tarball contents:
+
+```
+server.toml
+system/data/{data,lock}.mdb
+db/<name>/db.toml
+db/<name>/data/{data,lock}.mdb
+…
+```
+
+Per-database flavour:
+
+```bash
+sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+  backup create --db memoria --output /backups/memoria-$(date +%F).tar.gz
+```
+
+This is the **cold** flow — it tars the on-disk files directly. Run
+it at a moment when the engine is idle (or briefly stop the service)
+for a guaranteed-consistent capture. For zero-downtime, see
+*Live snapshot* below.
+
+### Live snapshot (engine serving traffic)
+
+Wraps LMDB's `Env::copy_to_file` (the same primitive `mdb_copy` uses) —
+**safe with active writers**:
+
+```bash
+sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+  snapshot create --db memoria
+# ✓ snapshot: /var/lib/heatherdb/snapshots/memoria-1730000000
+
+sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+  snapshot list
+# NAME                                       SIZE  CREATED
+# memoria-1730000000                       2.7 MB  2026-05-11 09:42:07Z
+```
+
+The snapshot is one self-contained directory — `db.toml` + `data/data.mdb`
+(LMDB compaction is on by default, smaller files). Treat it as a
+durable, restorable artefact.
+
+```bash
+# Drop a snapshot when you're done with it.
+sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+  snapshot delete memoria-1730000000
+```
+
+### Restore
+
+Both `backup` tarballs and `snapshot` directories restore through the
+same command. Stop the engine first (LMDB locks the env you're
+restoring into).
 
 ```bash
 sudo systemctl stop heatherdb
-sudo tar -C /var/lib/heatherdb -czf /backups/heatherdb-$(date +%F).tar.gz \
-  users.json server.toml db/
+
+# Full data-dir restore (tarball — covers every DB + the user store).
+sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+  restore restore --input /backups/heatherdb-2026-05-11.tar.gz
+
+# Single-database restore from a full backup.
+sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+  restore restore --input /backups/heatherdb-2026-05-11.tar.gz --db memoria
+
+# Restore a live snapshot directory.
+sudo -u heatherdb heather_server --data-dir /var/lib/heatherdb \
+  restore restore --input /var/lib/heatherdb/snapshots/memoria-1730000000
+
 sudo systemctl start heatherdb
 ```
 
-Restoring: stop the engine, untar over `$HEATHER_DATA_DIR`, start.
+If a per-DB restore would clobber an existing database, the command
+refuses — move the existing `db/<name>/` aside first, or restore into
+a different `--data-dir` to inspect first.
 
-### Hot backup (engine running)
+### Scheduling nightly backups
 
-LMDB has `mdb_copy` for consistent live snapshots:
+systemd timer is the boring choice:
 
-```bash
-for db in /var/lib/heatherdb/db/*/data; do
-  name=$(basename $(dirname $db))
-  sudo -u heatherdb mdb_copy "$db" /backups/$name-$(date +%F)/
-done
-sudo cp /var/lib/heatherdb/users.json /backups/
-sudo cp /var/lib/heatherdb/server.toml /backups/
+```ini
+# /etc/systemd/system/heatherdb-backup.service
+[Unit]
+Description=HeatherDB nightly cold backup
+
+[Service]
+Type=oneshot
+User=heatherdb
+ExecStart=/usr/local/bin/heather_server \
+  --data-dir /var/lib/heatherdb \
+  backup create --output /backups/heatherdb-%%i.tar.gz
 ```
 
-Each `mdb_copy` produces a consistent point-in-time snapshot of one
-database, even with active writers. Glue them together for a full
-backup; restore by laying them back into `db/<name>/data/`.
+```ini
+# /etc/systemd/system/heatherdb-backup.timer
+[Unit]
+Description=Run HeatherDB cold backup nightly
 
-### Per-database snapshot
+[Timer]
+OnCalendar=daily
+Persistent=true
 
-Just one DB:
+[Install]
+WantedBy=timers.target
+```
 
 ```bash
-sudo systemctl stop heatherdb       # or use mdb_copy live
-tar -czf memoria-snap.tar.gz -C /var/lib/heatherdb db/memoria
-sudo systemctl start heatherdb
-
-# Restore on the same or a different host
-tar -xzf memoria-snap.tar.gz -C /var/lib/heatherdb
-sudo systemctl restart heatherdb
+sudo systemctl enable --now heatherdb-backup.timer
 ```
+
+For zero-downtime per-DB rolling snapshots: drop `snapshot create` in
+a similar timer.
 
 ---
 
@@ -288,7 +384,7 @@ single writes.
 | Scenario                         | Recovery |
 |----------------------------------|----------|
 | Process crashed mid-write         | Restart. LMDB rolls back the partial transaction; no corruption. |
-| Lost the admin password           | Stop engine. Delete `users.json`. Set `HEATHER_ADMIN_PASSWORD=…` on next boot — first-boot path runs again. |
+| Lost the admin password           | Stop engine. `rm -rf $HEATHER_DATA_DIR/system/`. Set `HEATHER_ADMIN_PASSWORD=…` on next boot — first-boot path runs again. (Per-DB data is untouched.) |
 | Accidentally dropped a DB         | Stop engine. `mv $ROOT/_trash/<name>-<ts> $ROOT/db/<name>`. Restart. |
 | `map_size_mb` exhausted (writes 500) | Stop engine. Edit `db/<name>/db.toml`, raise `map_size_mb`. Restart. (Can't do this live in v0.x; planned for v0.3.) |
 | Disk full                        | Free space. LMDB writes simply fail with `MDB_MAP_FULL`; no data loss. |

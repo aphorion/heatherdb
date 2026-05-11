@@ -6,17 +6,17 @@ authenticated requests in about five minutes.
 ## What you're about to set up
 
 ```
-┌────────┐                ┌────────────────────┐
-│ curl / │  HTTP Basic    │ heather_server     │
-│ Fovea  │ ─────────────▶ │  ↳ data dir        │
-│ ...    │                │  ↳ users.json      │
-└────────┘                │  ↳ db/<name>/...   │
-                          └────────────────────┘
+┌────────┐                ┌─────────────────────┐
+│ curl / │  HTTP Basic    │ heather_server      │
+│ Fovea  │ ─────────────▶ │  ↳ data dir         │
+│ ...    │                │  ↳ system/  (users) │
+│        │                │  ↳ db/<name>/ (data)│
+└────────┘                └─────────────────────┘
 ```
 
-One process, one data dir. Inside the data dir: a `users.json` for HTTP
-Basic credentials and a `db/` directory holding one LMDB env per
-database. That's the whole footprint.
+One process, one data dir. Inside: a `system/` LMDB env that holds the
+HTTP Basic Auth credentials, and a `db/` directory holding one more
+LMDB env per database. That's the whole footprint.
 
 ## Prerequisites
 
@@ -62,8 +62,11 @@ INFO heather_server: HeatherDB server listening  addr=0.0.0.0:6380
 
 If you skip the env vars, the engine generates a random 24-char
 password and prints it once in a fenced box on stderr — copy it.
-After first boot the password is hashed in `users.json`; the random
-banner never shows again.
+After first boot the password lives Argon2-hashed inside the `system/`
+LMDB env; the random banner never shows again. Rotate via
+`heather_server user passwd admin --password '…'` — and because the
+user store is LMDB-backed, the running engine sees the new password
+immediately, no restart.
 
 ## 3. First request
 
@@ -146,6 +149,27 @@ Don't share the admin credential. Make a per-app user:
 `memoria-app` can do anything inside `/db/memoria/...` and nothing else
 — `/db` management, other databases, and the legacy `/collections/...`
 routes are all 403.
+
+## 7. (Optional) take a backup
+
+Three subcommands cover the lifecycle:
+
+```bash
+# Cold full-stack tarball (DBs + users + config).
+./target/release/heather_server --data-dir /tmp/heatherdb \
+  backup create --output /tmp/heather-$(date +%F).tar.gz
+
+# Live consistent snapshot of one DB while the engine serves.
+./target/release/heather_server --data-dir /tmp/heatherdb \
+  snapshot create --db memoria
+
+# Bring a tarball or snapshot back into a (stopped-engine) data dir.
+./target/release/heather_server --data-dir /tmp/heatherdb \
+  restore restore --input /tmp/heather-2026-05-11.tar.gz
+```
+
+See [operations.md → Backups](./operations.md#backups) for scheduling
++ disaster-recovery recipes.
 
 ## Where to go next
 
