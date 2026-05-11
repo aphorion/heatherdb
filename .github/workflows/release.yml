@@ -98,7 +98,7 @@ jobs:
             ext: ".exe"
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain (stable, target ${{ matrix.target }})
         uses: dtolnay/rust-toolchain@stable
@@ -187,7 +187,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Build inside FreeBSD VM
         id: build
@@ -245,7 +245,7 @@ jobs:
     needs: [prep, build, build-freebsd]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0           # need history for the changelog
 

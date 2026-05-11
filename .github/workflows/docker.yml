@@ -42,7 +42,7 @@ jobs:
     name: Build & publish image
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # Native qemu emulators so buildx can target arm64 from an amd64 runner.
       - name: Set up QEMU
