@@ -26,6 +26,14 @@ export type Stats = {
   collections: CollectionSummary[];
 };
 
+export type DatabaseInfo = {
+  name: string;
+  created_at: number;
+  dimension: number;
+  map_size_mb: number;
+  collections: number;
+};
+
 export type ProjectionPoint = {
   id: number;
   x: number;       // -1..1
@@ -84,9 +92,43 @@ function emitWire(e: WireEntry) {
   for (const fn of wireListeners) fn(e);
 }
 
+export type HeatherClientOpts = {
+  /** HTTP Basic credentials. Engine has auth on by default. */
+  username?: string;
+  password?: string;
+  /** Active database — every endpoint other than `/health` and `/db*`
+   *  routes through `/db/{activeDb}/...`. Defaults to `default`. */
+  activeDb?: string;
+  timeoutMs?: number;
+};
+
 export class HeatherClient {
-  constructor(public baseUrl: string, public timeoutMs = 10_000) {
-    this.baseUrl = baseUrl.replace(/\/$/, "");
+  /** Bare engine URL — never includes `/db/...`. */
+  baseUrl: string;
+  username?: string;
+  password?: string;
+  activeDb: string;
+  timeoutMs: number;
+
+  constructor(baseUrl: string, opts: HeatherClientOpts = {}) {
+    this.baseUrl   = baseUrl.replace(/\/$/, "");
+    this.username  = opts.username;
+    this.password  = opts.password;
+    this.activeDb  = opts.activeDb ?? "default";
+    this.timeoutMs = opts.timeoutMs ?? 10_000;
+  }
+
+  /** Build the full URL for a path, applying database scoping if needed.
+   *  Paths starting with `/db`, `/health`, or `/server` are sent bare —
+   *  everything else is rewritten to `/db/{activeDb}/...`. */
+  private fullUrl(path: string): string {
+    const isAdmin =
+      path === "/health" ||
+      path.startsWith("/db") ||
+      path.startsWith("/server");
+    return isAdmin
+      ? `${this.baseUrl}${path}`
+      : `${this.baseUrl}/db/${encodeURIComponent(this.activeDb)}${path}`;
   }
 
   /* ─── plumbing ────────────────────────────────────────────────────────── */
@@ -96,11 +138,21 @@ export class HeatherClient {
     path: string,
     body?: unknown
   ): Promise<T> {
-    const url = `${this.baseUrl}${path}`;
+    const url = this.fullUrl(path);
     const t0 = performance.now();
+
+    // Headers — Content-Type only when there's a body, Authorization
+    // when both username + password are set. Build the Basic header by
+    // hand so it works under both Tauri's HTTP plugin and plain fetch.
+    const headers: Record<string, string> = {};
+    if (body) headers["Content-Type"] = "application/json";
+    if (this.username && this.password) {
+      headers["Authorization"] = `Basic ${btoa(`${this.username}:${this.password}`)}`;
+    }
+
     const init: RequestInit = {
       method,
-      headers: body ? { "Content-Type": "application/json" } : undefined,
+      headers,
       body: body ? JSON.stringify(body) : undefined,
       signal: AbortSignal.timeout(this.timeoutMs),
     };
@@ -134,6 +186,17 @@ export class HeatherClient {
   /* ─── endpoints ───────────────────────────────────────────────────────── */
 
   health = () => this.req<Health>("GET", "/health");
+
+  /* ─── databases (multi-tenancy) ───────────────────────────────────────── */
+
+  databases = () => this.req<{ databases: DatabaseInfo[] }>("GET", "/db");
+  databaseInfo = (name: string) => this.req<DatabaseInfo>("GET", `/db/${encodeURIComponent(name)}`);
+  createDatabase = (name: string, dimension: number, map_size_mb?: number) =>
+    this.req<DatabaseInfo>("POST", "/db", { name, dimension, map_size_mb });
+  dropDatabase = (name: string) =>
+    this.req<{ dropped: boolean }>("DELETE", `/db/${encodeURIComponent(name)}`);
+
+  /* ─── collections (scoped to activeDb) ────────────────────────────────── */
 
   collections = () => this.req<{ collections: CollectionSummary[] }>("GET", "/collections");
 

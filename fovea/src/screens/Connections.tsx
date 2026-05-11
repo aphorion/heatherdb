@@ -51,8 +51,16 @@ export default function Connections({ ctx }: { ctx: AppCtx }) {
                     <div className="text-[14px] text-white truncate">{c.label}</div>
                     <div className="font-mono text-11 text-ink-muted truncate">
                       {c.url}
+                      <span className="text-ink-ghost"> · db </span>
+                      <span className="text-white">{c.active_db ?? "default"}</span>
                       <span className="text-ink-ghost"> · </span>
                       <span className="uppercase">{c.role}</span>
+                      {c.username && (
+                        <>
+                          <span className="text-ink-ghost"> · user </span>
+                          <span className="text-white">{c.username}</span>
+                        </>
+                      )}
                       <span className="text-ink-ghost"> · </span>
                       last used {fmtRelativeTs(c.last_used_at)}
                     </div>
@@ -123,9 +131,12 @@ function ConnectionForm({
   onSubmit: (c: Omit<Connection, "id" | "added_at"> & { id?: string }) => void;
   onCancel?: () => void;
 }) {
-  const [label, setLabel] = useState(initial?.label ?? "Local");
-  const [url,   setUrl]   = useState(initial?.url   ?? DEFAULT_URL);
-  const [role,  setRole]  = useState<"rw" | "ro">(initial?.role ?? "rw");
+  const [label,    setLabel]    = useState(initial?.label    ?? "Local");
+  const [url,      setUrl]      = useState(initial?.url      ?? DEFAULT_URL);
+  const [username, setUsername] = useState(initial?.username ?? "admin");
+  const [password, setPassword] = useState(initial?.password ?? "");
+  const [activeDb, setActiveDb] = useState(initial?.active_db ?? "default");
+  const [role,     setRole]     = useState<"rw" | "ro">(initial?.role ?? "rw");
 
   return (
     <form
@@ -133,23 +144,67 @@ function ConnectionForm({
       onSubmit={(e) => {
         e.preventDefault();
         if (!label.trim() || !url.trim()) return;
-        onSubmit({ id: initial?.id, label: label.trim(), url: url.trim(), role });
+        onSubmit({
+          id: initial?.id,
+          label: label.trim(),
+          url: url.trim(),
+          username: username.trim() || undefined,
+          password: password || undefined,
+          active_db: activeDb.trim() || "default",
+          role,
+        });
       }}
     >
-      <div className="grid grid-cols-1 md:grid-cols-[1fr_2fr_auto] gap-3 items-end">
+      <div className="grid grid-cols-1 md:grid-cols-[1fr_2fr] gap-3 items-end">
         <Field label="Label">
           <input value={label} onChange={(e) => setLabel(e.target.value)} className="input w-full" placeholder="Local" />
         </Field>
-        <Field label="URL">
+        <Field label="Engine URL (no /db suffix)">
           <input value={url} onChange={(e) => setUrl(e.target.value)} className="input w-full" placeholder="http://127.0.0.1:6380" />
+        </Field>
+      </div>
+
+      <div className="grid grid-cols-1 md:grid-cols-[1fr_1fr_1fr_auto] gap-3 items-end">
+        <Field label="Username">
+          <input
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            className="input w-full"
+            placeholder="admin"
+            autoComplete="username"
+          />
+        </Field>
+        <Field label="Password">
+          <input
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            type="password"
+            className="input w-full"
+            placeholder="leave blank for --auth-disabled engines"
+            autoComplete="current-password"
+          />
+        </Field>
+        <Field label="Active database">
+          <input
+            value={activeDb}
+            onChange={(e) => setActiveDb(e.target.value)}
+            className="input w-full"
+            placeholder="default"
+          />
         </Field>
         <Field label="Role">
           <div className="flex gap-1">
-            <RolePill active={role === "rw"} onClick={() => setRole("rw")}>read · write</RolePill>
-            <RolePill active={role === "ro"} onClick={() => setRole("ro")}>read only</RolePill>
+            <RolePill active={role === "rw"} onClick={() => setRole("rw")}>r/w</RolePill>
+            <RolePill active={role === "ro"} onClick={() => setRole("ro")}>r/o</RolePill>
           </div>
         </Field>
       </div>
+
+      <p className="font-mono text-10 uppercase tracking-ops text-ink-ghost">
+        First-boot creates an <code className="text-white">admin</code> user — copy the password from the engine's
+        boot log. Active database picks which <code className="text-white">/db/{"{db}"}/...</code> everything routes through.
+      </p>
+
       <div className="flex items-center gap-2 pt-1">
         <button type="submit" className="btn btn-primary">{initial?.id ? "save" : "add"}</button>
         {onCancel && <button type="button" className="btn" onClick={onCancel}>cancel</button>}

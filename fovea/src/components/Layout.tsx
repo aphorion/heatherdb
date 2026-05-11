@@ -47,6 +47,8 @@ export default function Layout({
               <span className="text-ink-ghost normal-case">
                 {ctx.connection.url.replace(/^https?:\/\//, "")}
               </span>
+              <span className="text-ink-ghost">·</span>
+              <span className="text-accent">db {ctx.connection.active_db ?? "default"}</span>
             </span>
           )}
           <button

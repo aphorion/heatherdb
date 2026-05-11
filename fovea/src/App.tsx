@@ -48,8 +48,15 @@ export default function App() {
   }, []);
 
   const client = useMemo(
-    () => (conn ? new HeatherClient(conn.url) : null),
-    [conn?.id, conn?.url]
+    () =>
+      conn
+        ? new HeatherClient(conn.url, {
+            username: conn.username,
+            password: conn.password,
+            activeDb: conn.active_db ?? "default",
+          })
+        : null,
+    [conn?.id, conn?.url, conn?.username, conn?.password, conn?.active_db]
   );
 
   // Lightweight health probe whenever the active connection changes.

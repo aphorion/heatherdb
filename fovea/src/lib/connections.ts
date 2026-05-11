@@ -15,9 +15,18 @@ import { Store } from "@tauri-apps/plugin-store";
 export type Connection = {
   id: string;
   label: string;
+  /** Bare engine URL — no /db/ suffix. The DB is selected separately. */
   url: string;
+  /** HTTP Basic auth — engine has auth on by default. Leave both empty
+   *  to talk to an --auth-disabled engine. */
+  username?: string;
+  password?: string;
   /** "rw" | "ro" — currently informational, no enforcement yet. */
   role: "rw" | "ro";
+  /** Active database for this connection. Defaults to "default". The
+   *  picker on the Connections screen sets it; every API call routes
+   *  through /db/{active_db}/... */
+  active_db?: string;
   added_at: number;
   last_used_at?: number;
 };
