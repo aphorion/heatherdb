@@ -1,40 +1,48 @@
-//! User store + password hashing + per-database scope.
+//! User store — LMDB-backed.
 //!
-//! Persisted as `$HEATHER_DATA_DIR/users.json`. JSON because it's tiny
-//! (a handful of entries), human-readable, and easy to back up alongside
-//! the data dirs. We rewrite the file atomically (write to `.tmp` then
-//! rename) so a crash mid-save can't leave the engine without a usable
-//! credentials file.
+//! Lives at `$HEATHER_DATA_DIR/system/data/` (its own LMDB env, sibling
+//! of `$ROOT/db/<name>/data/`). One named sub-DB called `users`; key is
+//! the username (`Str`), value is bincode of `User`.
 //!
-//! Passwords are stored as Argon2id PHC-format hashes. The hash itself
-//! encodes the salt and parameters; rotating cost factors later is just
-//! a matter of re-hashing on next login.
+//! Why LMDB:
+//!   - Live consistency. The CLI mutates the same env the running server
+//!     reads from — every `verify()` opens a fresh read transaction so
+//!     `heather_server user create` is visible immediately, no restart.
+//!   - One persistence layer. `backup`/`snapshot`/`restore` cover users
+//!     for free now that they live in an env.
+//!   - Multi-process safe by design — LMDB is built for it.
+//!
+//! No migration: pre-1.0, fresh-start only. Existing `users.json` files
+//! are ignored — recreate the user via the CLI on first boot of an
+//! upgraded engine.
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::RwLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use heed::types::{Bytes, Str};
+use heed::{Database, Env, EnvOpenOptions};
 use rand::rngs::OsRng;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 
-const USERS_FILE: &str = "users.json";
+const SYSTEM_SUBDIR: &str = "system/data";
+const SYSTEM_DB_NAME: &str = "users";
+/// Modest map size — a system with thousands of users is still tens of MB.
+const SYSTEM_MAP_SIZE_MB: usize = 64;
+
+/* ─── public types ────────────────────────────────────────────────────────── */
 
 /// Where a user is allowed to operate.
 ///
-/// `Root` carries every permission — DB management (`POST /db`,
-/// `DELETE /db/{name}`), every scoped route, and the legacy
-/// `/collections/*` aliases.
-///
-/// `Database(name)` carries only the routes that target that name —
-/// `/db/{name}/...` plus the legacy aliases iff `name == "default"`.
+/// Encoded with bincode's default enum layout (discriminant + payload) —
+/// the serde-tagged JSON form was dropped when the user store moved into
+/// LMDB; nothing reads these bytes by hand any more.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "name", rename_all = "snake_case")]
 pub enum Scope {
     Root,
     Database(String),
@@ -45,9 +53,6 @@ impl Scope {
         if s.eq_ignore_ascii_case("root") || s == "*" {
             Ok(Scope::Root)
         } else {
-            // Reuse the engine's database-name validator so users can't be
-            // scoped to invalid names. Mirrors the same rules the engine
-            // would refuse at create time.
             heather_db::validate_db_name(s)
                 .map_err(|e| format!("invalid scope '{s}': {e}"))?;
             Ok(Scope::Database(s.to_string()))
@@ -70,50 +75,68 @@ pub struct User {
     pub created_at: u64,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
-struct UsersFile {
-    #[serde(default)]
-    users: Vec<User>,
-}
+/* ─── store ───────────────────────────────────────────────────────────────── */
 
-/// In-memory user database. Backed by a JSON file on disk; reloads can be
-/// triggered by `reload_from_disk()` if an out-of-band edit happens.
+/// LMDB-backed user store. Multi-process safe; CLI and server can share one
+/// data dir without restart-to-see-changes weirdness.
 pub struct UserStore {
-    path: PathBuf,
-    inner: RwLock<UsersFile>,
+    env: Env,
+    users: Database<Str, Bytes>,
+    /// Where the system env lives. Useful for diagnostics ("which file did
+    /// this user store load?").
+    env_path: PathBuf,
 }
 
 impl UserStore {
-    /// Load (or create) the users file under `data_dir`.
+    /// Open (or create) the user store under `data_dir`.
     pub fn load(data_dir: &Path) -> Result<Self, String> {
-        let path = data_dir.join(USERS_FILE);
-        let inner = if path.exists() {
-            let raw = fs::read_to_string(&path)
-                .map_err(|e| format!("read {}: {e}", path.display()))?;
-            serde_json::from_str::<UsersFile>(&raw)
-                .map_err(|e| format!("parse {}: {e}", path.display()))?
-        } else {
-            UsersFile::default()
+        let env_path = data_dir.join(SYSTEM_SUBDIR);
+        fs::create_dir_all(&env_path)
+            .map_err(|e| format!("create {}: {e}", env_path.display()))?;
+
+        let env = unsafe {
+            EnvOpenOptions::new()
+                .map_size(1024 * 1024 * SYSTEM_MAP_SIZE_MB)
+                .max_dbs(2)
+                .open(&env_path)
+                .map_err(|e| format!("open env {}: {e}", env_path.display()))?
         };
-        Ok(Self {
-            path,
-            inner: RwLock::new(inner),
-        })
+
+        let mut wtxn = env.write_txn().map_err(|e| e.to_string())?;
+        let users: Database<Str, Bytes> = env
+            .create_database(&mut wtxn, Some(SYSTEM_DB_NAME))
+            .map_err(|e| format!("create users db: {e}"))?;
+        wtxn.commit().map_err(|e| e.to_string())?;
+
+        Ok(Self { env, users, env_path })
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.env_path
     }
 
     pub fn is_empty(&self) -> bool {
-        self.inner.read().map(|f| f.users.is_empty()).unwrap_or(true)
+        match self.env.read_txn() {
+            Ok(rtxn) => self.users.is_empty(&rtxn).unwrap_or(true),
+            Err(_) => true,
+        }
     }
 
     pub fn list(&self) -> Vec<User> {
-        self.inner
-            .read()
-            .map(|f| f.users.clone())
-            .unwrap_or_default()
+        let rtxn = match self.env.read_txn() {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let mut out = Vec::new();
+        if let Ok(iter) = self.users.iter(&rtxn) {
+            for entry in iter.flatten() {
+                if let Ok(u) = bincode::deserialize::<User>(entry.1) {
+                    out.push(u);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
     }
 
     /// Create a new user. Returns an error if the name already exists.
@@ -130,12 +153,12 @@ impl UserStore {
             created_at: now_secs(),
         };
 
-        let mut file = self.inner.write().map_err(|_| "user store lock poisoned")?;
-        if file.users.iter().any(|u| u.name == name) {
+        let mut wtxn = self.env.write_txn().map_err(|e| e.to_string())?;
+        if self.users.get(&wtxn, name).map_err(|e| e.to_string())?.is_some() {
             return Err(format!("user already exists: {name}"));
         }
-        file.users.push(user.clone());
-        Self::save(&self.path, &file)?;
+        self.put_user(&mut wtxn, &user)?;
+        wtxn.commit().map_err(|e| e.to_string())?;
         Ok(user)
     }
 
@@ -145,87 +168,71 @@ impl UserStore {
             return Err("password must be at least 8 characters".into());
         }
         let hash = hash_password(new_password)?;
-        let mut file = self.inner.write().map_err(|_| "user store lock poisoned")?;
-        let u = file
-            .users
-            .iter_mut()
-            .find(|u| u.name == name)
+
+        let mut wtxn = self.env.write_txn().map_err(|e| e.to_string())?;
+        let raw = self.users
+            .get(&wtxn, name)
+            .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("user not found: {name}"))?;
-        u.password_hash = hash;
-        Self::save(&self.path, &file)?;
+        let mut user: User = bincode::deserialize(raw)
+            .map_err(|e| format!("deserialise user: {e}"))?;
+        user.password_hash = hash;
+        self.put_user(&mut wtxn, &user)?;
+        wtxn.commit().map_err(|e| e.to_string())?;
         Ok(())
     }
 
     /// Delete a user. Returns `true` if a user was actually removed.
     pub fn delete(&self, name: &str) -> Result<bool, String> {
-        let mut file = self.inner.write().map_err(|_| "user store lock poisoned")?;
-        let before = file.users.len();
-        file.users.retain(|u| u.name != name);
-        let removed = file.users.len() < before;
-        if removed {
-            Self::save(&self.path, &file)?;
-        }
+        let mut wtxn = self.env.write_txn().map_err(|e| e.to_string())?;
+        let removed = self.users
+            .delete(&mut wtxn, name)
+            .map_err(|e| e.to_string())?;
+        wtxn.commit().map_err(|e| e.to_string())?;
         Ok(removed)
     }
 
-    /// Verify a username + password pair against the store.
-    /// Returns the user (with its scope) on success, `None` on any failure.
-    /// Constant-time-ish — always runs an argon2 verify, even when the
-    /// user doesn't exist, to avoid a username-enumeration timing oracle.
+    /// Verify a username + password. Always runs an Argon2 verify (against
+    /// a decoy hash when the user doesn't exist) so timing doesn't leak
+    /// whether the username was valid.
     pub fn verify(&self, name: &str, password: &str) -> Option<User> {
-        let users = self.inner.read().ok()?;
         // Decoy hash so the timing of "user not found" matches "wrong password".
         const DECOY: &str = "$argon2id$v=19$m=19456,t=2,p=1$YWFhYWFhYWFhYWFhYWFhYQ$qJDuO5/0aMQHsfZK2dMNgJsEuXRTyT5xhI8Sx5Z03Ag";
-        let (hash_str, found) = match users.users.iter().find(|u| u.name == name) {
-            Some(u) => (u.password_hash.as_str(), Some(u.clone())),
-            None => (DECOY, None),
+
+        // Fresh read txn — picks up whatever the CLI wrote since the last call.
+        let rtxn = self.env.read_txn().ok()?;
+        let (hash_str, found) = match self.users.get(&rtxn, name).ok().flatten() {
+            Some(raw) => match bincode::deserialize::<User>(raw) {
+                Ok(u) => (u.password_hash.clone(), Some(u)),
+                Err(_) => (DECOY.to_string(), None),
+            },
+            None => (DECOY.to_string(), None),
         };
-        let parsed = PasswordHash::new(hash_str).ok()?;
+        drop(rtxn);
+
+        let parsed = PasswordHash::new(&hash_str).ok()?;
         let ok = Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
             .is_ok();
         if ok { found } else { None }
     }
 
-    /// Re-read the file from disk. Useful after the CLI has mutated it
-    /// while the server was running.
-    #[allow(dead_code)]
-    pub fn reload_from_disk(&self) -> Result<(), String> {
-        let raw = fs::read_to_string(&self.path)
-            .map_err(|e| format!("read {}: {e}", self.path.display()))?;
-        let next: UsersFile = serde_json::from_str(&raw)
-            .map_err(|e| format!("parse {}: {e}", self.path.display()))?;
-        let mut file = self.inner.write().map_err(|_| "user store lock poisoned")?;
-        *file = next;
+    /* ─── internals ───────────────────────────────────────────────────── */
+
+    fn put_user(&self, wtxn: &mut heed::RwTxn, user: &User) -> Result<(), String> {
+        let bytes = bincode::serialize(user)
+            .map_err(|e| format!("serialise user: {e}"))?;
+        self.users
+            .put(wtxn, &user.name, &bytes)
+            .map_err(|e| format!("write user: {e}"))?;
         Ok(())
     }
 
-    fn save(path: &Path, file: &UsersFile) -> Result<(), String> {
-        let serialised = serde_json::to_string_pretty(file)
-            .map_err(|e| format!("serialise users: {e}"))?;
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serialised.as_bytes())
-            .map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        // Restrict to owner-readable (best-effort on Unix).
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-        }
-        fs::rename(&tmp, path).map_err(|e| format!("rename {}: {e}", path.display()))?;
-        Ok(())
-    }
 }
 
+/* ─── auth-route classifier (unchanged from JSON era) ─────────────────────── */
+
 /// Authorisation check: does `scope` permit access to a request `path`?
-///
-/// Rules:
-///   - `Scope::Root`                  → every path.
-///   - `Scope::Database("default")`   → /db/default/* AND /collections/*
-///                                       AND /algebra/* AND /compose/*
-///   - `Scope::Database(name)`        → /db/{name}/*  only
-///   - `/db` (DB management)          → root only
-///   - `/health`                      → not checked here (whitelisted upstream)
 pub fn is_authorized(scope: &Scope, path: &str) -> bool {
     if matches!(scope, Scope::Root) {
         return true;
@@ -235,20 +242,16 @@ pub fn is_authorized(scope: &Scope, path: &str) -> bool {
         Scope::Root => unreachable!(),
     };
 
-    // /db/{name}/...
     if let Some(rest) = path.strip_prefix("/db/") {
-        // The first segment up to the next '/' (or end) is the DB name.
         let segment_end = rest.find('/').unwrap_or(rest.len());
         let route_db = &rest[..segment_end];
         return route_db == db_name;
     }
 
-    // /db itself (list + create) — root only.
     if path == "/db" {
         return false;
     }
 
-    // Legacy default-DB routes — only if scoped to "default".
     if db_name == "default" {
         return path.starts_with("/collections")
             || path.starts_with("/algebra")
@@ -279,15 +282,15 @@ pub fn validate_username(name: &str) -> Result<(), String> {
     }
     for c in chars {
         if !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
-            return Err(format!("username has invalid char {c:?} (allowed: a-zA-Z0-9 _ - .)"));
+            return Err(format!(
+                "username has invalid char {c:?} (allowed: a-zA-Z0-9 _ - .)"
+            ));
         }
     }
     Ok(())
 }
 
-/// Generate a URL-safe random password. Used when first-boot creates the
-/// admin user — printed once to stderr in the engine logs and never stored
-/// in plaintext.
+/// Generate a URL-safe random password.
 pub fn generate_password(len: usize) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789";
     let mut rng = OsRng;
@@ -348,6 +351,29 @@ mod tests {
     }
 
     #[test]
+    fn live_visibility_across_handles() {
+        // Simulates the CLI-while-server-runs case: open two handles on
+        // the same dir, write through one, see it from the other.
+        let dir = tempfile::tempdir().unwrap();
+        let server = UserStore::load(dir.path()).unwrap();
+        let cli    = UserStore::load(dir.path()).unwrap();
+
+        // CLI creates a user. Server (no restart) should see it.
+        cli.create("alice", "passw0rd!", Scope::Root).unwrap();
+        assert!(server.verify("alice", "passw0rd!").is_some());
+
+        // CLI rotates the password. Server picks up the new one
+        // immediately.
+        cli.set_password("alice", "new-passw0rd").unwrap();
+        assert!(server.verify("alice", "passw0rd!").is_none());
+        assert!(server.verify("alice", "new-passw0rd").is_some());
+
+        // CLI deletes. Server stops accepting.
+        cli.delete("alice").unwrap();
+        assert!(server.verify("alice", "new-passw0rd").is_none());
+    }
+
+    #[test]
     fn scope_parse() {
         assert_eq!(Scope::parse("root").unwrap(), Scope::Root);
         assert_eq!(Scope::parse("*").unwrap(), Scope::Root);
@@ -355,8 +381,8 @@ mod tests {
             Scope::parse("memoria").unwrap(),
             Scope::Database("memoria".into())
         );
-        assert!(Scope::parse("Memoria").is_err()); // uppercase
-        assert!(Scope::parse("1abc").is_err()); // leading digit
+        assert!(Scope::parse("Memoria").is_err());
+        assert!(Scope::parse("1abc").is_err());
     }
 
     #[test]
@@ -374,8 +400,8 @@ mod tests {
         assert!(is_authorized(&s, "/db/memoria"));
         assert!(is_authorized(&s, "/db/memoria/collections/users/write"));
         assert!(!is_authorized(&s, "/db/navigator/collections/x"));
-        assert!(!is_authorized(&s, "/db"));               // mgmt
-        assert!(!is_authorized(&s, "/collections/x"));   // legacy = default
+        assert!(!is_authorized(&s, "/db"));
+        assert!(!is_authorized(&s, "/collections/x"));
         assert!(!is_authorized(&s, "/algebra/add"));
     }
 
@@ -384,21 +410,10 @@ mod tests {
         let s = Scope::Database("default".into());
         assert!(is_authorized(&s, "/db/default"));
         assert!(is_authorized(&s, "/db/default/collections/x"));
-        assert!(is_authorized(&s, "/collections/x"));        // legacy alias
+        assert!(is_authorized(&s, "/collections/x"));
         assert!(is_authorized(&s, "/algebra/add"));
         assert!(is_authorized(&s, "/compose/read"));
         assert!(!is_authorized(&s, "/db/memoria/collections/x"));
         assert!(!is_authorized(&s, "/db"));
-    }
-
-    #[test]
-    fn timing_safe_unknown_user() {
-        // Both calls should take roughly the same amount of work — hard to
-        // assert timing in unit tests, but we can at least confirm both
-        // return None deterministically.
-        let (_dir, s) = store();
-        s.create("alice", "passw0rd!", Scope::Root).unwrap();
-        assert!(s.verify("alice", "wrong").is_none());
-        assert!(s.verify("nonexistent", "wrong").is_none());
     }
 }

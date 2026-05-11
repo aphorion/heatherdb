@@ -658,6 +658,7 @@ dependencies = [
  "argon2",
  "axum",
  "base64",
+ "bincode",
  "clap",
  "flate2",
  "heather_algebra",

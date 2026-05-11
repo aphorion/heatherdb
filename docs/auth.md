@@ -290,38 +290,39 @@ firewall, no rate limiting, and no audit log; the network boundary is
 the only thing standing between an unauthenticated request and arbitrary
 data destruction.
 
-## File formats
+## Where users live on disk
 
-`$HEATHER_DATA_DIR/users.json`:
+`$HEATHER_DATA_DIR/system/data/` — its own LMDB env, sibling of every
+per-database env at `$ROOT/db/<name>/data/`. One named sub-DB inside
+called `users` (key = username, value = bincode of the user record).
 
-```json
-{
-  "users": [
-    {
-      "name": "admin",
-      "password_hash": "$argon2id$v=19$m=19456,t=2,p=1$…",
-      "scope": { "kind": "root" },
-      "created_at": 1730000000
-    },
-    {
-      "name": "memoria-app",
-      "password_hash": "$argon2id$…",
-      "scope": { "kind": "database", "name": "memoria" },
-      "created_at": 1730000123
-    }
-  ]
-}
-```
+Why LMDB instead of a JSON file: **CLI mutations are visible to a
+running engine immediately**, no restart. `verify()` opens a fresh
+read transaction per request, so `heather_server user create alice …`
+in one terminal lets `alice` log in seconds later in another, even
+while the engine is mid-flight.
 
-The file is rewritten atomically (`users.json.tmp` → rename) on every
-mutation. Permissions on Unix are clamped to `0600` on save.
+The file is owner-readable on Unix (LMDB's default `0600` mode).
 
 ## Backup + restore
 
-`users.json` is a single small JSON file. Back it up alongside the
-data directory. To migrate creds to a new instance: copy the file,
-restart. Hashes are portable — Argon2id parameters are encoded in the
-hash itself.
+The system env is one of N LMDB envs under `$HEATHER_DATA_DIR/`. The
+backup tooling already covers it:
+
+```bash
+heather_server --data-dir … backup create --output users-and-all.tar.gz
+# tar contents include system/ alongside db/<name>/.
+```
+
+Live snapshot of just the user store:
+
+```bash
+mdb_copy $HEATHER_DATA_DIR/system/data /tmp/users-snap
+```
+
+To migrate creds to a new instance: snapshot or tar the `system/`
+directory and drop it into the new data dir. Hashes are portable —
+Argon2id parameters are encoded in the hash itself.
 
 ## What this isn't (yet)
 

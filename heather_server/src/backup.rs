@@ -154,13 +154,18 @@ fn do_backup(data_dir: &Path, output: &Path, db: Option<&str>) -> Result<(), Str
             .map_err(|e| format!("tar {}: {e}", dir.display()))?;
         println!("✓ backed up database '{name}' → {}", output.display());
     } else {
-        // Full backup: users.json + server.toml + db/.
-        for f in ["users.json", "server.toml"] {
+        // Full backup: server.toml + system/ (users env) + db/.
+        for f in ["server.toml"] {
             let p = data_dir.join(f);
             if p.is_file() {
                 tar.append_path_with_name(&p, f)
                     .map_err(|e| format!("tar {}: {e}", p.display()))?;
             }
+        }
+        let system_dir = data_dir.join("system");
+        if system_dir.is_dir() {
+            tar.append_dir_all("system", &system_dir)
+                .map_err(|e| format!("tar {}: {e}", system_dir.display()))?;
         }
         let db_dir = data_dir.join("db");
         if db_dir.is_dir() {
