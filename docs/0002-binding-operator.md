@@ -4,6 +4,7 @@
 **Owner:** —
 **Last updated:** 2026-05-15
 **Branch:** `binding-operator`
+**Status of demos:** 12 / 12 passing as of this version
 
 ## Summary
 
@@ -21,21 +22,23 @@ Eliasmith's Semantic Pointer Architecture, **and Friston's Active
 Inference / Free Energy Principle** — that the field walked past in
 the mid-90s when backprop won the substrate war.
 
-**Eleven runnable demos** under `heather_algebra/examples/`
+**Twelve runnable demos** under `heather_algebra/examples/`
 substantiate the claim end-to-end. Each is self-validating. Together
 they show the substrate handling state, structure, decision,
 relational reasoning, discrete computation, rule discovery, task
-dispatch, recursive structures, two-tier memory, and predictive-
-coding / free-energy-minimizing agency — all from the same five
-operators.
+dispatch, recursive structures, two-tier memory, free-energy-
+minimizing agency, **and hierarchical feature learning** — all from
+the same five operators.
 
-The eleventh demo (`active_inference`) is the keystone: it doesn't
-add a new cognitive capability, it **re-frames the existing ten under
-one organizing principle**. Friston's framework explains *why* the
-substrate's primitives work — every operation reduces to variational
-free-energy minimization — turning the demo portfolio from "a library
-of capabilities" into "an implementation of a 25-year theoretical
-framework."
+The eleventh demo (`active_inference`) is the keystone: it
+re-frames the prior ten under one organizing principle — Friston's
+framework explains *why* the substrate's primitives work, every
+operation reducing to variational free-energy minimization. The
+twelfth (`predictive_coding`) goes one step further: it shows the
+substrate can **learn its own features from raw data**, hierarchical
+representation learning without backprop or autograd. The substrate
+is no longer "a cognitive architecture that consumes pretrained
+encoders" — it's a *training infrastructure* in its own right.
 
 ## Goals
 
@@ -210,11 +213,11 @@ In `bind.rs` `#[cfg(test)] mod tests`:
 
 ---
 
-## Validation — eleven runnable demos
+## Validation — twelve runnable demos
 
 Each is a standalone Rust example under `heather_algebra/examples/`,
 runs via `cargo run --release --example <name> -p heather_algebra`,
-and self-validates via `assert!`. Together they total ~5,000 lines.
+and self-validates via `assert!`. Together they total ~5,500 lines.
 
 ### `gridworld` — substrate as agent architecture
 
@@ -478,6 +481,44 @@ Four sections, all passing:
    substrate noise. Friston's framework as a working agent loop,
    not a theoretical claim.
 
+### `predictive_coding` — hierarchical feature learning without backprop
+
+Two-layer hierarchical EAM that learns categorical features from
+noisy inputs via Rao & Ballard (1999) predictive coding. Layer 2
+stores **bidirectional bindings** between high-level categories and
+low-level inputs:
+
+    entry = bind(L2_KEY, l2_state) + bind(L1_KEY, l1_state)
+
+Bottom-up: `bind(L1, observed) → read → unbind L2 → cleanup against
+L2 lexicon → cleaned category state`. Top-down: `bind(L2, cleaned)
+→ read → unbind L1 → cleanup against L1 lexicon → reconstructed
+input`. The error is computed in the cleaned-up space; if it
+exceeds a threshold, the substrate invents a new L2 category.
+Otherwise it reinforces the existing one. **All updates local — no
+gradient ever flows backward through layers.**
+
+Four sections, all passing:
+1. **Baseline**: single-layer EAM doesn't discover categories from
+   raw noisy inputs — it just memorizes them.
+2. **Predictive coding**: discovers *exactly* K=4 prototype
+   categories from 100 noisy samples (25 per prototype), **100%
+   cluster purity**, one-pass, online, unsupervised.
+3. **Continual learning**: 2 new prototypes added after the first
+   4 are learned → 2 new categories emerge, old 4 categories
+   untouched. No catastrophic forgetting at the feature level.
+4. **Generative reconstruction**: top-down predictions from each
+   learned L2 state recover the underlying prototype at average
+   cosine **0.894**. The substrate has learned a generative model
+   — the autoencoder property — without an autoencoder loss, without
+   backprop, without autograd.
+
+This is the demo that turns "substrate cognitive architecture" into
+"substrate training infrastructure." The encoder layer (perception)
+is no longer external — it co-trains with the substrate via local
+prediction-error updates. The path to learning representations from
+raw data, not consuming pretrained ones.
+
 ---
 
 ## Module → Spaun cognitive analog
@@ -495,6 +536,7 @@ Four sections, all passing:
 | `raam` | recursive structure encoding | (beyond Spaun — Pollack) |
 | `episodic_semantic` | two-tier memory + replay | (beyond Spaun — neuroscience) |
 | `active_inference` | **organizing principle for all of the above** | (beyond Spaun — Friston) |
+| `predictive_coding` | **hierarchical feature learning, no backprop** | (beyond Spaun — Rao & Ballard) |
 
 What remains for full Spaun parity:
 - **Perception**: raw input → semantic pointer (encoder concern;
@@ -637,6 +679,37 @@ This isn't a bug in the substrate — it's a property of how Hopfield
 networks work. But it's a non-obvious requirement for anyone
 implementing predictive/curiosity-driven behaviour on top.
 
+### 5. HRR cleanup is essential for chained unbind operations
+
+Methodological finding from building `predictive_coding.rs`. Raw
+HRR unbind through a bundled binding loses ~40% of signal per step.
+Two chained unbinds (e.g., `infer_l2 → predict_l1`) compound this,
+leaving the output with cosine ~0.5 to the original — not enough to
+distinguish categories. Without lexicon cleanup, the demo creates
+**one category per input** (100 categories for 100 samples). With
+cleanup, it creates *exactly K = 4* — the correct answer.
+
+The fix is to interpose an EAM cleanup step against a stored
+lexicon between unbind operations:
+
+```rust
+let noisy_l2 = layer2.infer_l2_raw(l1);
+let cleaned_l2 = layer2.cleanup_l2(&noisy_l2);  // ← snap to lexicon
+let noisy_l1 = layer2.predict_l1_raw(&cleaned_l2);
+let cleaned_l1 = layer2.cleanup_l1(&noisy_l1);  // ← snap to lexicon
+```
+
+The cleanup against a lexicon is **Plate's original 1995 HRR design**.
+It's not optional when you chain operations — the cross-term noise
+compounds geometrically without it. This is finding 2 (the EAM read
+does cleanup implicitly) refined: the read cleans up *one* operation;
+*chained* operations require explicit lexicon cleanup at each stage.
+
+**Implication**: any substrate pipeline that composes `bind` and
+`unbind` across multiple stages MUST interleave lexicon cleanup
+operations. Skipping cleanup is the most likely failure mode for
+new substrate code.
+
 ---
 
 ## Lineage and pointers
@@ -717,15 +790,15 @@ the highest-leverage next move**. Concrete follow-ups, in order:
    community is the secondary one via the Ramsauer 2020 bridge.
 
 Optional further cognitive modules (lower priority than the above):
-- **Hierarchical predictive coding** (Rao & Ballard 1999) — layered
-  EAMs each predicting the layer below. The natural extension of
-  `active_inference`: scale free-energy minimization across
-  abstraction layers. This is the highest-leverage cognitive demo
-  remaining.
-- **Perception encoder under predictive coding** — raw input →
-  prediction-error vector. Active inference makes the encoder
-  substrate-aware: encode the residual, not the raw signal. Order-
-  of-magnitude memory efficiency gain.
+- **Benchmark on a standard dataset** — substrate classifier vs
+  backprop baselines on Iris / Wine / MNIST. Measures accuracy,
+  training time, continual-learning resilience. The empirical
+  validation that turns "trains without backprop" from plausible
+  to demonstrated. *Next demo to build.*
+- **Deeper hierarchical predictive coding** — three or more layers
+  stacked, each predicting the layer below. `predictive_coding`
+  proves the two-layer case; deeper stacks would test how
+  abstraction scales.
 - **Motor decoder** — bound action vector → discrete output. Mirror
   of perception; goes at the boundary.
 - **Reward / reinforcement signal** — partially subsumed by the
