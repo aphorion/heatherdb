@@ -16,14 +16,16 @@ over **structured** representations.
 The implementation is small (~200 lines in `bind.rs`). The thesis is
 large: with `bind`, HeatherDB is no longer a vector database with a
 neat algebra. It is the operational substrate for a line of cognitive
-architecture research — Kanerva's SDM, Plate's HRR, Eliasmith's
-Semantic Pointer Architecture — that the field walked past in the
-mid-90s when backprop won the substrate war.
+architecture research — Kanerva's SDM, Plate's HRR, Pollack's RAAM,
+Eliasmith's Semantic Pointer Architecture — that the field walked
+past in the mid-90s when backprop won the substrate war.
 
-Six runnable demos under `heather_algebra/examples/` substantiate the
-claim end-to-end. Each is self-validating. Together they show the
-substrate handling state, structure, decision, reasoning, and discrete
-computation, all from the same five operators.
+**Ten runnable demos** under `heather_algebra/examples/` substantiate
+the claim end-to-end. Each is self-validating. Together they show
+the substrate handling state, structure, decision, relational
+reasoning, discrete computation, rule discovery, task dispatch,
+recursive structures, and two-tier memory — all from the same
+five operators.
 
 ## Goals
 
@@ -34,7 +36,8 @@ computation, all from the same five operators.
 2. **Demonstrate the algebra's completeness** via runnable examples
    covering the canonical primitives of distributed cognitive
    architectures: working memory, action selection, analogical
-   reasoning, counting.
+   reasoning, counting, pattern induction, task dispatch, recursive
+   structure, and episodic↔semantic memory.
 3. **Pin down the theoretical frame** — name the lineage (Plate,
    Kanerva, Eliasmith, Hofstadter) the substrate sits in, so future
    work has a vocabulary and a literature to draw from.
@@ -197,11 +200,11 @@ In `bind.rs` `#[cfg(test)] mod tests`:
 
 ---
 
-## Validation — six runnable demos
+## Validation — ten runnable demos
 
 Each is a standalone Rust example under `heather_algebra/examples/`,
 runs via `cargo run --release --example <name> -p heather_algebra`,
-and self-validates via `assert!`. Together they total ~2,800 lines.
+and self-validates via `assert!`. Together they total ~4,500 lines.
 
 ### `gridworld` — substrate as agent architecture
 
@@ -310,6 +313,107 @@ notable empirical finding:
 4. **Addition as iterated counting**: 8/8 sums correct including
    modular wraps (e.g. `8+7=5 mod 10`).
 
+### `pattern_induction` — Spaun's "figure out the rule"
+
+Each candidate operator (`succ`, `pred`, `add2`, `add3`, `double`) is
+stored as bound `(CURRENT, NEXT)` pairs tagged by operator identity.
+Inference iterates the operator library, checking how well each
+predicts every consecutive pair in the observed sequence.
+
+Four sections, all passing:
+1. **Operator library**: 7/7 stored operators apply correctly.
+2. **Inference**: 8/8 sequences correctly attributed to their
+   generating rule (`succ`, `pred`, `add2`, `add3`, `double`).
+3. **Prediction**: 6/6 next-term predictions correct, including
+   modular wraps (`[1,2,4,8] → 6` for `double`).
+4. **Evidence accumulation**: `(1,2)` is ambiguous (tied: `succ` and
+   `double`); `(1,2,4)` resolves to `double`; `(1,2,3)` resolves to
+   `succ`. Confidence gap (top-1 minus runner-up) rises from 0% to
+   80% as more terms arrive. **Interpretable epistemic state from a
+   single subtraction, no probabilistic machinery.**
+
+### `cognitive_control` — task dispatch as substrate primitive
+
+The keystone module: receives heterogeneous bound requests, identifies
+each task by similarity-matching the unbound `TASK` tag against a
+known-task lexicon, and routes to the appropriate cognitive
+subroutine. This is Eliasmith's task-selection loop — basal-ganglia
+gating applied to *cognitive subroutines* rather than motor actions.
+
+Four sections, all passing:
+1. **Basic dispatch**: 4/4 task types routed to correct handlers.
+2. **Mixed stream**: 30/30 (100%) routing on a random heterogeneous
+   request mix.
+3. **Composition**: `predict_next [1,2,3,4]=5` chained into
+   `count_forward(5,3)=[5,6,7,8]` produces the full sequence
+   `[1,2,3,4,5,6,7,8]` — cognitive subroutines compose by passing
+   substrate values.
+4. **Unknown task**: a request tagged with an unfamiliar `TASK`
+   vector triggers `Uncertain` (gap +0.010 vs familiar gap +0.469 —
+   a 47× geometric separation). The agent refuses to dispatch when
+   it doesn't recognize the task, instead of silently misrouting.
+
+This module is where the previous seven cease being a library and
+become a single agent.
+
+### `raam` — Pollack's RAAM, 35 years later
+
+Pollack (1990) showed how to encode arbitrary trees as fixed-dim
+vectors via recursive binding. His implementation used a backprop'd
+autoencoder for cleanup, which was fragile and didn't survive the
+90s. On the substrate the construction is dramatically simpler:
+
+    node(left, right) = bind(LEFT, left) + bind(RIGHT, right)
+
+Every subtree (leaf or internal) is written to a tree EAM as it's
+built. Decoding by path walks LEFT/RIGHT steps, unbinding the role
+key and reading the EAM at each step for cleanup.
+
+Four sections, **all at cosine 1.000**:
+1. Round-trip `((A,B),(C,D))` — 4/4 leaves recovered by path.
+2. Parse tree of "the cat sat on the mat" — 6/6 words recovered
+   including the depth-4 path `RIGHT.RIGHT.RIGHT.RIGHT → mat`.
+3. **Linear chains up to depth 15** — every deepest leaf recovered
+   at cosine 1.000. The EAM cleanup absorbs per-step noise without
+   accumulation.
+4. **Algebraic tree manipulation** — swap left/right children at
+   the root via `unbind + rebind`, no encode/decode round-trip.
+   The tree is a value, not a process.
+
+Pollack had the theory in 1990; the EAM is the missing cleanup
+memory that makes the construction operational.
+
+### `episodic_semantic` — hippocampal-cortical replay loop
+
+Two-tier memory: **episodic** (fast write, verbatim cases, fades)
+plus **semantic** (slow build via consolidation, prototypes,
+persists). Consolidation groups episodic cases by their decoded
+resolution, bundles each group into a prototype, and writes
+prototypes to semantic.
+
+Four sections, all passing:
+1. **Episodic baseline**: 60/60 (100%) specific recall on the
+   training set.
+2. **Consolidation**: 60 episodic entries → 5 semantic prototypes
+   (12× compression, one per resolution class).
+3. **Generalization** on 60 *novel* cases:
+   - Episodic alone: 85.0%
+   - Semantic alone: 88.3% — *generalizes better* than episodic
+   - Combined two-tier: 90.0%
+4. **Forgetting**: replace episodic with 30 random noise vectors
+   (simulating loss of specific experiences).
+   - Episodic accuracy: 85.0% → **2.5%** (collapsed to chance)
+   - Semantic accuracy: 87.5% → **87.5%** (unchanged)
+
+   The policy survives the loss of the specific cases. **This is
+   exactly the architecture biological brains use** and exactly
+   why they use it.
+
+No new operators were introduced for this module. Episodic write is
+`eam.write`; consolidation is `bundle` + `eam.write`; query is
+`read` + `unbind`. The two-tier behaviour is a *policy* over the
+substrate, not a new mechanism.
+
 ---
 
 ## Module → Spaun cognitive analog
@@ -319,18 +423,23 @@ notable empirical finding:
 | `gridworld` | world model + planning + agent composition | sensorimotor + value |
 | `tenancy` | namespace isolation | (substrate use, not cognitive) |
 | `working_memory` | state holding, manipulation | working memory |
-| `analogy` | relation extraction & transfer | pattern induction |
+| `analogy` | relation extraction & transfer | pattern induction (per-pair) |
 | `action_selection` | decision under goal | basal ganglia + PFC |
 | `counting` | iterative transformation | counting circuit |
+| `pattern_induction` | rule discovery from sequence | inductive reasoning |
+| `cognitive_control` | task dispatch (keystone) | task selection / control |
+| `raam` | recursive structure encoding | (beyond Spaun — Pollack) |
+| `episodic_semantic` | two-tier memory + replay | (beyond Spaun — neuroscience) |
 
 What remains for full Spaun parity:
 - **Perception**: raw input → semantic pointer (encoder concern, not a
   substrate primitive)
 - **Motor output**: vector → discrete action (decoder concern)
-- **Cognitive control**: task selection / dispatch (composable from
-  action selection + WM; not yet demoed)
-- **Long-term semantic memory** (consolidation from episodic — partly
-  there via `knn_merge`; can be made an explicit primitive)
+- **Reward / reinforcement**: strengthen memories based on outcome
+  feedback (composable from `scale` + write)
+- **Hierarchical predictive coding** (Rao & Ballard 1999): layered
+  EAMs each predicting the layer below — a future demo, not a
+  missing primitive
 
 ---
 
@@ -384,6 +493,45 @@ weak membership privacy. Adequate for multi-tenant isolation in
 non-adversarial settings; insufficient as a cryptographic primitive
 without the nonce hardening.
 
+### 3. The EAM read *is* a transformer attention head
+
+Result formalized by Ramsauer, Schäfl, et al. (2020), "Hopfield
+Networks is All You Need" — but worth pinning here, because it
+reshapes how to talk about the substrate.
+
+The EAM's softmax read computes:
+
+    result = Σ_i  softmax(β · query · address_i) · pattern_i
+
+This is **identical** to a transformer attention head, where
+`query ↔ Q`, `address ↔ K`, `pattern ↔ V`, `β ↔ 1/√d` scaling.
+Modern Hopfield networks recover transformer attention as their
+retrieval operation.
+
+**Implication for framing**: HeatherDB doesn't need an "attention
+module" — every EAM read in every demo above *is* transformer
+attention. The architectural difference is that transformers stack
+this primitive inside a frozen weight tensor; the substrate exposes
+it as a composable operator that you can pre- and post-process with
+`bind`, `add`, `sub`, `intersect`. Same primitive, different
+exposure: the substrate is to attention what a CPU is to dedicated
+silicon — slower at one fixed configuration, but reprogrammable.
+
+This identity also explains why the demos' results are sharp at
+modest dimensions (d=512–1024): we're running a single attention
+head per read, with very few competing keys, on near-orthogonal
+representations. Conditions transformers don't get in production.
+
+Three substrate-level identities, in one sentence each:
+- **EAM is Kanerva's SDM** — pattern completion via attractor
+  relaxation.
+- **EAM read is HRR cleanup** — softmax concentrates, noisy bindings
+  recover.
+- **EAM read is transformer attention** — Ramsauer 2020 made the
+  equivalence formal.
+
+All three name the same primitive.
+
 ---
 
 ## Lineage and pointers
@@ -400,7 +548,19 @@ deep-learning era:
 - **Paul Smolensky** — Tensor Product Representations (1990); ICS
   architecture. The uncompressed parent of HRR.
 - **Jordan Pollack** — Recursive Auto-Associative Memory (1990).
-  Recursive binding for trees. Direct application path for future demos.
+  Recursive binding for trees. The `raam` demo is a faithful port;
+  what Pollack lacked was the cleanup memory at scale, which the
+  EAM provides natively.
+- **Sepp Hochreiter / Hubert Ramsauer (Linz)** — "Hopfield Networks
+  is All You Need" (2020). Proved transformer attention is
+  mathematically identical to modern Hopfield retrieval. This is
+  the result that makes the substrate's competitive frame against
+  transformers explicit: same primitive, more flexible exposure.
+- **Tulving, McClelland, O'Reilly** — complementary learning systems
+  theory (1995–2000s). Hippocampus does fast episodic encoding;
+  cortex does slow semantic consolidation via replay. The
+  `episodic_semantic` demo is this architecture in 400 lines of
+  substrate code.
 - **Chris Eliasmith** — *How to Build a Brain* (2013); Spaun
   (Eliasmith et al., *Science* 2012). The most complete cognitive
   architecture built on this stack. Built spiking-neuron substrate
@@ -422,43 +582,58 @@ math at scale. The combination of `heather_db`'s EAM with this RFC's
 
 ## What's next
 
-Concrete follow-ups, roughly in order of leverage:
+The substrate proof is complete enough that **integration becomes
+the highest-leverage next move**. Concrete follow-ups, in order:
 
-1. **HTTP route surface** — `/db/{db}/algebra/bind` and `/unbind`, so
-   the operator is reachable from Python/TS clients and Fovea. Small
-   RFC, mostly route plumbing.
-2. **Per-record nonce hardening** — close the tenancy side channel.
-   Document the construction in `docs/tenancy-isolation.md`.
-3. **Engine integration of the demos** — port at least one demo
-   (working memory or counting) to use a live `heather_db::Collection`
+1. **HTTP route surface** — `/db/{db}/algebra/bind` and `/unbind`,
+   so the operator is reachable from Python/TS clients and Fovea.
+   Small RFC, mostly route plumbing. Unblocks all downstream
+   adoption.
+2. **Engine integration of one demo** — port `working_memory` or
+   `episodic_semantic` to use a live `heather_db::Collection`
    instead of `MiniEAM`, validating that the engine's read path
-   delivers the same numbers.
-4. **Pollack RAAM port** — recursive binding for tree-structured
-   representations. Encode an AST, recover any node by path. The
-   demo that proves the substrate handles arbitrary nesting depth.
-5. **Operator traits + ergonomic surface** — `&a ⊛ &b` via a custom
-   trait if it pays off in client code. Skip for now.
-6. **Public writeup / paper draft** — once the engine integration is
-   in, the demo portfolio is publishable. The Vector Symbolic
-   Architectures community (small but active — Kanerva's group,
-   Eliasmith's lab, Levy/Gayler) is the natural audience.
+   delivers the same numbers at scale.
+3. **Per-record nonce hardening** — close the tenancy side channel.
+   Document the construction in `docs/tenancy-isolation.md`.
+4. **Operator traits + ergonomic surface** — `&a ⊛ &b` via a custom
+   trait if it pays off in client code. Cosmetic; skip for now.
+5. **Public writeup / paper draft** — the ten-demo portfolio plus
+   the three substrate-level identity findings is publishable. The
+   VSA community (Kanerva's group, Eliasmith's lab, Levy/Gayler) is
+   the natural primary audience; the wider ML attention-mechanism
+   community is the secondary one via the Ramsauer 2020 bridge.
+
+Optional further cognitive modules (lower priority than the above):
+- **Perception encoder** — raw input → semantic pointer. Goes at the
+  boundary; not a substrate primitive.
+- **Motor decoder** — bound action vector → discrete output. Same.
+- **Reward / reinforcement signal** — strengthen memories based on
+  outcome. Composable from `scale` + selective write.
+- **Hierarchical predictive coding** (Rao & Ballard 1999) — layered
+  EAMs predicting the layer below. The "abstraction" demo.
 
 ## Out of scope explicitly
 
-- New cognitive modules. The six demos are enough to substantiate the
-  framing. Adding more before integration / hardening is premature.
+- Further cognitive modules before engine integration. The ten demos
+  are enough to substantiate the framing. Adding more before
+  integration is premature — the existing portfolio already saturates
+  what one can claim from a `MiniEAM` substrate.
 - Production binding throughput. We have not benchmarked. At d=384
   the math is microseconds per pair; at scale, the FFT path is the
   obvious win when it's needed.
-- Replacing transformers as inference engines. The substrate is a
-  cognitive substrate, not a sequence model. Encoders (including
-  transformer encoders) feed into the substrate; the substrate is
-  not a drop-in transformer replacement and we don't claim it is.
+- Replacing transformers as inference engines. Per Finding 3,
+  transformer attention *is* the EAM read — the substrate is what
+  attention looks like when exposed as a composable primitive.
+  Encoders and decoders (including transformer encoders) feed into
+  the substrate; the substrate is not a drop-in transformer
+  replacement and we don't claim it is.
 
 ---
 
 ## Decision request
 
 Adopt `bind` as a stable operator in `heather_algebra`. Lock in the
-example portfolio as substrate validation. Schedule (1) route surface
-and (3) engine integration as the next two work items.
+ten-demo example portfolio as substrate validation. Schedule (1)
+route surface and (2) engine integration as the next two work items;
+both unblock external adoption and validate the substrate at engine
+scale.
