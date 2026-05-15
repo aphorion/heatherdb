@@ -656,6 +656,115 @@ pub async fn algebra_sub(
     }
 }
 
+pub async fn algebra_bind(
+    State(hive): State<AppState>,
+    Json(req): Json<AlgebraBindRequest>,
+) -> Response {
+    let col_a = match hive.get_collection(&req.source_a) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("source collection '{}' not found", req.source_a),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let col_b = match hive.get_collection(&req.source_b) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("source collection '{}' not found", req.source_b),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let col_target = match hive.get_or_create_collection(&req.target) {
+        Ok(col) => col,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let target_name = req.target.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let snap_a = EAMSnapshot::from_collection(&col_a)?;
+        let snap_b = EAMSnapshot::from_collection(&col_b)?;
+        let bound = heather_algebra::bind::bind_with_limit(
+            &snap_a, &snap_b, req.max_cross_k.unwrap_or(0)
+        )?;
+        let num = bound.num_locations();
+        bound.into_collection(&col_target)?;
+        Ok::<_, heather_algebra::AlgebraError>(num)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(num_locations)) => {
+            tracing::info!(target = %target_name, num_locations, "Algebra bind completed");
+            Json(AlgebraResponse { collection: target_name, num_locations }).into_response()
+        }
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+pub async fn algebra_unbind(
+    State(hive): State<AppState>,
+    Json(req): Json<AlgebraUnbindRequest>,
+) -> Response {
+    let col_source = match hive.get_collection(&req.source) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("source collection '{}' not found", req.source),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let col_target = match hive.get_or_create_collection(&req.target) {
+        Ok(col) => col,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let target_name = req.target.clone();
+    let key_vector = req.key_vector.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let snap_source = EAMSnapshot::from_collection(&col_source)?;
+        // Build a single-location key snapshot from the raw vector.
+        if key_vector.len() != snap_source.dim() {
+            return Err(heather_algebra::AlgebraError::DimensionMismatch {
+                left: snap_source.dim(),
+                right: key_vector.len(),
+            });
+        }
+        let mut key_loc = heather_db::HardLocation::new(
+            heather_db::LocationId(0),
+            heather_db::vec_ops::normalize(&key_vector),
+        );
+        key_loc.counter = key_vector.clone();
+        key_loc.write_count = 1.0;
+        let snap_key = EAMSnapshot::new(vec![key_loc], snap_source.config.clone())?;
+        let unbound = heather_algebra::bind::unbind(&snap_source, &snap_key)?;
+        let num = unbound.num_locations();
+        unbound.into_collection(&col_target)?;
+        Ok::<_, heather_algebra::AlgebraError>(num)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(num_locations)) => {
+            tracing::info!(target = %target_name, num_locations, "Algebra unbind completed");
+            Json(AlgebraResponse { collection: target_name, num_locations }).into_response()
+        }
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
 pub async fn algebra_scale(
     State(hive): State<AppState>,
     Json(req): Json<AlgebraScaleRequest>,
