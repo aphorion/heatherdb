@@ -2,11 +2,13 @@
 //! substrate, without backprop.
 //!
 //! Rao & Ballard (1999) showed that the visual cortex learns features
-//! via *predictive coding*: each layer sends bottom-up signals to the
-//! layer above and receives top-down predictions back. Layers update
-//! locally to minimize the residual (prediction error). No global
-//! gradient, no autograd, no backprop — and yet hierarchical features
-//! emerge.
+//! via *predictive coding*: each layer sends bottom-up residual signals
+//! to the layer above and receives top-down predictions back. The loop
+//! is **iterative** — state at each layer refines through multiple
+//! rounds of (predict → compute residual → update belief) until the
+//! residual stops shrinking. Layers update locally to minimize this
+//! prediction error. No global gradient, no autograd, no backprop —
+//! and yet hierarchical features emerge.
 //!
 //! On the substrate, this becomes a two-layer EAM stack where Layer 2
 //! stores **bidirectional bindings** between high-level categories and
@@ -14,13 +16,20 @@
 //!
 //!   entry = bind(L2_KEY, l2_state) + bind(L1_KEY, l1_state)
 //!
-//! Bottom-up inference: query with bind(L1_KEY, observed_l1), unbind L2_KEY.
-//! Top-down prediction: query with bind(L2_KEY, inferred_l2), unbind L1_KEY.
+//! Inference loop (the actual Rao-Ballard algorithm):
+//!   state_l2 = infer_l2(l1)                       // initial guess
+//!   loop:
+//!     pred_l1   = predict_l1(state_l2)             // top-down
+//!     residual  = l1 − pred_l1                      // what's unexplained
+//!     delta     = infer_l2(residual)                // bottom-up update
+//!     state_l2 += PC_LR · delta;  normalize        // gradient-like step
+//!     if residual stopped shrinking: break
+//!   cleaned_l2 = cleanup_l2(state_l2)              // snap to lexicon
 //!
-//! When the prediction matches the observation, the substrate has a
-//! category for this input — reinforce. When it doesn't, the substrate
-//! is surprised — invent a new L2 state and bind it to this L1. Local,
-//! error-driven, no backprop.
+//! Learning is gated by the FINAL converged error: if the cleaned
+//! state still doesn't explain the input, the substrate invents a new
+//! L2 category. Otherwise it reinforces the existing one. Inference is
+//! fast and continuous; learning is slower and discrete.
 //!
 //! Sections:
 //!   1. Baseline — single-layer EAM that just memorizes noisy inputs.
@@ -49,6 +58,10 @@ const N_PER_PROTOTYPE: usize = 25;
 const PREDICTION_THRESHOLD: f64 = 0.45; // create new category if error > this
 const BETA: f64 = 12.0;
 const READ_ITERS: usize = 4;
+// Iterative inference (Rao & Ballard 1999):
+const PC_INFERENCE_ITERS: usize = 8;
+const PC_LR: f64 = 0.3;               // gradient-like step size
+const CONVERGENCE_EPS: f64 = 0.001;   // residual stops shrinking by this much → stop
 
 // ----- Helpers --------------------------------------------------------------
 
@@ -181,16 +194,26 @@ impl Layer2 {
     }
 }
 
-/// One step of predictive coding:
-///   1. Bottom-up infer L2 from L1 (substrate associative read).
-///   2. Top-down predict L1 from inferred L2.
-///   3. Error = 1 − cosine(actual L1, predicted L1).
-///   4. If error > threshold: invent a new L2 category, bind it to L1.
-///      Else: reinforce the existing category by writing again.
+/// One step of predictive coding — the *actual* Rao & Ballard 1999
+/// algorithm with iterative inference:
 ///
+///   1. Initial bottom-up guess: state_l2 = infer_l2(l1).
+///   2. Loop until residual converges:
+///       a. Top-down prediction: pred_l1 = predict_l1(state_l2).
+///       b. Residual = l1 − pred_l1 (the part of l1 not yet explained).
+///       c. Bottom-up update: delta = infer_l2(residual). The substrate
+///          tells us which direction in L2 space would explain the
+///          residual.
+///       d. Gradient-like step: state_l2 += PC_LR · delta, renormalize.
+///   3. Cleanup converged state_l2 against the L2 lexicon.
+///   4. If the cleaned state explains the input well enough, reinforce.
+///      Otherwise, invent a new L2 category.
+///
+/// The "residual goes up, prediction comes down" loop is the heart of
+/// the Rao & Ballard formulation — what the cortex is theorized to do.
 /// All updates are local. No gradient ever flows backward through layers.
 fn pc_step(l1: &[f64], layer2: &mut Layer2, rng: &mut StdRng)
-    -> (usize, f64, bool)
+    -> (usize, f64, bool, usize)
 {
     let empty = layer2.l2_states.is_empty();
     if empty {
@@ -199,18 +222,50 @@ fn pc_step(l1: &[f64], layer2: &mut Layer2, rng: &mut StdRng)
         let cat_idx = layer2.l2_states.len();
         layer2.l2_states.push(new_l2.clone());
         layer2.write(&new_l2, l1);
-        return (cat_idx, 1.0, true);
+        return (cat_idx, 1.0, true, 0);
     }
 
-    // Bottom-up: l1 → noisy l2 → cleanup against L2 lexicon.
-    let noisy_l2 = layer2.infer_l2_raw(l1);
-    let cleaned_l2 = layer2.cleanup_l2(&noisy_l2);
+    // Initial bottom-up guess (continuous state, NOT yet snapped to lexicon).
+    let mut state_l2 = layer2.infer_l2_raw(l1);
+    let mut last_residual_norm = f64::INFINITY;
+    let mut iters_used = 0;
 
-    // Top-down: cleaned l2 → noisy l1 → cleanup against L1 lexicon.
-    let noisy_l1 = layer2.predict_l1_raw(&cleaned_l2);
-    let cleaned_l1 = layer2.cleanup_l1(&noisy_l1);
+    for iter in 0..PC_INFERENCE_ITERS {
+        iters_used = iter + 1;
 
-    // Error in the cleaned-up space — this is where signal is preserved.
+        // Top-down prediction from current belief
+        let pred_l1 = layer2.predict_l1_raw(&state_l2);
+
+        // Residual — what current belief fails to explain
+        let residual: Vec<f64> = l1.iter().zip(pred_l1.iter())
+            .map(|(a, p)| a - p).collect();
+        let residual_norm = vec_ops::l2_norm(&residual);
+
+        // Convergence check: residual stopped shrinking
+        if iter > 0 && (last_residual_norm - residual_norm).abs() < CONVERGENCE_EPS {
+            break;
+        }
+        last_residual_norm = residual_norm;
+
+        // Bottom-up update FROM THE RESIDUAL (not from the raw l1) —
+        // this is the key Rao-Ballard insight. The substrate's
+        // infer_l2 on the residual tells us how to shift state_l2 to
+        // explain the unexplained part.
+        let delta = layer2.infer_l2_raw(&residual);
+
+        // Gradient-like step
+        for i in 0..state_l2.len() {
+            state_l2[i] = (1.0 - PC_LR) * state_l2[i] + PC_LR * delta[i];
+        }
+        state_l2 = vec_ops::normalize(&state_l2);
+    }
+
+    // Cleanup the converged state against the L2 lexicon
+    let cleaned_l2 = layer2.cleanup_l2(&state_l2);
+
+    // Final prediction error in cleaned-up space
+    let final_pred = layer2.predict_l1_raw(&cleaned_l2);
+    let cleaned_l1 = layer2.cleanup_l1(&final_pred);
     let error = (1.0 - vec_ops::cosine_similarity(l1, &cleaned_l1)).max(0.0);
 
     if error > PREDICTION_THRESHOLD {
@@ -218,13 +273,12 @@ fn pc_step(l1: &[f64], layer2: &mut Layer2, rng: &mut StdRng)
         let cat_idx = layer2.l2_states.len();
         layer2.l2_states.push(new_l2.clone());
         layer2.write(&new_l2, l1);
-        (cat_idx, error, true)
+        (cat_idx, error, true, iters_used)
     } else {
         let cat = layer2.classify(&cleaned_l2);
         let chosen = layer2.l2_states[cat].clone();
-        layer2.write(&chosen, l1);  // reinforce — strengthens the binding
-                                    // and adds this l1 to the lexicon
-        (cat, error, false)
+        layer2.write(&chosen, l1);
+        (cat, error, false, iters_used)
     }
 }
 
@@ -336,14 +390,18 @@ fn section_2(rng: &mut StdRng) -> (Vec<Vec<f64>>, Vec<(Vec<f64>, usize)>, Layer2
     let mut new_cat_events = 0;
     let mut errors_seen: Vec<f64> = Vec::new();
 
+    let mut iters_used: Vec<usize> = Vec::new();
     for (l1, true_p) in &samples {
-        let (cat, err, created) = pc_step(l1, &mut layer2, rng);
+        let (cat, err, created, iters) = pc_step(l1, &mut layer2, rng);
         assignments.push((cat, *true_p));
         if created { new_cat_events += 1; }
         errors_seen.push(err);
+        iters_used.push(iters);
     }
     let avg_err: f64 = errors_seen.iter().sum::<f64>() / errors_seen.len() as f64;
+    let avg_iters: f64 = iters_used.iter().sum::<usize>() as f64 / iters_used.len() as f64;
     println!("  Mean error across all inputs: {:.3}", avg_err);
+    println!("  Mean inference iterations: {:.2} (max {})", avg_iters, PC_INFERENCE_ITERS);
 
     let n_cats = layer2.l2_states.len();
     let pur = purity(&assignments, n_cats);
@@ -404,7 +462,7 @@ fn section_3(rng: &mut StdRng, mut layer2: Layer2) {
     // Run continual phase
     let mut new_phase_assignments: Vec<(usize, usize)> = Vec::new();
     for (l1, true_p) in &new_samples {
-        let (cat, _err, _) = pc_step(l1, &mut layer2, rng);
+        let (cat, _err, _, _) = pc_step(l1, &mut layer2, rng);
         new_phase_assignments.push((cat, *true_p));
     }
 
