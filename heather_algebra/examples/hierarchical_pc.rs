@@ -202,6 +202,11 @@ impl Bridge {
         let r = self.eam.read(&q);
         vec_ops::normalize(&unbind_vec(&r, &self.above_key))
     }
+    fn classify_above(&self, noisy: &[f64]) -> usize {
+        if self.above_states.is_empty() { return 0; }
+        let (_, idx) = self.cleanup_above(noisy);
+        idx
+    }
     fn cleanup_above(&self, noisy: &[f64]) -> (Vec<f64>, usize) {
         if self.above_states.is_empty() { return (noisy.to_vec(), 0); }
         let mut best = 0usize; let mut bs = f64::NEG_INFINITY;
@@ -294,11 +299,69 @@ impl Hierarchy {
     /// it's currently in pending limbo (the slow-learning gate is
     /// waiting for recurrence before promoting it). Pending inputs
     /// are NOT written to any existing category — they don't pollute.
+    /// Joint iterative inference across both layers (Rao & Ballard 1999,
+    /// Equation 7). L2 and L3 are updated CONCURRENTLY each iteration:
+    ///   - L3 receives the *residual* between L2's current state and L3's
+    ///     top-down prediction of L2 (not L2's state directly).
+    ///   - L2 is modulated by L3's top-down prediction, which biases L2's
+    ///     belief toward the higher-level expectation.
+    /// Both layers' states refine together until residuals converge.
+    fn joint_infer(&self, l1: &[f64]) -> (Vec<f64>, Vec<f64>, f64, f64) {
+        // Initial bottom-up guesses
+        let mut state_l2 = self.bridge12.infer_above_raw(l1);
+        let mut state_l3 = self.bridge23.infer_above_raw(&state_l2);
+
+        let mut last_l1_norm = f64::INFINITY;
+
+        for iter in 0..PC_INFERENCE_ITERS {
+            // Top-down predictions
+            let l3_predicts_l2 = self.bridge23.predict_below_raw(&state_l3);
+            let l2_predicts_l1 = self.bridge12.predict_below_raw(&state_l2);
+
+            // Residuals: what each layer fails to predict for the layer below
+            let l1_residual: Vec<f64> = l1.iter().zip(l2_predicts_l1.iter())
+                .map(|(a, p)| a - p).collect();
+            let l2_residual: Vec<f64> = state_l2.iter().zip(l3_predicts_l2.iter())
+                .map(|(a, p)| a - p).collect();
+            let l1_norm = vec_ops::l2_norm(&l1_residual);
+            if iter > 0 && (last_l1_norm - l1_norm).abs() < CONVERGENCE_EPS { break; }
+            last_l1_norm = l1_norm;
+
+            // Bottom-up updates (driven by residuals)
+            let l2_bu_update = self.bridge12.infer_above_raw(&l1_residual);
+            let l3_bu_update = self.bridge23.infer_above_raw(&l2_residual);
+
+            // L2 update: combine bottom-up (l1 residual) with top-down
+            // (pull toward L3's prediction). Equation 7's two error terms.
+            for i in 0..state_l2.len() {
+                let bu = l2_bu_update[i];
+                let td = l3_predicts_l2[i] - state_l2[i];  // top-down error
+                state_l2[i] += PC_LR * (bu + 0.5 * td);
+            }
+            state_l2 = vec_ops::normalize(&state_l2);
+
+            // L3 update: bottom-up only (it's the top of our stack)
+            for i in 0..state_l3.len() {
+                state_l3[i] += PC_LR * l3_bu_update[i];
+            }
+            state_l3 = vec_ops::normalize(&state_l3);
+        }
+
+        // Final per-layer error in cleaned-up space
+        let (cleaned_l2, _) = self.bridge12.cleanup_above(&state_l2);
+        let (cleaned_l3, _) = self.bridge23.cleanup_above(&state_l3);
+        let final_l2_pred = self.bridge12.predict_below_raw(&cleaned_l2);
+        let final_l2_pred_cl = self.bridge12.cleanup_below(&final_l2_pred);
+        let l1_err = (1.0 - vec_ops::cosine_similarity(l1, &final_l2_pred_cl)).max(0.0);
+        let final_l3_pred = self.bridge23.predict_below_raw(&cleaned_l3);
+        let final_l3_pred_cl = self.bridge23.cleanup_below(&final_l3_pred);
+        let l2_err = (1.0 - vec_ops::cosine_similarity(&cleaned_l2, &final_l3_pred_cl)).max(0.0);
+        (cleaned_l2, cleaned_l3, l1_err, l2_err)
+    }
+
     fn step(&mut self, l1: &[f64], _rng: &mut StdRng) -> Option<(usize, usize)> {
-        // ----- L2: process l1 -----
+        // Bootstrap the very first input
         if self.bridge12.above_states.is_empty() {
-            // First-ever input bootstraps everything (no candidate gate
-            // for the very first input — there's nothing to compare to).
             let new_l2 = vec_ops::normalize(l1);
             let l2_cat = self.bridge12.add_category(new_l2.clone());
             self.bridge12.write(&new_l2, l1);
@@ -307,11 +370,12 @@ impl Hierarchy {
             self.bridge23.write(&new_l3, &new_l2);
             return Some((l2_cat, l3_cat));
         }
-        let (_l2_state, l2_cat_guess, l2_err) = infer_iterative(&self.bridge12, l1);
-        let l2_cat = if l2_err > L2_THRESHOLD {
-            // Surprise: route through slow-learning gate. If pending,
-            // return None for the whole step — do NOT pollute existing
-            // categories with the unknown input.
+
+        // Joint iterative inference (Rao-Ballard Eq. 7)
+        let (cleaned_l2, _cleaned_l3, l1_err, l2_err) = self.joint_infer(l1);
+        let l2_cat_guess = self.bridge12.classify_above(&cleaned_l2);
+
+        let l2_cat = if l1_err > L2_THRESHOLD {
             let proposed = vec_ops::normalize(l1);
             match self.bridge12.surprise(l1, proposed) {
                 Some(idx) => idx,
@@ -320,20 +384,20 @@ impl Hierarchy {
         } else {
             let chosen = self.bridge12.above_states[l2_cat_guess].clone();
             self.bridge12.write(&chosen, l1);
-            self.bridge12.update_precision(l2_cat_guess, l2_err);
+            self.bridge12.update_precision(l2_cat_guess, l1_err);
             l2_cat_guess
         };
         let l2_used = self.bridge12.above_states[l2_cat].clone();
 
-        // ----- L3: process l2 -----
         if self.bridge23.above_states.is_empty() {
             let new_l3 = vec_ops::normalize(&l2_used);
             let l3_cat = self.bridge23.add_category(new_l3.clone());
             self.bridge23.write(&new_l3, &l2_used);
             return Some((l2_cat, l3_cat));
         }
-        let (_l3_state, l3_cat_guess, l3_err) = infer_iterative(&self.bridge23, &l2_used);
-        let l3_cat = if l3_err > L3_THRESHOLD {
+
+        let l3_cat_guess = self.bridge23.classify_above(&self.bridge23.infer_above_raw(&l2_used));
+        let l3_cat = if l2_err > L3_THRESHOLD {
             let proposed = vec_ops::normalize(&l2_used);
             match self.bridge23.surprise(&l2_used, proposed) {
                 Some(idx) => idx,
@@ -342,7 +406,7 @@ impl Hierarchy {
         } else {
             let chosen = self.bridge23.above_states[l3_cat_guess].clone();
             self.bridge23.write(&chosen, &l2_used);
-            self.bridge23.update_precision(l3_cat_guess, l3_err);
+            self.bridge23.update_precision(l3_cat_guess, l2_err);
             l3_cat_guess
         };
         Some((l2_cat, l3_cat))
