@@ -22,6 +22,13 @@ The deeper "why does this look like this" answers live in
 `docs/0001-multi-tenancy.md`. Read that before refactoring anything in
 `heather_db::server` or `heather_server::routes_db`.
 
+`docs/0002-binding-operator.md` is the second RFC — it documents the
+**HRR binding operator** added to `heather_algebra`, the 17 substrate
+demos in `heather_algebra/examples/`, and the substrate-level identities
+(EAM read = SDM = HRR cleanup = transformer attention = free-energy
+descent). Read that before touching `heather_algebra/src/bind.rs` or
+any of the `examples/*.rs` demos.
+
 ## Common commands
 
 ### Engine workspace
@@ -119,8 +126,14 @@ Full guide: `docs/coolify.md`.
 - **`heather_server`** — Axum HTTP. Imports `heather_db::Server` and
   exposes it.
 - **`heather_algebra`** — energy-correct vector algebra ops (`add`,
-  `sub`, `scale`, `intersect`). Owns `EAMSnapshot` for ferrying state
-  between collections.
+  `sub`, `scale`, `intersect`) plus **HRR binding** (`bind`, `unbind`,
+  `circular_convolve`, `involve`) in `bind.rs`. Owns `EAMSnapshot` for
+  ferrying state between collections. **17 runnable demos** under
+  `heather_algebra/examples/` substantiate the substrate framing — see
+  RFC 0002. The `MiniEAM` shim in those demos is a ~50-line in-memory
+  mirror of `heather_db::Collection`'s read/write shape; the
+  `engine_integration` example proves the substrate algebra composes
+  with the production engine without API change.
 - **`heather_fornix`** — model-ingestion (Pinecone/Weaviate/etc. → Heather).
 
 ### The route-table dual-router pattern (the most likely thing to confuse you)
@@ -135,6 +148,9 @@ Every collection / algebra route exists in **two shapes**:
    plus a `Path<(String, String)>` (db + collection name) — they resolve
    the hive from the path.
 
+Algebra routes currently exposed (both shapes): `add`, `sub`, `scale`,
+`intersect`, `bind`, `unbind`.
+
 The handlers live in two files:
 
 - **`routes.rs`** — the legacy handlers, full implementations.
@@ -143,6 +159,15 @@ The handlers live in two files:
   fresh `State(...)`/`Path(...)` extractor to delegate into the
   matching legacy handler. **Don't duplicate logic** — extend the
   legacy handler and the wrapper picks it up automatically.
+
+**Quirk on `/algebra/unbind`**: its request takes `key_vector: Vec<f64>`
+(a raw vector), not a `key: String` collection name like the other
+two-argument ops. Reason: `heather_algebra::unbind` requires a
+single-location key snapshot, but the engine's adaptive memory creates
+~1000 locations per collection by default. Users hold binding keys as
+plain vectors (random unit vectors generated at agent birth, persisted
+as JSON), not as separate collections. The handler builds a one-location
+snapshot from the supplied vector internally.
 
 The router is assembled in `heather_server/src/main.rs` by `.merge()`-ing
 three sub-routers: `legacy_router` (with `Arc<Hive>` state), `db_admin_router`,
@@ -202,9 +227,23 @@ _trash/                  # dropped DBs land here (recoverable by mv-back)
 - **Pre-1.0**: no migration code anywhere. Per the user's standing
   policy, fresh-start changes are fine; don't write migration shims
   unless asked.
-- **`heather_fornix` and the older `heather_algebra` glue** existed
-  before multi-tenancy — when adding new APIs, mirror the
-  `routes.rs` / `routes_db.rs` dual-router pattern.
+- **`heather_fornix`** existed before multi-tenancy — when adding new
+  APIs, mirror the `routes.rs` / `routes_db.rs` dual-router pattern.
+- **`heather_algebra::bind` is both a module and a re-exported function.**
+  `pub mod bind` exposes the module; `pub use bind::{bind, unbind, ...}`
+  re-exports the functions at crate root. Inside `heather_server` we
+  call `heather_algebra::bind::bind_with_limit(...)` and
+  `heather_algebra::bind::unbind(...)` with the explicit module path
+  to disambiguate.
+- **Substrate demos use `MiniEAM`, not `Collection`.** The 17 demos
+  under `heather_algebra/examples/` use a 50-line in-memory shim
+  (`MiniEAM`) that has the same read/write/softmax shape as
+  `Collection`. This is deliberate — it isolates the substrate-algebra
+  proof from the storage-engine proof. The single exception is
+  `engine_integration.rs`, which uses both side-by-side and is the
+  validation that the algebra composes with the production engine
+  (within ~5pt accuracy, with ~16× LMDB write overhead, 30% faster
+  reads via graph-search activation).
 
 ## Sibling repos (referenced from this code, not vendored)
 
