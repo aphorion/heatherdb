@@ -56,6 +56,14 @@ const SUB_TO_INSTANCE_NOISE: f64 = 0.45;
 // looser at L3 (merge sub-cats from same super into one super-cat).
 const L2_THRESHOLD: f64 = 0.22;
 const L3_THRESHOLD: f64 = 0.45;
+// Slow learning: a surprise doesn't immediately create a category. It
+// goes into a candidate buffer; only when a *similar* surprise recurs
+// PROMOTION_COUNT times does it get promoted to a real category. This
+// separates one-off noise from genuine new structure.
+const PROMOTION_COUNT: usize = 2;
+// Recurrence threshold: must be ABOVE the cross-sub cosine (0.74)
+// so different sub-prototypes don't get falsely merged.
+const CANDIDATE_RECURRENCE_THR: f64 = 0.78;
 const BETA: f64 = 12.0;
 const READ_ITERS: usize = 4;
 const PC_INFERENCE_ITERS: usize = 6;
@@ -124,6 +132,12 @@ struct Bridge {
     /// Per-category running mean of residual norm (precision proxy).
     /// Lower mean residual = higher precision = sharper predictions.
     precisions: Vec<f64>,
+    /// Candidate buffer — surprises seen so far that haven't been
+    /// promoted to categories yet. Each entry is (proposed_above_state,
+    /// triggering_below_input, recurrence_count).
+    candidate_states: Vec<Vec<f64>>,
+    candidate_inputs: Vec<Vec<f64>>,
+    candidate_counts: Vec<usize>,
 }
 impl Bridge {
     fn new(rng: &mut StdRng) -> Self {
@@ -134,7 +148,49 @@ impl Bridge {
             above_states: Vec::new(),
             below_states: Vec::new(),
             precisions: Vec::new(),
+            candidate_states: Vec::new(),
+            candidate_inputs: Vec::new(),
+            candidate_counts: Vec::new(),
         }
+    }
+
+    /// Slow-learning gate: route a surprise through the candidate
+    /// buffer. Returns Some(category_idx) if the candidate has been
+    /// seen PROMOTION_COUNT times and is now a real category. Returns
+    /// None if it's still pending (count < threshold).
+    ///
+    /// Best-match (greedy) candidate selection — the closest existing
+    /// candidate gets the recurrence count, not the first one above
+    /// threshold. Avoids cross-category confusion when candidates
+    /// from different but similar prototypes coexist in the buffer.
+    fn surprise(&mut self, below: &[f64], proposed_state: Vec<f64>) -> Option<usize> {
+        let mut best: Option<(usize, f64)> = None;
+        for i in 0..self.candidate_inputs.len() {
+            let sim = vec_ops::cosine_similarity(below, &self.candidate_inputs[i]);
+            if sim > CANDIDATE_RECURRENCE_THR {
+                if best.map(|(_, s)| sim > s).unwrap_or(true) {
+                    best = Some((i, sim));
+                }
+            }
+        }
+        if let Some((i, _)) = best {
+            self.candidate_counts[i] += 1;
+            if self.candidate_counts[i] >= PROMOTION_COUNT {
+                let state = self.candidate_states[i].clone();
+                let cat_idx = self.add_category(state.clone());
+                self.write(&state, below);
+                self.candidate_states.remove(i);
+                self.candidate_inputs.remove(i);
+                self.candidate_counts.remove(i);
+                return Some(cat_idx);
+            }
+            return None;
+        }
+        // No matching candidate — store as new candidate
+        self.candidate_states.push(proposed_state);
+        self.candidate_inputs.push(below.to_vec());
+        self.candidate_counts.push(1);
+        None
     }
     fn predict_below_raw(&self, above: &[f64]) -> Vec<f64> {
         let q = bind_vec(&self.above_key, above);
@@ -233,39 +289,35 @@ impl Hierarchy {
         }
     }
 
-    /// Process one input through the hierarchy. Creates new categories
-    /// at L2 and L3 as needed. Returns (l2_cat, l3_cat).
-    ///
-    /// Critical design point: higher-layer states are derived from the
-    /// lower-layer pattern they represent (not arbitrary random tags).
-    /// This lets L2 states retain l1's similarity structure, which in
-    /// turn lets L3 discover the hierarchical structure.
-    fn step(&mut self, l1: &[f64], rng: &mut StdRng) -> (usize, usize) {
+    /// Process one input through the hierarchy. Returns Some((l2_cat,
+    /// l3_cat)) if the input was successfully categorized, or None if
+    /// it's currently in pending limbo (the slow-learning gate is
+    /// waiting for recurrence before promoting it). Pending inputs
+    /// are NOT written to any existing category — they don't pollute.
+    fn step(&mut self, l1: &[f64], _rng: &mut StdRng) -> Option<(usize, usize)> {
         // ----- L2: process l1 -----
         if self.bridge12.above_states.is_empty() {
-            // First-ever input: bootstrap L2 with l1 as the category state.
-            // Pass l1 through a fixed random projection (in the form of a
-            // random unit rotation) so L2 state space is distinct from L1
-            // input space, but still inherits similarity structure.
+            // First-ever input bootstraps everything (no candidate gate
+            // for the very first input — there's nothing to compare to).
             let new_l2 = vec_ops::normalize(l1);
             let l2_cat = self.bridge12.add_category(new_l2.clone());
             self.bridge12.write(&new_l2, l1);
-            // Bootstrap L3 too — L3 state derived from L2
             let new_l3 = new_l2.clone();
             let l3_cat = self.bridge23.add_category(new_l3.clone());
             self.bridge23.write(&new_l3, &new_l2);
-            return (l2_cat, l3_cat);
+            return Some((l2_cat, l3_cat));
         }
         let (_l2_state, l2_cat_guess, l2_err) = infer_iterative(&self.bridge12, l1);
         let l2_cat = if l2_err > L2_THRESHOLD {
-            // Surprise at L2 — invent new sub-category. New L2 state =
-            // a copy of this input, so similar inputs produce similar L2.
-            let new_l2 = vec_ops::normalize(l1);
-            let idx = self.bridge12.add_category(new_l2.clone());
-            self.bridge12.write(&new_l2, l1);
-            idx
+            // Surprise: route through slow-learning gate. If pending,
+            // return None for the whole step — do NOT pollute existing
+            // categories with the unknown input.
+            let proposed = vec_ops::normalize(l1);
+            match self.bridge12.surprise(l1, proposed) {
+                Some(idx) => idx,
+                None => return None,
+            }
         } else {
-            // Reinforce
             let chosen = self.bridge12.above_states[l2_cat_guess].clone();
             self.bridge12.write(&chosen, l1);
             self.bridge12.update_precision(l2_cat_guess, l2_err);
@@ -278,23 +330,22 @@ impl Hierarchy {
             let new_l3 = vec_ops::normalize(&l2_used);
             let l3_cat = self.bridge23.add_category(new_l3.clone());
             self.bridge23.write(&new_l3, &l2_used);
-            return (l2_cat, l3_cat);
+            return Some((l2_cat, l3_cat));
         }
         let (_l3_state, l3_cat_guess, l3_err) = infer_iterative(&self.bridge23, &l2_used);
         let l3_cat = if l3_err > L3_THRESHOLD {
-            let new_l3 = vec_ops::normalize(&l2_used);
-            let idx = self.bridge23.add_category(new_l3.clone());
-            self.bridge23.write(&new_l3, &l2_used);
-            idx
+            let proposed = vec_ops::normalize(&l2_used);
+            match self.bridge23.surprise(&l2_used, proposed) {
+                Some(idx) => idx,
+                None => return None,
+            }
         } else {
             let chosen = self.bridge23.above_states[l3_cat_guess].clone();
             self.bridge23.write(&chosen, &l2_used);
             self.bridge23.update_precision(l3_cat_guess, l3_err);
             l3_cat_guess
         };
-        // Suppress unused-variable warning explicitly:
-        let _ = rng;
-        (l2_cat, l3_cat)
+        Some((l2_cat, l3_cat))
     }
 
     /// Top-down generative pass: given an L3 category, predict down to L1.
@@ -419,11 +470,18 @@ fn section_2(samples: &[(Vec<f64>, usize, usize)], rng: &mut StdRng) -> Hierarch
     let mut l2_assignments: Vec<(usize, usize)> = Vec::new(); // (cat, true_sub)
     let mut l3_assignments: Vec<(usize, usize)> = Vec::new(); // (cat, true_super)
 
+    let mut pending = 0;
     for (l1, sub_idx, super_idx) in samples {
-        let (l2_cat, l3_cat) = h.step(l1, rng);
-        l2_assignments.push((l2_cat, *sub_idx));
-        l3_assignments.push((l3_cat, *super_idx));
+        match h.step(l1, rng) {
+            Some((l2_cat, l3_cat)) => {
+                l2_assignments.push((l2_cat, *sub_idx));
+                l3_assignments.push((l3_cat, *super_idx));
+            }
+            None => { pending += 1; }
+        }
     }
+    println!("  Categorized: {} / {}   (pending: {} — slow-learning gate held them back)",
+        l2_assignments.len(), samples.len(), pending);
 
     let n_l2 = h.bridge12.above_states.len();
     let n_l3 = h.bridge23.above_states.len();
