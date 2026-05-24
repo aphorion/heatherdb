@@ -54,3 +54,4 @@ pub use hive::Hive;
 pub use location::{HardLocation, LocationId};
 pub use read::{ActivatedLocation, ReadTrace};
 pub use server::{default_db_config, Server, DEFAULT_DB};
+pub use write::{WriteActivation, WriteAux, WriteDiagnostics};

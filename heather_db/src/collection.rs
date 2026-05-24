@@ -244,6 +244,93 @@ impl Collection {
         self.collection_id
     }
 
+    /// As [`Self::write`], but accepts auxiliary input-space deltas
+    /// folded into the per-location parameter updates, and returns
+    /// diagnostics (activation pattern, soft prediction, residual)
+    /// suitable for downstream chain-rule gradient work. See RFC 0005.
+    ///
+    /// `aux.counter_delta`, when `Some`, is added to every activated
+    /// location's counter update weighted by the location's activation.
+    /// `aux.address_delta`, when `Some`, is added to every activated
+    /// location's address migration weighted by its local learning rate.
+    /// A `WriteAux::default()` produces state changes bit-identical to
+    /// `write` (verified by tests in `heather_db::write`).
+    pub fn write_with_aux(
+        &self,
+        input: &[f64],
+        aux: &crate::write::WriteAux,
+    ) -> Result<crate::write::WriteDiagnostics> {
+        vec_ops::validate_vector(input)?;
+
+        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+
+        if input.len() != inner.config.d {
+            return Err(HeatherError::DimensionMismatch {
+                expected: inner.config.d,
+                got: input.len(),
+            });
+        }
+        aux.validate(inner.config.d)?;
+
+        if inner.locations.is_empty() {
+            return Err(HeatherError::EmptyMemory);
+        }
+
+        let mut rng = rand::thread_rng();
+        let (result, diagnostics) = {
+            let EAMInner {
+                ref config,
+                ref mut locations,
+                ref mut next_id,
+                ref mut eta,
+                ref landmarks,
+                ref id_lookup,
+                ..
+            } = *inner;
+            let (r, d) = write::adaptive_write_with_aux(
+                input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                Some(aux),
+            );
+            *eta = r.eta;
+            (r, d)
+        };
+
+        let new_locs = result.new_locations;
+
+        let mut txn = self.store.write_txn()?;
+        for &idx in &result.modified_indices {
+            self.store
+                .put_location(&mut txn, self.collection_id, &inner.locations[idx])?;
+        }
+        for loc in &new_locs {
+            self.store
+                .put_location(&mut txn, self.collection_id, loc)?;
+        }
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "next_id",
+            &bincode::serialize(&inner.next_id)?,
+        )?;
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "eta",
+            &bincode::serialize(&inner.eta)?,
+        )?;
+        txn.commit()?;
+
+        inner.sync_addresses(&result.modified_indices);
+        if !new_locs.is_empty() {
+            let start = inner.locations.len();
+            inner.locations.extend(new_locs);
+            inner.extend_id_lookup(start);
+            inner.append_addresses(start);
+        }
+
+        Ok(diagnostics)
+    }
+
     /// Write a pattern into the collection.
     pub fn write(&self, input: &[f64]) -> Result<()> {
         vec_ops::validate_vector(input)?;
@@ -1057,6 +1144,51 @@ mod tests {
 
         let stats = col.stats().unwrap();
         assert!(stats.total_writes > 0.0);
+    }
+
+    #[test]
+    fn write_with_aux_returns_diagnostics_and_persists() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let config = test_config();
+        let col = Collection::new(col_id, "test".into(), store, &config).unwrap();
+
+        let pattern = vec_ops::normalize(&vec![1.0; 16]);
+        let aux = crate::write::WriteAux::default();
+        let diag = col.write_with_aux(&pattern, &aux).unwrap();
+
+        // At least one location activated → diagnostics populated.
+        assert!(!diag.activations.is_empty());
+        assert_eq!(diag.prediction.len(), 16);
+        assert_eq!(diag.residual.len(), 16);
+
+        // residual = input − prediction
+        for k in 0..16 {
+            let expected = pattern[k] - diag.prediction[k];
+            assert!((diag.residual[k] - expected).abs() < 1e-12);
+        }
+
+        // The write counted in the persistent stats.
+        let stats = col.stats().unwrap();
+        assert!(stats.total_writes > 0.0);
+    }
+
+    #[test]
+    fn write_with_aux_rejects_wrong_dimensions() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let config = test_config();
+        let col = Collection::new(col_id, "test".into(), store, &config).unwrap();
+
+        let pattern = vec_ops::normalize(&vec![1.0; 16]);
+        let aux = crate::write::WriteAux {
+            counter_delta: Some(vec![0.0; 8]), // wrong: should be 16
+            address_delta: None,
+        };
+        let err = col
+            .write_with_aux(&pattern, &aux)
+            .expect_err("expected dimension mismatch");
+        assert!(matches!(err, HeatherError::DimensionMismatch { .. }));
     }
 
     #[test]
