@@ -141,6 +141,60 @@ pub async fn write(
     }
 }
 
+/// `POST /collections/{name}/write_with_aux` — one write with optional
+/// auxiliary input-space deltas, returning diagnostics suitable for
+/// downstream chain-rule gradient work. See RFC 0005.
+pub async fn write_with_aux(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<WriteWithAuxRequest>,
+) -> Response {
+    if req.vector.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "vector must not be empty");
+    }
+
+    let col = match hive.get_or_create_collection(&name) {
+        Ok(col) => col,
+        Err(e) => {
+            tracing::warn!(error = %e, collection = %name, "Failed to get collection");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
+        }
+    };
+
+    let aux = heather_db::WriteAux {
+        counter_delta: req.aux.as_ref().and_then(|a| a.counter_delta.clone()),
+        address_delta: req.aux.as_ref().and_then(|a| a.address_delta.clone()),
+    };
+
+    let col_clone = col.clone();
+    let vector = req.vector;
+    let result = tokio::task::spawn_blocking(move || col_clone.write_with_aux(&vector, &aux)).await;
+
+    match result {
+        Ok(Ok(diag)) => Json(WriteWithAuxResponse {
+            activations: diag
+                .activations
+                .into_iter()
+                .map(|a| WriteAuxActivation {
+                    location_index: a.location_index,
+                    weight: a.weight,
+                })
+                .collect(),
+            prediction: diag.prediction,
+            residual: diag.residual,
+        })
+        .into_response(),
+        Ok(Err(e)) => {
+            tracing::warn!(error = %e, collection = %name, "write_with_aux failed");
+            error_response(StatusCode::BAD_REQUEST, e)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "write_with_aux task panicked");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    }
+}
+
 pub async fn read(
     State(hive): State<AppState>,
     Path(name): Path<String>,

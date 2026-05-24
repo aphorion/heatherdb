@@ -195,6 +195,15 @@ pub async fn write(
     routes::write(State(hive), Path(col), Json(req)).await
 }
 
+pub async fn write_with_aux(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col)): Path<(String, String)>,
+    Json(req): Json<WriteWithAuxRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    routes::write_with_aux(State(hive), Path(col), Json(req)).await
+}
+
 pub async fn read(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,

@@ -10,6 +10,25 @@ pub struct WriteRequest {
     pub metadata: Option<Vec<serde_json::Value>>,
 }
 
+/// One write with optional auxiliary input-space deltas. Mirrors
+/// `heather_db::WriteAux` on the wire. See RFC 0005.
+#[derive(Debug, Deserialize)]
+pub struct WriteWithAuxRequest {
+    pub vector: Vec<f64>,
+    /// Optional auxiliary signals. Omit field or set to null for a
+    /// plain write that still returns diagnostics.
+    #[serde(default)]
+    pub aux: Option<WriteAuxPayload>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct WriteAuxPayload {
+    #[serde(default)]
+    pub counter_delta: Option<Vec<f64>>,
+    #[serde(default)]
+    pub address_delta: Option<Vec<f64>>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ReadRequest {
     pub query: Vec<f64>,
@@ -40,6 +59,22 @@ pub struct WriteResponse {
 #[derive(Debug, Serialize)]
 pub struct ReadResponse {
     pub result: Vec<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WriteWithAuxResponse {
+    /// Per-activated-location (index, weight) entries.
+    pub activations: Vec<WriteAuxActivation>,
+    /// Weighted soft-prediction Σ_j w_j · address_j (input space).
+    pub prediction: Vec<f64>,
+    /// `vector − prediction`.
+    pub residual: Vec<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct WriteAuxActivation {
+    pub location_index: usize,
+    pub weight: f64,
 }
 
 #[derive(Debug, Serialize)]

@@ -50,21 +50,21 @@ pub struct WriteAux {
 impl WriteAux {
     /// Returns `Ok(())` if every populated delta has the expected length.
     pub fn validate(&self, expected_d: usize) -> Result<(), HeatherError> {
-        if let Some(c) = &self.counter_delta {
-            if c.len() != expected_d {
-                return Err(HeatherError::DimensionMismatch {
-                    expected: expected_d,
-                    got: c.len(),
-                });
-            }
+        if let Some(c) = &self.counter_delta
+            && c.len() != expected_d
+        {
+            return Err(HeatherError::DimensionMismatch {
+                expected: expected_d,
+                got: c.len(),
+            });
         }
-        if let Some(a) = &self.address_delta {
-            if a.len() != expected_d {
-                return Err(HeatherError::DimensionMismatch {
-                    expected: expected_d,
-                    got: a.len(),
-                });
-            }
+        if let Some(a) = &self.address_delta
+            && a.len() != expected_d
+        {
+            return Err(HeatherError::DimensionMismatch {
+                expected: expected_d,
+                got: a.len(),
+            });
         }
         Ok(())
     }
@@ -135,6 +135,7 @@ pub fn adaptive_write(
 ///
 /// When `aux` is `None` or all fields are `None`, the produced state
 /// changes are bit-identical to [`adaptive_write`].
+#[allow(clippy::too_many_arguments)]
 pub fn adaptive_write_with_aux(
     input: &[f64],
     locations: &mut [HardLocation],
