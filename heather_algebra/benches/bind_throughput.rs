@@ -5,6 +5,7 @@
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use heather_algebra::bind::{bind, bind_vec, circular_convolve, unbind, unbind_vec};
+use heather_algebra::consolidate::consolidate;
 use heather_algebra::snapshot::EAMSnapshot;
 use heather_db::{EAMConfig, HardLocation, LocationId, vec_ops};
 use rand::SeedableRng;
@@ -115,12 +116,32 @@ fn bench_snapshot_unbind(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_consolidate(c: &mut Criterion) {
+    // Consolidate runs after every snapshot bind/add/sub, on the
+    // pairwise output. Realistic sizes: 100 locs (10×10 bind),
+    // 400 locs (20×20), 2500 locs (50×50).
+    let mut group = c.benchmark_group("bind/consolidate");
+    let mut rng = StdRng::seed_from_u64(16);
+    for &(n, d) in &[(100usize, 128), (100, 384), (400, 384), (2500, 384)] {
+        let snap = make_snapshot(n, d, &mut rng);
+        group.bench_function(BenchmarkId::new(format!("d{d}/n"), n), |bencher| {
+            bencher.iter_batched(
+                || snap.clone(),
+                |mut s| consolidate(&mut s),
+                criterion::BatchSize::SmallInput,
+            );
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_circular_convolve,
     bench_bind_vec,
     bench_unbind_vec,
     bench_snapshot_bind_pairwise,
-    bench_snapshot_unbind
+    bench_snapshot_unbind,
+    bench_consolidate
 );
 criterion_main!(benches);
