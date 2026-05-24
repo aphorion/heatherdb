@@ -8,6 +8,8 @@ heather_db = { path = "../heather_db" }
 thiserror = "2"
 rand = "0.8"
 rand_distr = "0.4"
+realfft = "3"
+rayon = "1"
 
 [dev-dependencies]
 tempfile = "3"
