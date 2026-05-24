@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use heather_db::{Hive, ReadStrategy};
+use heather_db::{HardLocation, Hive, LocationId, ReadStrategy};
 use heather_algebra::{EAMSnapshot, ops, compose_read as algebra_compose_read};
 use rayon::prelude::*;
 
@@ -141,6 +141,82 @@ pub async fn write(
     }
 }
 
+pub async fn bulk_load(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<BulkLoadRequest>,
+) -> Response {
+    if req.addresses.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "addresses must not be empty");
+    }
+    if req.addresses.len() != req.counters.len() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "addresses ({}) and counters ({}) must have equal length",
+                req.addresses.len(),
+                req.counters.len()
+            ),
+        );
+    }
+    if let Some(wc) = &req.write_counts {
+        if wc.len() != req.addresses.len() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "write_counts ({}) must match addresses ({})",
+                    wc.len(),
+                    req.addresses.len()
+                ),
+            );
+        }
+    }
+
+    let col = match hive.get_or_create_collection(&name) {
+        Ok(col) => col,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        // Reuse the target's current config (preserves the per-DB
+        // dimension and EAM hyperparameters); load_snapshot validates.
+        let (_, config) = col.snapshot()?;
+        let dim = config.d;
+
+        let mut locations: Vec<HardLocation> = Vec::with_capacity(req.addresses.len());
+        for (i, (addr, counter)) in req.addresses.iter().zip(req.counters.iter()).enumerate() {
+            if addr.len() != dim || counter.len() != dim {
+                return Err(heather_db::HeatherError::DimensionMismatch {
+                    expected: dim,
+                    got: addr.len().max(counter.len()),
+                });
+            }
+            let mut loc = HardLocation::new(LocationId(i as u64), addr.clone());
+            loc.counter = counter.clone();
+            loc.write_count = req
+                .write_counts
+                .as_ref()
+                .map(|wc| wc[i])
+                .unwrap_or(1.0);
+            locations.push(loc);
+        }
+
+        let n = locations.len();
+        col.load_snapshot(locations, config)?;
+        Ok::<_, heather_db::HeatherError>((n, dim))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((n_loaded, dim))) => {
+            tracing::info!(collection = %name, n_loaded, dim, "Bulk load completed");
+            Json(BulkLoadResponse { n_loaded, dim }).into_response()
+        }
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
 pub async fn read(
     State(hive): State<AppState>,
     Path(name): Path<String>,
@@ -249,6 +325,7 @@ pub async fn collection_config(
 pub async fn locations(
     State(hive): State<AppState>,
     Path(name): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<LocationsQuery>,
 ) -> Response {
     let col = match hive.get_collection(&name) {
         Ok(Some(col)) => col,
@@ -264,21 +341,42 @@ pub async fn locations(
         }
     };
 
-    match col.locations_summary() {
-        Ok(summaries) => {
-            let locations = summaries
-                .into_iter()
-                .map(|s| LocationSummaryItem {
-                    id: s.id,
-                    write_count: s.write_count,
-                    avg_counter_magnitude: s.avg_counter_magnitude,
-                })
-                .collect();
-            Json(LocationsResponse { locations }).into_response()
+    if q.full {
+        match col.snapshot() {
+            Ok((locs, _cfg)) => {
+                let locations: Vec<LocationFullItem> = locs
+                    .into_iter()
+                    .map(|l| LocationFullItem {
+                        id: l.id.0 as usize,
+                        write_count: l.write_count,
+                        address: l.address,
+                        counter: l.counter,
+                    })
+                    .collect();
+                Json(LocationsFullResponse { locations }).into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Full locations snapshot failed");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, e)
+            }
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Locations failed");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, e)
+    } else {
+        match col.locations_summary() {
+            Ok(summaries) => {
+                let locations = summaries
+                    .into_iter()
+                    .map(|s| LocationSummaryItem {
+                        id: s.id,
+                        write_count: s.write_count,
+                        avg_counter_magnitude: s.avg_counter_magnitude,
+                    })
+                    .collect();
+                Json(LocationsResponse { locations }).into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Locations failed");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, e)
+            }
         }
     }
 }

@@ -124,6 +124,27 @@ pub struct LocationsResponse {
     pub locations: Vec<LocationSummaryItem>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+pub struct LocationsQuery {
+    /// When true, the response includes each location's full
+    /// `address` and `counter` vectors instead of just the summary.
+    #[serde(default)]
+    pub full: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocationFullItem {
+    pub id: usize,
+    pub write_count: f64,
+    pub address: Vec<f64>,
+    pub counter: Vec<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct LocationsFullResponse {
+    pub locations: Vec<LocationFullItem>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ActivatedLocationItem {
     pub id: usize,
@@ -193,6 +214,27 @@ pub struct QueryDocumentResult {
 #[derive(Debug, Serialize)]
 pub struct QueryDocumentsResponse {
     pub results: Vec<QueryDocumentResult>,
+}
+
+// --- Bulk load (deterministic location placement) ---
+
+/// Replace a collection's hard locations atomically with a caller-
+/// supplied set. Bypasses competitive learning — useful when the
+/// caller wants the collection to hold exactly the vectors specified,
+/// with no novelty splits or address migration. Required for snapshot
+/// algebra (bind / unbind / add / sub) to operate on known operands.
+#[derive(Debug, Deserialize)]
+pub struct BulkLoadRequest {
+    pub addresses: Vec<Vec<f64>>,
+    pub counters: Vec<Vec<f64>>,
+    #[serde(default)]
+    pub write_counts: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BulkLoadResponse {
+    pub n_loaded: usize,
+    pub dim: usize,
 }
 
 // --- Algebra ---
