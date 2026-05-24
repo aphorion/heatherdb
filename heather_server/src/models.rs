@@ -235,6 +235,27 @@ fn default_threshold() -> f64 {
     0.95
 }
 
+#[derive(Debug, Deserialize)]
+pub struct AlgebraBindRequest {
+    pub source_a: String,
+    pub source_b: String,
+    pub target: String,
+    #[serde(default)]
+    pub max_cross_k: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AlgebraUnbindRequest {
+    /// The bundle to be unbound (multi-location collection).
+    pub source: String,
+    /// The binding key as a raw vector. Provided directly in the
+    /// request because the production engine's adaptive memory means
+    /// collections rarely have exactly one location — users hold their
+    /// binding keys as plain vectors, not as separate collections.
+    pub key_vector: Vec<f64>,
+    pub target: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AlgebraResponse {
     pub collection: String,

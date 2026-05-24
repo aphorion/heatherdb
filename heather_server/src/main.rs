@@ -237,6 +237,8 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/algebra/sub", post(routes::algebra_sub))
         .route("/algebra/scale", post(routes::algebra_scale))
         .route("/algebra/intersect", post(routes::algebra_intersect))
+        .route("/algebra/bind", post(routes::algebra_bind))
+        .route("/algebra/unbind", post(routes::algebra_unbind))
         .route("/compose/read", post(routes::compose_read))
         .with_state(default_hive);
 
@@ -267,6 +269,8 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/db/{db}/algebra/sub", post(routes_db::algebra_sub))
         .route("/db/{db}/algebra/scale", post(routes_db::algebra_scale))
         .route("/db/{db}/algebra/intersect", post(routes_db::algebra_intersect))
+        .route("/db/{db}/algebra/bind", post(routes_db::algebra_bind))
+        .route("/db/{db}/algebra/unbind", post(routes_db::algebra_unbind))
         .route("/db/{db}/compose/read", post(routes_db::compose_read));
 
     let app = Router::new()
