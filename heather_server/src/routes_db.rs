@@ -204,6 +204,15 @@ pub async fn read(
     routes::read(State(hive), Path(col), Json(req)).await
 }
 
+pub async fn bulk_load(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col)): Path<(String, String)>,
+    Json(req): Json<BulkLoadRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    routes::bulk_load(State(hive), Path(col), Json(req)).await
+}
+
 pub async fn stats(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
@@ -223,9 +232,10 @@ pub async fn collection_config(
 pub async fn locations(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
+    q: axum::extract::Query<LocationsQuery>,
 ) -> Response {
     let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
-    routes::locations(State(hive), Path(col)).await
+    routes::locations(State(hive), Path(col), q).await
 }
 
 pub async fn fingerprint(
@@ -306,6 +316,24 @@ pub async fn algebra_scale(
 ) -> Response {
     let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
     routes::algebra_scale(State(hive), Json(req)).await
+}
+
+pub async fn algebra_bind(
+    Extension(server): Extension<Arc<Server>>,
+    Path(db_name): Path<String>,
+    Json(req): Json<AlgebraBindRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    routes::algebra_bind(State(hive), Json(req)).await
+}
+
+pub async fn algebra_unbind(
+    Extension(server): Extension<Arc<Server>>,
+    Path(db_name): Path<String>,
+    Json(req): Json<AlgebraUnbindRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    routes::algebra_unbind(State(hive), Json(req)).await
 }
 
 pub async fn algebra_intersect(

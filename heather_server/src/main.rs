@@ -223,6 +223,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/collections", get(routes::list_collections))
         .route("/collections/{name}", delete(routes::drop_collection))
         .route("/collections/{name}/write", post(routes::write))
+        .route("/collections/{name}/bulk_load", post(routes::bulk_load))
         .route("/collections/{name}/read", post(routes::read))
         .route("/collections/{name}/stats", get(routes::stats))
         .route("/collections/{name}/config", get(routes::collection_config))
@@ -237,6 +238,8 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/algebra/sub", post(routes::algebra_sub))
         .route("/algebra/scale", post(routes::algebra_scale))
         .route("/algebra/intersect", post(routes::algebra_intersect))
+        .route("/algebra/bind", post(routes::algebra_bind))
+        .route("/algebra/unbind", post(routes::algebra_unbind))
         .route("/compose/read", post(routes::compose_read))
         .with_state(default_hive);
 
@@ -253,6 +256,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/db/{db}/collections", get(routes_db::list_collections))
         .route("/db/{db}/collections/{name}", delete(routes_db::drop_collection))
         .route("/db/{db}/collections/{name}/write", post(routes_db::write))
+        .route("/db/{db}/collections/{name}/bulk_load", post(routes_db::bulk_load))
         .route("/db/{db}/collections/{name}/read", post(routes_db::read))
         .route("/db/{db}/collections/{name}/stats", get(routes_db::stats))
         .route("/db/{db}/collections/{name}/config", get(routes_db::collection_config))
@@ -267,6 +271,8 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/db/{db}/algebra/sub", post(routes_db::algebra_sub))
         .route("/db/{db}/algebra/scale", post(routes_db::algebra_scale))
         .route("/db/{db}/algebra/intersect", post(routes_db::algebra_intersect))
+        .route("/db/{db}/algebra/bind", post(routes_db::algebra_bind))
+        .route("/db/{db}/algebra/unbind", post(routes_db::algebra_unbind))
         .route("/db/{db}/compose/read", post(routes_db::compose_read));
 
     let app = Router::new()

@@ -1,3 +1,5 @@
+use rayon::prelude::*;
+
 use crate::config::EAMConfig;
 use crate::location::HardLocation;
 use crate::vec_ops;
@@ -14,32 +16,64 @@ pub struct MergeResult {
 
 /// KNN merge: find nearest neighbor pairs above tau_merge, merge them.
 /// Process highest-similarity pairs first, skip already-merged locations.
+///
+/// The nearest-neighbor pass is the O(N²·d) hot spot. We precompute
+/// norms once (so the inner kernel is a raw dot product, not the
+/// three-traversal `cosine_similarity`) and parallelise the outer
+/// loop with rayon.
 pub fn knn_merge(locations: &mut Vec<HardLocation>, config: &EAMConfig) -> MergeResult {
-    // Compute all pairwise nearest-neighbor similarities
     let n = locations.len();
-    let mut pairs: Vec<(usize, usize, f64)> = Vec::new();
-
-    for i in 0..n {
-        let mut best_j = None;
-        let mut best_sim = f64::NEG_INFINITY;
-        for j in 0..n {
-            if i == j {
-                continue;
-            }
-            let sim = vec_ops::cosine_similarity(&locations[i].address, &locations[j].address);
-            if sim > best_sim {
-                best_sim = sim;
-                best_j = Some(j);
-            }
-        }
-        if let Some(j) = best_j {
-            if best_sim > config.tau_merge {
-                pairs.push((i, j, best_sim));
-            }
-        }
+    if n < 2 {
+        return MergeResult {
+            removed_ids: Vec::new(),
+            merge_map: Vec::new(),
+            merge_count: 0,
+        };
     }
 
-    // Sort by similarity descending
+    // Precompute norms once. Addresses are typically unit vectors at
+    // this point (every algebra op + the engine write path normalises
+    // them), so each norm is ≈ 1.0 and the per-pair division is free —
+    // but doing it explicitly keeps the function correct for any input.
+    let norms: Vec<f64> = locations
+        .par_iter()
+        .map(|l| vec_ops::l2_norm(&l.address))
+        .collect();
+
+    let tau = config.tau_merge;
+    let pairs_unsorted: Vec<(usize, usize, f64)> = (0..n)
+        .into_par_iter()
+        .filter_map(|i| {
+            let ni = norms[i];
+            if ni < 1e-12 {
+                return None;
+            }
+            let addr_i = &locations[i].address;
+            let mut best_j = usize::MAX;
+            let mut best_sim = f64::NEG_INFINITY;
+            for (j, loc_j) in locations.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                let nj = norms[j];
+                if nj < 1e-12 {
+                    continue;
+                }
+                let sim = vec_ops::dot(addr_i, &loc_j.address) / (ni * nj);
+                if sim > best_sim {
+                    best_sim = sim;
+                    best_j = j;
+                }
+            }
+            if best_j != usize::MAX && best_sim > tau {
+                Some((i, best_j, best_sim))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    let mut pairs = pairs_unsorted;
     pairs.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
     let mut merged = vec![false; n];

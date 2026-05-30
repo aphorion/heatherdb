@@ -6,7 +6,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 
-use heather_db::{Hive, ReadStrategy};
+use heather_db::{HardLocation, Hive, LocationId, ReadStrategy};
 use heather_algebra::{EAMSnapshot, ops, compose_read as algebra_compose_read};
 use rayon::prelude::*;
 
@@ -141,6 +141,82 @@ pub async fn write(
     }
 }
 
+pub async fn bulk_load(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<BulkLoadRequest>,
+) -> Response {
+    if req.addresses.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "addresses must not be empty");
+    }
+    if req.addresses.len() != req.counters.len() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "addresses ({}) and counters ({}) must have equal length",
+                req.addresses.len(),
+                req.counters.len()
+            ),
+        );
+    }
+    if let Some(wc) = &req.write_counts {
+        if wc.len() != req.addresses.len() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "write_counts ({}) must match addresses ({})",
+                    wc.len(),
+                    req.addresses.len()
+                ),
+            );
+        }
+    }
+
+    let col = match hive.get_or_create_collection(&name) {
+        Ok(col) => col,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        // Reuse the target's current config (preserves the per-DB
+        // dimension and EAM hyperparameters); load_snapshot validates.
+        let (_, config) = col.snapshot()?;
+        let dim = config.d;
+
+        let mut locations: Vec<HardLocation> = Vec::with_capacity(req.addresses.len());
+        for (i, (addr, counter)) in req.addresses.iter().zip(req.counters.iter()).enumerate() {
+            if addr.len() != dim || counter.len() != dim {
+                return Err(heather_db::HeatherError::DimensionMismatch {
+                    expected: dim,
+                    got: addr.len().max(counter.len()),
+                });
+            }
+            let mut loc = HardLocation::new(LocationId(i as u64), addr.clone());
+            loc.counter = counter.clone();
+            loc.write_count = req
+                .write_counts
+                .as_ref()
+                .map(|wc| wc[i])
+                .unwrap_or(1.0);
+            locations.push(loc);
+        }
+
+        let n = locations.len();
+        col.load_snapshot(locations, config)?;
+        Ok::<_, heather_db::HeatherError>((n, dim))
+    })
+    .await;
+
+    match result {
+        Ok(Ok((n_loaded, dim))) => {
+            tracing::info!(collection = %name, n_loaded, dim, "Bulk load completed");
+            Json(BulkLoadResponse { n_loaded, dim }).into_response()
+        }
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
 pub async fn read(
     State(hive): State<AppState>,
     Path(name): Path<String>,
@@ -249,6 +325,7 @@ pub async fn collection_config(
 pub async fn locations(
     State(hive): State<AppState>,
     Path(name): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<LocationsQuery>,
 ) -> Response {
     let col = match hive.get_collection(&name) {
         Ok(Some(col)) => col,
@@ -264,21 +341,42 @@ pub async fn locations(
         }
     };
 
-    match col.locations_summary() {
-        Ok(summaries) => {
-            let locations = summaries
-                .into_iter()
-                .map(|s| LocationSummaryItem {
-                    id: s.id,
-                    write_count: s.write_count,
-                    avg_counter_magnitude: s.avg_counter_magnitude,
-                })
-                .collect();
-            Json(LocationsResponse { locations }).into_response()
+    if q.full {
+        match col.snapshot() {
+            Ok((locs, _cfg)) => {
+                let locations: Vec<LocationFullItem> = locs
+                    .into_iter()
+                    .map(|l| LocationFullItem {
+                        id: l.id.0 as usize,
+                        write_count: l.write_count,
+                        address: l.address,
+                        counter: l.counter,
+                    })
+                    .collect();
+                Json(LocationsFullResponse { locations }).into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Full locations snapshot failed");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, e)
+            }
         }
-        Err(e) => {
-            tracing::error!(error = %e, "Locations failed");
-            error_response(StatusCode::INTERNAL_SERVER_ERROR, e)
+    } else {
+        match col.locations_summary() {
+            Ok(summaries) => {
+                let locations = summaries
+                    .into_iter()
+                    .map(|s| LocationSummaryItem {
+                        id: s.id,
+                        write_count: s.write_count,
+                        avg_counter_magnitude: s.avg_counter_magnitude,
+                    })
+                    .collect();
+                Json(LocationsResponse { locations }).into_response()
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "Locations failed");
+                error_response(StatusCode::INTERNAL_SERVER_ERROR, e)
+            }
         }
     }
 }
@@ -650,6 +748,115 @@ pub async fn algebra_sub(
                 num_locations,
             })
             .into_response()
+        }
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+pub async fn algebra_bind(
+    State(hive): State<AppState>,
+    Json(req): Json<AlgebraBindRequest>,
+) -> Response {
+    let col_a = match hive.get_collection(&req.source_a) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("source collection '{}' not found", req.source_a),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let col_b = match hive.get_collection(&req.source_b) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("source collection '{}' not found", req.source_b),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let col_target = match hive.get_or_create_collection(&req.target) {
+        Ok(col) => col,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let target_name = req.target.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let snap_a = EAMSnapshot::from_collection(&col_a)?;
+        let snap_b = EAMSnapshot::from_collection(&col_b)?;
+        let bound = heather_algebra::bind::bind_with_limit(
+            &snap_a, &snap_b, req.max_cross_k.unwrap_or(0)
+        )?;
+        let num = bound.num_locations();
+        bound.into_collection(&col_target)?;
+        Ok::<_, heather_algebra::AlgebraError>(num)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(num_locations)) => {
+            tracing::info!(target = %target_name, num_locations, "Algebra bind completed");
+            Json(AlgebraResponse { collection: target_name, num_locations }).into_response()
+        }
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+pub async fn algebra_unbind(
+    State(hive): State<AppState>,
+    Json(req): Json<AlgebraUnbindRequest>,
+) -> Response {
+    let col_source = match hive.get_collection(&req.source) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("source collection '{}' not found", req.source),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let col_target = match hive.get_or_create_collection(&req.target) {
+        Ok(col) => col,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let target_name = req.target.clone();
+    let key_vector = req.key_vector.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        let snap_source = EAMSnapshot::from_collection(&col_source)?;
+        // Build a single-location key snapshot from the raw vector.
+        if key_vector.len() != snap_source.dim() {
+            return Err(heather_algebra::AlgebraError::DimensionMismatch {
+                left: snap_source.dim(),
+                right: key_vector.len(),
+            });
+        }
+        let mut key_loc = heather_db::HardLocation::new(
+            heather_db::LocationId(0),
+            heather_db::vec_ops::normalize(&key_vector),
+        );
+        key_loc.counter = key_vector.clone();
+        key_loc.write_count = 1.0;
+        let snap_key = EAMSnapshot::new(vec![key_loc], snap_source.config.clone())?;
+        let unbound = heather_algebra::bind::unbind(&snap_source, &snap_key)?;
+        let num = unbound.num_locations();
+        unbound.into_collection(&col_target)?;
+        Ok::<_, heather_algebra::AlgebraError>(num)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(num_locations)) => {
+            tracing::info!(target = %target_name, num_locations, "Algebra unbind completed");
+            Json(AlgebraResponse { collection: target_name, num_locations }).into_response()
         }
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
