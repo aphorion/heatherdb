@@ -2,6 +2,7 @@ mod auth;
 mod backup;
 mod cli;
 mod dream;
+mod limits;
 mod models;
 mod routes;
 mod routes_db;
@@ -82,9 +83,26 @@ struct Args {
 
     /// First-boot admin password. Used only when the user store is empty.
     /// If unset and the store is empty, the engine generates a random
-    /// password and prints it ONCE to stderr.
+    /// password, prints it ONCE to stderr, and writes it to
+    /// `$DATA_DIR/initial-admin-password` (mode 0600).
     #[arg(long, env = "HEATHER_ADMIN_PASSWORD")]
     admin_password: Option<String>,
+
+    /// Max locations an algebra add/sub/bind result may contain. Bounds the
+    /// n×m cross product before allocation. 0 disables the cap.
+    #[arg(long, env = "HEATHER_MAX_ALGEBRA_LOCATIONS",
+          default_value_t = limits::DEFAULT_MAX_ALGEBRA_LOCATIONS)]
+    max_algebra_locations: usize,
+
+    /// Max address/counter pairs per bulk_load request. 0 disables the cap.
+    #[arg(long, env = "HEATHER_MAX_BULK_ITEMS",
+          default_value_t = limits::DEFAULT_MAX_BULK_ITEMS)]
+    max_bulk_items: usize,
+
+    /// Max queries per batch_analyze request. 0 disables the cap.
+    #[arg(long, env = "HEATHER_MAX_BATCH_QUERIES",
+          default_value_t = limits::DEFAULT_MAX_BATCH_QUERIES)]
+    max_batch_queries: usize,
 
     #[command(subcommand)]
     command: Option<Cmd>,
@@ -184,10 +202,23 @@ async fn serve(args: Args) -> std::process::ExitCode {
         }
     };
 
+    limits::init(limits::Limits {
+        max_algebra_locations: args.max_algebra_locations,
+        max_bulk_items: args.max_bulk_items,
+        max_batch_queries: args.max_batch_queries,
+    });
+
     // Open the multi-tenant server. On a fresh boot this lazily creates
     // the `default` database with the dimension we pass here.
-    let server =
-        Server::open_with(&data_dir, args.dimension, args.l0).expect("failed to open server");
+    // Keeps the `--l0` seeding knob while reporting a failed open instead of
+    // panicking, which is what the hardening pass was after.
+    let server = match Server::open_with(&data_dir, args.dimension, args.l0) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("error: open server: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
     let databases = server.databases().unwrap_or_default();
     tracing::info!(
@@ -234,6 +265,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
             &user_store,
             &args.admin_user,
             args.admin_password.as_deref(),
+            &data_dir,
         ) {
             eprintln!("error: bootstrap admin user: {e}");
             return std::process::ExitCode::FAILURE;
@@ -381,6 +413,9 @@ async fn serve(args: Args) -> std::process::ExitCode {
 
     let app = Router::new()
         .route("/health", get(routes::health))
+        .route("/healthz", get(routes::health))
+        .route("/ready", get(routes_db::ready))
+        .route("/readyz", get(routes_db::ready))
         .merge(legacy_router)
         .merge(db_admin_router)
         .merge(db_scoped_router)

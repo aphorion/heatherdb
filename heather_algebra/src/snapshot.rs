@@ -36,6 +36,14 @@ impl EAMSnapshot {
             .map_err(AlgebraError::Db)
     }
 
+    /// Like [`into_collection`](Self::into_collection), but refuses (with
+    /// `HeatherError::Conflict`) if the target was mutated since
+    /// `expected_version` was observed via `Collection::version()`.
+    pub fn into_collection_checked(self, col: &Collection, expected_version: u64) -> Result<()> {
+        col.load_snapshot_checked(self.locations, self.config, Some(expected_version))
+            .map_err(AlgebraError::Db)
+    }
+
     /// Dimensionality of this snapshot.
     pub fn dim(&self) -> usize {
         self.config.d

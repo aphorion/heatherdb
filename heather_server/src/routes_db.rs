@@ -17,6 +17,33 @@ use heather_db::{DEFAULT_MAP_SIZE_MB, DbConfig, Hive, Server};
 use crate::models::*;
 use crate::routes;
 
+/// Readiness probe: unlike `/health` (alive-only), this proves the engine
+/// can actually serve — it lists databases and runs a real LMDB read on
+/// the default hive. Returns 503 when the storage layer is broken, so
+/// orchestrators stop routing traffic instead of restart-looping a
+/// corrupted engine that still answers `/health`.
+pub async fn ready(Extension(server): Extension<Arc<Server>>) -> Response {
+    let result = tokio::task::spawn_blocking(move || {
+        let _dbs = server.databases()?;
+        match server.database(heather_db::DEFAULT_DB) {
+            Some(hive) => hive.list_collections().map(|_| ()),
+            None => Err(heather_db::HeatherError::Storage(
+                "default database missing".into(),
+            )),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Json(HealthResponse {
+            status: "ok".to_string(),
+        })
+        .into_response(),
+        Ok(Err(e)) => err(StatusCode::SERVICE_UNAVAILABLE, e),
+        Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e),
+    }
+}
+
 /// Resolve a DB name to its `Arc<Hive>`. Returns a `404 Response` if the
 /// name doesn't exist on this server.
 // The `Err` variant is axum's own `Response`, which is genuinely large.

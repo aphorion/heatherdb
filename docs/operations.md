@@ -102,13 +102,16 @@ All accept either a CLI flag or an env var. Env wins when both are set.
 | `--max-body-size`          | `HEATHER_MAX_BODY_SIZE`       | 2097152 (2MB) | Largest single request. Raise for big batch writes. |
 | `--request-timeout`        | `HEATHER_REQUEST_TIMEOUT`     | 30            | Per-request seconds. Algebra ops can take a while at scale. |
 | `--map-size-mb`            | `HEATHER_MAP_SIZE_MB`         | 256           | LMDB map size for the auto-created `default` DB. |
+| `--max-algebra-locations`  | `HEATHER_MAX_ALGEBRA_LOCATIONS` | 250000      | Cap on an algebra add/sub/bind result (the n×m cross product). Requests over it get a 400 telling the caller to pass `max_cross_k`. 0 disables. |
+| `--max-bulk-items`         | `HEATHER_MAX_BULK_ITEMS`      | 100000        | Cap on address/counter pairs per `bulk_load`. 0 disables. |
+| `--max-batch-queries`      | `HEATHER_MAX_BATCH_QUERIES`   | 1000          | Cap on queries per `batch_analyze`. 0 disables. |
 
 ### Auth
 
 | Flag                | Env                          | Default | Notes |
 |---------------------|------------------------------|---------|-------|
 | `--admin-user`      | `HEATHER_ADMIN_USER`         | `admin` | First-boot admin username. Ignored once user store is non-empty. |
-| `--admin-password`  | `HEATHER_ADMIN_PASSWORD`     | (random)| First-boot admin password. Random if unset (printed once). |
+| `--admin-password`  | `HEATHER_ADMIN_PASSWORD`     | (random)| First-boot admin password. Random if unset — printed once to stderr **and** written to `$DATA_DIR/initial-admin-password` (0600). Delete that file after saving the password. |
 | `--auth-disabled`   | `HEATHER_AUTH_DISABLED`      | false   | Disable auth entirely. **Dev only.** |
 
 ### Logging
@@ -160,12 +163,16 @@ After editing `/etc/heatherdb/env`: `sudo systemctl restart heatherdb`.
 ### Liveness
 
 ```
-GET /health → 200 {"status":"ok"}
+GET /health → 200 {"status":"ok"}        # alive-only (alias: /healthz)
+GET /ready  → 200 ok | 503               # real probe  (alias: /readyz)
 ```
 
-Always returns 200 if the process is alive — *doesn't* check that the
-LMDB env is mountable. For a "ready to serve" probe, hit
-`GET /db/{name}` on a known DB with valid auth.
+`/health` always returns 200 if the process is alive — *doesn't* check
+that the LMDB env is mountable. `/ready` runs an actual LMDB read on the
+default database and returns 503 when the storage layer is broken — point
+orchestrator healthchecks (Docker, Coolify, systemd watchdog scripts) at
+`/ready` so a corrupted engine stops receiving traffic instead of
+restart-looping behind a green `/health`.
 
 ### Per-database health
 

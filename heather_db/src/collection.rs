@@ -127,6 +127,10 @@ pub(crate) struct EAMInner {
     /// Contiguous [L × D] address matrix for cache-friendly brute-force activation.
     /// Row i = `locations[i].address`. Updated incrementally on writes.
     pub(crate) address_matrix: Vec<f64>,
+    /// In-process mutation counter. Bumped on every write-locked mutation;
+    /// lets snapshot→load_snapshot cycles detect concurrent writes. Not
+    /// persisted — resets to 0 on load.
+    pub(crate) version: u64,
 }
 
 impl EAMInner {
@@ -242,6 +246,7 @@ impl Collection {
                 landmarks,
                 id_lookup,
                 address_matrix,
+                version: 0,
             }),
             store,
         })
@@ -304,6 +309,7 @@ impl Collection {
                 landmarks,
                 id_lookup,
                 address_matrix,
+                version: 0,
             }),
             store,
         })
@@ -322,6 +328,7 @@ impl Collection {
         vec_ops::validate_vector(input)?;
 
         let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        inner.version += 1;
 
         if input.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -480,6 +487,7 @@ impl Collection {
         }
 
         let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        inner.version += 1;
 
         // No EmptyMemory guard: data-seeded index is seeded by the first write.
 
@@ -827,6 +835,7 @@ impl Collection {
     /// Migrates document index posting lists from removed locations to survivors.
     pub fn merge(&self) -> Result<usize> {
         let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        inner.version += 1;
         let EAMInner {
             ref config,
             ref mut locations,
@@ -1043,6 +1052,7 @@ impl Collection {
         vec_ops::validate_vector(input)?;
 
         let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        inner.version += 1;
 
         if input.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -1389,10 +1399,39 @@ impl Collection {
         Ok((inner.locations.clone(), inner.config.clone()))
     }
 
+    /// Like [`snapshot`](Self::snapshot), but also returns the mutation
+    /// version, for handing to [`load_snapshot_checked`](Self::load_snapshot_checked).
+    pub fn snapshot_versioned(&self) -> Result<(Vec<HardLocation>, EAMConfig, u64)> {
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        Ok((inner.locations.clone(), inner.config.clone(), inner.version))
+    }
+
+    /// Current mutation version. Bumped on every write-locked mutation
+    /// (write, merge, load_snapshot). In-process only — resets on load.
+    pub fn version(&self) -> Result<u64> {
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        Ok(inner.version)
+    }
+
     /// Replace this collection's in-memory EAM state from a snapshot.
     /// Flushes the new state to persistent storage atomically.
     /// Resets next_id to max(location_ids) + 1.
     pub fn load_snapshot(&self, locations: Vec<HardLocation>, config: EAMConfig) -> Result<()> {
+        self.load_snapshot_checked(locations, config, None)
+    }
+
+    /// [`load_snapshot`](Self::load_snapshot) with optimistic concurrency:
+    /// when `expected_version` is `Some`, the replace is refused with
+    /// [`HeatherError::Conflict`] if the collection was mutated since that
+    /// version was observed (via [`snapshot_versioned`](Self::snapshot_versioned)
+    /// or [`version`](Self::version)). Prevents a snapshot→compute→load
+    /// cycle from silently discarding concurrent writes.
+    pub fn load_snapshot_checked(
+        &self,
+        locations: Vec<HardLocation>,
+        config: EAMConfig,
+        expected_version: Option<u64>,
+    ) -> Result<()> {
         config.validate()?;
 
         for loc in &locations {
@@ -1412,6 +1451,15 @@ impl Collection {
             .unwrap_or(0);
 
         let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        if let Some(expected) = expected_version
+            && inner.version != expected
+        {
+            return Err(HeatherError::Conflict(format!(
+                "collection '{}' was modified concurrently (version {} != expected {}); retry",
+                self.name, inner.version, expected
+            )));
+        }
+        inner.version += 1;
 
         // Persist atomically: clear old locations, write new ones
         let mut txn = self.store.write_txn()?;

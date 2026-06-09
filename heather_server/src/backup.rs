@@ -163,6 +163,7 @@ fn do_backup(data_dir: &Path, output: &Path, db: Option<&str>) -> Result<(), Str
     tar.follow_symlinks(false);
 
     if let Some(name) = db {
+        heather_db::validate_db_name(name).map_err(|e| format!("invalid --db name: {e}"))?;
         let dir = data_dir.join("db").join(name);
         if !dir.is_dir() {
             return Err(format!(
@@ -206,6 +207,9 @@ fn do_backup(data_dir: &Path, output: &Path, db: Option<&str>) -> Result<(), Str
 
 fn do_restore(data_dir: &Path, input: &Path, only_db: Option<&str>) -> Result<(), String> {
     refuse_if_engine_running(data_dir)?;
+    if let Some(only) = only_db {
+        heather_db::validate_db_name(only).map_err(|e| format!("invalid --db name: {e}"))?;
+    }
     fs::create_dir_all(data_dir).map_err(|e| format!("create {}: {e}", data_dir.display()))?;
 
     // Two input shapes:
@@ -233,6 +237,11 @@ fn do_restore(data_dir: &Path, input: &Path, only_db: Option<&str>) -> Result<()
             .ok_or_else(|| "db.toml missing 'name' field".to_string())?
             .to_string();
         let restore_name = only_db.unwrap_or(&name);
+        // The name comes from the snapshot's own db.toml — untrusted input.
+        // Without this check a crafted `name = "../../..."` escapes the
+        // data dir.
+        heather_db::validate_db_name(restore_name)
+            .map_err(|e| format!("invalid database name '{restore_name}' in snapshot: {e}"))?;
 
         let target = data_dir.join("db").join(restore_name);
         fs::create_dir_all(target.parent().unwrap()).map_err(|e| e.to_string())?;
@@ -259,6 +268,19 @@ fn do_restore(data_dir: &Path, input: &Path, only_db: Option<&str>) -> Result<()
     for entry in tar.entries().map_err(|e| format!("read tar: {e}"))? {
         let mut entry = entry.map_err(|e| format!("entry: {e}"))?;
         let path = entry.path().map_err(|e| e.to_string())?.into_owned();
+        // Zip-slip guard: we join the entry path onto data_dir ourselves,
+        // so absolute paths / `..` components / unknown top-level dirs
+        // must be rejected, and link entries (which later entries could
+        // traverse) refused outright.
+        sanitize_archive_path(&path)?;
+        let entry_type = entry.header().entry_type();
+        if !(entry_type.is_file() || entry_type.is_dir()) {
+            return Err(format!(
+                "refusing to unpack non-regular archive entry: {} ({:?})",
+                path.display(),
+                entry_type
+            ));
+        }
         // --db filter: only entries under db/<only>/...
         if let Some(only) = only_db {
             let prefix = PathBuf::from(format!("db/{only}"));
@@ -437,17 +459,47 @@ fn delete_snapshot(data_dir: &Path, name: &str) -> Result<(), String> {
 /* ─── helpers ─────────────────────────────────────────────────────────────── */
 
 fn refuse_if_engine_running(data_dir: &Path) -> Result<(), String> {
-    // Heuristic: if any LMDB lock file under db/*/data is held, opening
-    // that env in EXCLUSIVE mode would error. We don't actually try to
-    // grab exclusive — that would race with the running engine. Instead
-    // we look for any process listening on the port AND for an active
-    // lock file. This is best-effort; operators can always force with
-    // --force (not yet implemented; deliberately keeping it manual).
-    let _ = data_dir; // silence unused warning when there's no check below
-    // For now: just return Ok. The downstream tar/extract calls will
-    // fail naturally if the file is locked or being mutated. snapshot
-    // is intended to be safe under load anyway.
-    Ok(())
+    // The engine holds an exclusive flock on $DATA/engine.lock for its
+    // whole lifetime. If we can't take it, an engine is live on this
+    // data dir — a cold backup/restore would capture or clobber a
+    // mid-mutation LMDB. (We release immediately; the point is the probe.)
+    match heather_db::try_acquire_engine_lock(data_dir) {
+        Ok(Some(_lock)) => Ok(()),
+        Ok(None) => Err(
+            "an engine is running on this data dir (engine.lock is held) — stop it first, \
+             or use `snapshot create` which is safe under load"
+                .into(),
+        ),
+        Err(e) => Err(format!("engine lock check: {e}")),
+    }
+}
+
+/// Reject archive entry paths that could land outside the data dir:
+/// absolute paths, `..`/`.` components, and anything not under the known
+/// top-level layout (`server.toml`, `system/`, `db/`).
+fn sanitize_archive_path(path: &Path) -> Result<(), String> {
+    use std::path::Component;
+    if path.as_os_str().is_empty()
+        || path
+            .components()
+            .any(|c| !matches!(c, Component::Normal(_)))
+    {
+        return Err(format!(
+            "refusing to unpack archive entry with unsafe path: {}",
+            path.display()
+        ));
+    }
+    let first = match path.components().next() {
+        Some(Component::Normal(s)) => s.to_str(),
+        _ => None,
+    };
+    match first {
+        Some("server.toml") | Some("system") | Some("db") => Ok(()),
+        _ => Err(format!(
+            "archive entry outside the known layout (server.toml, system/, db/): {}",
+            path.display()
+        )),
+    }
 }
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
@@ -497,4 +549,63 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn archive_paths_traversal_rejected() {
+        for bad in [
+            "../outside",
+            "db/../../outside",
+            "/etc/passwd",
+            "./db/x",
+            "",
+            "backups/x.tgz",
+            "secrets",
+        ] {
+            assert!(
+                sanitize_archive_path(Path::new(bad)).is_err(),
+                "expected rejection: {bad}"
+            );
+        }
+        for ok in ["server.toml", "system/data/data.mdb", "db/default/db.toml"] {
+            assert!(
+                sanitize_archive_path(Path::new(ok)).is_ok(),
+                "expected accept: {ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_restore_rejects_traversal_name() {
+        let data = tempfile::tempdir().unwrap();
+        let snap = tempfile::tempdir().unwrap();
+        std::fs::write(
+            snap.path().join("db.toml"),
+            "name = \"../../evil\"\nmap_size_mb = 64\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(snap.path().join("data")).unwrap();
+
+        let err = do_restore(data.path(), snap.path(), None).unwrap_err();
+        assert!(err.contains("invalid database name"), "got: {err}");
+        assert!(!data.path().join("db").join("..").join("..").join("evil").exists());
+    }
+
+    #[test]
+    fn restore_refused_while_engine_lock_held() {
+        let data = tempfile::tempdir().unwrap();
+        let _held = heather_db::try_acquire_engine_lock(data.path())
+            .unwrap()
+            .expect("lock should be free");
+        let snap = tempfile::tempdir().unwrap();
+        std::fs::write(snap.path().join("db.toml"), "name = \"x\"\n").unwrap();
+        std::fs::create_dir_all(snap.path().join("data")).unwrap();
+
+        let err = do_restore(data.path(), snap.path(), None).unwrap_err();
+        assert!(err.contains("engine is running"), "got: {err}");
+    }
 }

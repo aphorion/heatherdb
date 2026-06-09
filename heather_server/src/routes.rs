@@ -13,6 +13,7 @@ use heather_algebra::{
 use heather_db::{HardLocation, Hive, LocationId, ReadStrategy};
 use rayon::prelude::*;
 
+use crate::limits;
 use crate::models::*;
 
 /// `POST /vec/bind` — circular-convolution bind of two raw vectors.
@@ -90,6 +91,54 @@ fn error_response(status: StatusCode, msg: impl ToString) -> Response {
         }),
     )
         .into_response()
+}
+
+/// Map an algebra error to a response: concurrent-modification conflicts
+/// are 409 (retryable), everything else stays 400.
+fn algebra_error_response(e: heather_algebra::AlgebraError) -> Response {
+    let status = match &e {
+        heather_algebra::AlgebraError::Db(heather_db::HeatherError::Conflict(_)) => {
+            StatusCode::CONFLICT
+        }
+        _ => StatusCode::BAD_REQUEST,
+    };
+    error_response(status, e)
+}
+
+/// Pre-flight guard for pairwise algebra ops (add/sub/bind): refuse before
+/// allocating when the estimated cross product exceeds the server cap.
+/// `Ok(())` means proceed; `Err(resp)` is the ready-made refusal.
+fn check_cross_product_cap(
+    op: &str,
+    col_a: &heather_db::Collection,
+    col_b: &heather_db::Collection,
+    max_cross_k: usize,
+) -> Result<(), Response> {
+    let cap = limits::get().max_algebra_locations;
+    if cap == 0 {
+        return Ok(());
+    }
+    let (n_a, n_b) = match (col_a.num_locations(), col_b.num_locations()) {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to size source collections",
+            ))
+        }
+    };
+    let est = limits::estimated_cross_locations(n_a, n_b, max_cross_k);
+    if est > cap {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "algebra {op} on {n_a}×{n_b} source locations would create ~{est} result \
+                 locations, over the server cap of {cap}; pass a smaller max_cross_k \
+                 or raise --max-algebra-locations"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 pub async fn health() -> Response {
@@ -212,6 +261,17 @@ pub async fn bulk_load(
     if req.addresses.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "addresses must not be empty");
     }
+    let max_items = limits::get().max_bulk_items;
+    if max_items > 0 && req.addresses.len() > max_items {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "bulk_load of {} items exceeds the server cap of {max_items}; \
+                 split into smaller batches or raise --max-bulk-items",
+                req.addresses.len()
+            ),
+        );
+    }
     if req.addresses.len() != req.counters.len() {
         return error_response(
             StatusCode::BAD_REQUEST,
@@ -243,7 +303,9 @@ pub async fn bulk_load(
     let result = tokio::task::spawn_blocking(move || {
         // Reuse the target's current config (preserves the per-DB
         // dimension and EAM hyperparameters); load_snapshot validates.
-        let (_, config) = col.snapshot()?;
+        // The version makes the replace refuse (409) if a concurrent
+        // write lands between here and the load below.
+        let (_, config, version) = col.snapshot_versioned()?;
         let dim = config.d;
 
         let mut locations: Vec<HardLocation> = Vec::with_capacity(req.addresses.len());
@@ -261,7 +323,7 @@ pub async fn bulk_load(
         }
 
         let n = locations.len();
-        col.load_snapshot(locations, config)?;
+        col.load_snapshot_checked(locations, config, Some(version))?;
         Ok::<_, heather_db::HeatherError>((n, dim))
     })
     .await;
@@ -270,6 +332,9 @@ pub async fn bulk_load(
         Ok(Ok((n_loaded, dim))) => {
             tracing::info!(collection = %name, n_loaded, dim, "Bulk load completed");
             Json(BulkLoadResponse { n_loaded, dim }).into_response()
+        }
+        Ok(Err(e @ heather_db::HeatherError::Conflict(_))) => {
+            error_response(StatusCode::CONFLICT, e)
         }
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -621,6 +686,17 @@ pub async fn batch_analyze(
     if req.queries.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "queries array must not be empty");
     }
+    let max_queries = limits::get().max_batch_queries;
+    if max_queries > 0 && req.queries.len() > max_queries {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "batch of {} queries exceeds the server cap of {max_queries}; \
+                 split into smaller batches or raise --max-batch-queries",
+                req.queries.len()
+            ),
+        );
+    }
 
     let strategy_name = req.strategy.as_deref().unwrap_or("iterative");
     let strategy = match strategy_name {
@@ -846,6 +922,11 @@ pub async fn algebra_add(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
+    let max_cross_k = req.max_cross_k.unwrap_or(0);
+    if let Err(resp) = check_cross_product_cap("add", &col_a, &col_b, max_cross_k) {
+        return resp;
+    }
+
     let col_target = match hive.get_or_create_collection(&req.target) {
         Ok(col) => col,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -853,11 +934,12 @@ pub async fn algebra_add(
 
     let target_name = req.target.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
         let snap_a = EAMSnapshot::from_collection(&col_a)?;
         let snap_b = EAMSnapshot::from_collection(&col_b)?;
-        let combined = ops::add_with_limit(&snap_a, &snap_b, req.max_cross_k.unwrap_or(0))?;
+        let combined = ops::add_with_limit(&snap_a, &snap_b, max_cross_k)?;
         let num = combined.num_locations();
-        combined.into_collection(&col_target)?;
+        combined.into_collection_checked(&col_target, target_version)?;
         Ok::<_, heather_algebra::AlgebraError>(num)
     })
     .await;
@@ -871,7 +953,7 @@ pub async fn algebra_add(
             })
             .into_response()
         }
-        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Ok(Err(e)) => algebra_error_response(e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -902,6 +984,11 @@ pub async fn algebra_sub(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
+    let max_cross_k = req.max_cross_k.unwrap_or(0);
+    if let Err(resp) = check_cross_product_cap("sub", &col_a, &col_b, max_cross_k) {
+        return resp;
+    }
+
     let col_target = match hive.get_or_create_collection(&req.target) {
         Ok(col) => col,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -909,11 +996,12 @@ pub async fn algebra_sub(
 
     let target_name = req.target.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
         let snap_a = EAMSnapshot::from_collection(&col_a)?;
         let snap_b = EAMSnapshot::from_collection(&col_b)?;
-        let diff = ops::sub_with_limit(&snap_a, &snap_b, req.max_cross_k.unwrap_or(0))?;
+        let diff = ops::sub_with_limit(&snap_a, &snap_b, max_cross_k)?;
         let num = diff.num_locations();
-        diff.into_collection(&col_target)?;
+        diff.into_collection_checked(&col_target, target_version)?;
         Ok::<_, heather_algebra::AlgebraError>(num)
     })
     .await;
@@ -927,7 +1015,7 @@ pub async fn algebra_sub(
             })
             .into_response()
         }
-        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Ok(Err(e)) => algebra_error_response(e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -958,6 +1046,11 @@ pub async fn algebra_bind(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
+    let max_cross_k = req.max_cross_k.unwrap_or(0);
+    if let Err(resp) = check_cross_product_cap("bind", &col_a, &col_b, max_cross_k) {
+        return resp;
+    }
+
     let col_target = match hive.get_or_create_collection(&req.target) {
         Ok(col) => col,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -965,12 +1058,12 @@ pub async fn algebra_bind(
 
     let target_name = req.target.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
         let snap_a = EAMSnapshot::from_collection(&col_a)?;
         let snap_b = EAMSnapshot::from_collection(&col_b)?;
-        let bound =
-            heather_algebra::bind::bind_with_limit(&snap_a, &snap_b, req.max_cross_k.unwrap_or(0))?;
+        let bound = heather_algebra::bind::bind_with_limit(&snap_a, &snap_b, max_cross_k)?;
         let num = bound.num_locations();
-        bound.into_collection(&col_target)?;
+        bound.into_collection_checked(&col_target, target_version)?;
         Ok::<_, heather_algebra::AlgebraError>(num)
     })
     .await;
@@ -984,7 +1077,7 @@ pub async fn algebra_bind(
             })
             .into_response()
         }
-        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Ok(Err(e)) => algebra_error_response(e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -1012,6 +1105,7 @@ pub async fn algebra_unbind(
     let target_name = req.target.clone();
     let key_vector = req.key_vector.clone();
     let result = tokio::task::spawn_blocking(move || {
+        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
         let snap_source = EAMSnapshot::from_collection(&col_source)?;
         // Build a single-location key snapshot from the raw vector.
         if key_vector.len() != snap_source.dim() {
@@ -1029,7 +1123,7 @@ pub async fn algebra_unbind(
         let snap_key = EAMSnapshot::new(vec![key_loc], snap_source.config.clone())?;
         let unbound = heather_algebra::bind::unbind(&snap_source, &snap_key)?;
         let num = unbound.num_locations();
-        unbound.into_collection(&col_target)?;
+        unbound.into_collection_checked(&col_target, target_version)?;
         Ok::<_, heather_algebra::AlgebraError>(num)
     })
     .await;
@@ -1043,7 +1137,7 @@ pub async fn algebra_unbind(
             })
             .into_response()
         }
-        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Ok(Err(e)) => algebra_error_response(e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -1071,10 +1165,11 @@ pub async fn algebra_scale(
     let target_name = req.target.clone();
     let alpha = req.alpha;
     let result = tokio::task::spawn_blocking(move || {
+        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
         let snap = EAMSnapshot::from_collection(&col_source)?;
         let scaled = ops::scale(&snap, alpha)?;
         let num = scaled.num_locations();
-        scaled.into_collection(&col_target)?;
+        scaled.into_collection_checked(&col_target, target_version)?;
         Ok::<_, heather_algebra::AlgebraError>(num)
     })
     .await;
@@ -1088,7 +1183,7 @@ pub async fn algebra_scale(
             })
             .into_response()
         }
-        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Ok(Err(e)) => algebra_error_response(e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
@@ -1189,14 +1284,23 @@ pub async fn algebra_intersect(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
+    // Intersect's allocation is threshold-dependent: a non-positive
+    // threshold admits every cross pair, so bound it like add/sub then.
+    if req.threshold <= 0.0 {
+        if let Err(resp) = check_cross_product_cap("intersect", &col_a, &col_b, 0) {
+            return resp;
+        }
+    }
+
     let target_name = req.target.clone();
     let threshold = req.threshold;
     let result = tokio::task::spawn_blocking(move || {
+        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
         let snap_a = EAMSnapshot::from_collection(&col_a)?;
         let snap_b = EAMSnapshot::from_collection(&col_b)?;
         let inter = ops::intersect(&snap_a, &snap_b, threshold)?;
         let num = inter.num_locations();
-        inter.into_collection(&col_target)?;
+        inter.into_collection_checked(&col_target, target_version)?;
         Ok::<_, heather_algebra::AlgebraError>(num)
     })
     .await;
@@ -1210,7 +1314,7 @@ pub async fn algebra_intersect(
             })
             .into_response()
         }
-        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Ok(Err(e)) => algebra_error_response(e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
 }
