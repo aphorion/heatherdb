@@ -906,6 +906,71 @@ pub async fn algebra_scale(
     }
 }
 
+pub async fn algebra_permute(
+    State(hive): State<AppState>,
+    Json(req): Json<AlgebraPermuteRequest>,
+) -> Response {
+    // Exactly one of `seed` / `name` must be supplied.
+    let permutation_key = match (req.seed, req.name.as_ref()) {
+        (Some(seed), None) => Ok(PermKey::Seed(seed)),
+        (None, Some(name)) => Ok(PermKey::Name(name.clone())),
+        _ => Err("provide exactly one of `seed` or `name`".to_string()),
+    };
+    let permutation_key = match permutation_key {
+        Ok(k) => k,
+        Err(msg) => return error_response(StatusCode::BAD_REQUEST, msg),
+    };
+
+    let col_source = match hive.get_collection(&req.source) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("source collection '{}' not found", req.source),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let col_target = match hive.get_or_create_collection(&req.target) {
+        Ok(col) => col,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let target_name = req.target.clone();
+    let power = req.power;
+    let result = tokio::task::spawn_blocking(move || {
+        let snap = EAMSnapshot::from_collection(&col_source)?;
+        let rho = match permutation_key {
+            PermKey::Seed(seed) => heather_algebra::Permutation::from_seed(snap.dim(), seed),
+            PermKey::Name(name) => heather_algebra::Permutation::from_name(snap.dim(), &name),
+        };
+        let permuted = heather_algebra::permute_snapshot(&snap, &rho, power)?;
+        let num = permuted.num_locations();
+        permuted.into_collection(&col_target)?;
+        Ok::<_, heather_algebra::AlgebraError>(num)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(num_locations)) => {
+            tracing::info!(target = %target_name, power, num_locations, "Algebra permute completed");
+            Json(AlgebraResponse {
+                collection: target_name,
+                num_locations,
+            })
+            .into_response()
+        }
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+enum PermKey {
+    Seed(u64),
+    Name(String),
+}
+
 pub async fn algebra_intersect(
     State(hive): State<AppState>,
     Json(req): Json<AlgebraIntersectRequest>,

@@ -393,6 +393,18 @@ pub async fn algebra_bind(
     routes::algebra_bind(State(hive), Json(req)).await
 }
 
+pub async fn algebra_permute(
+    Extension(server): Extension<Arc<Server>>,
+    Path(db_name): Path<String>,
+    Json(req): Json<AlgebraPermuteRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::algebra_permute(State(hive), Json(req)).await
+}
+
 pub async fn algebra_unbind(
     Extension(server): Extension<Arc<Server>>,
     Path(db_name): Path<String>,
