@@ -5,7 +5,7 @@
 
 use heather_db::read;
 use heather_db::vec_ops;
-use heather_db::{HardLocation, EAMConfig};
+use heather_db::{EAMConfig, HardLocation};
 
 use crate::snapshot::EAMSnapshot;
 
@@ -143,8 +143,7 @@ pub fn compose_read(
     let mut confs = Vec::with_capacity(parents.len());
 
     for parent in parents {
-        let (recon, conf) =
-            read_parent_with_confidence(query, &parent.locations, &parent.config);
+        let (recon, conf) = read_parent_with_confidence(query, &parent.locations, &parent.config);
         recons.push(recon);
         confs.push(conf);
     }
@@ -190,15 +189,10 @@ pub fn compose_read(
 mod tests {
     use super::*;
     use heather_db::location::LocationId;
-    use rand_distr::StandardNormal;
     use rand::Rng;
+    use rand_distr::StandardNormal;
 
-    fn make_cluster(
-        start_id: u64,
-        center: &[f64],
-        count: usize,
-        spread: f64,
-    ) -> Vec<HardLocation> {
+    fn make_cluster(start_id: u64, center: &[f64], count: usize, spread: f64) -> Vec<HardLocation> {
         let mut rng = rand::thread_rng();
         let center_norm = vec_ops::normalize(center);
         let mut locs = Vec::new();
@@ -306,7 +300,9 @@ mod tests {
         assert!(
             result.weights[0] > result.weights[1] && result.weights[0] > result.weights[2],
             "A-query: w_a={:.3}, w_b={:.3}, w_c={:.3}",
-            result.weights[0], result.weights[1], result.weights[2]
+            result.weights[0],
+            result.weights[1],
+            result.weights[2]
         );
 
         // Query near B → weight_b should dominate
@@ -318,7 +314,9 @@ mod tests {
         assert!(
             result.weights[1] > result.weights[0] && result.weights[1] > result.weights[2],
             "B-query: w_a={:.3}, w_b={:.3}, w_c={:.3}",
-            result.weights[0], result.weights[1], result.weights[2]
+            result.weights[0],
+            result.weights[1],
+            result.weights[2]
         );
     }
 

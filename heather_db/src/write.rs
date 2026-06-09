@@ -283,7 +283,16 @@ mod tests {
         let mut next_id = 3u64;
         let mut rng = rand::thread_rng();
 
-        let result = adaptive_write(&input, &mut locations, &config, 0.01, &mut next_id, &mut rng, &[], &[]);
+        let result = adaptive_write(
+            &input,
+            &mut locations,
+            &config,
+            0.01,
+            &mut next_id,
+            &mut rng,
+            &[],
+            &[],
+        );
         assert!(!result.modified_indices.is_empty());
         // Location 0 should have received the most weight
         assert!(locations[0].write_count > locations[1].write_count);
@@ -293,14 +302,24 @@ mod tests {
     fn test_novelty_split() {
         let mut config = EAMConfig::new(3).unwrap();
         config.tau_split = 0.99; // very high threshold -> always split
-        let mut locations = vec![
-            HardLocation::new(LocationId(0), vec_ops::normalize(&[1.0, 0.0, 0.0])),
-        ];
+        let mut locations = vec![HardLocation::new(
+            LocationId(0),
+            vec_ops::normalize(&[1.0, 0.0, 0.0]),
+        )];
         let input = vec_ops::normalize(&[0.0, 1.0, 0.0]); // very different
         let mut next_id = 1u64;
         let mut rng = rand::thread_rng();
 
-        let result = adaptive_write(&input, &mut locations, &mut config, 0.01, &mut next_id, &mut rng, &[], &[]);
+        let result = adaptive_write(
+            &input,
+            &mut locations,
+            &mut config,
+            0.01,
+            &mut next_id,
+            &mut rng,
+            &[],
+            &[],
+        );
         // Should have created at least one new location (novelty split)
         assert!(!result.new_locations.is_empty());
     }

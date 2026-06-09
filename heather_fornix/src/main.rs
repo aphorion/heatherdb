@@ -147,9 +147,7 @@ fn do_import(file: &Path, collection: &str, db: &Path, map_size: usize) -> anyho
     let col = hive.get_or_create_collection(collection)?;
     col.load_snapshot(locations, exported.config)?;
 
-    eprintln!(
-        "Imported {num_locations} locations (d={dim}) into collection '{collection}'"
-    );
+    eprintln!("Imported {num_locations} locations (d={dim}) into collection '{collection}'");
 
     if !exported.prototypes.is_empty() {
         eprintln!(
@@ -175,12 +173,7 @@ fn do_import(file: &Path, collection: &str, db: &Path, map_size: usize) -> anyho
 // Export
 // ---------------------------------------------------------------------------
 
-fn do_export(
-    collection: &str,
-    db: &Path,
-    output: &Path,
-    map_size: usize,
-) -> anyhow::Result<()> {
+fn do_export(collection: &str, db: &Path, output: &Path, map_size: usize) -> anyhow::Result<()> {
     // We need a config to open Hive. Use a placeholder — the real config
     // comes from the collection's stored state via snapshot().
     let hive_config = EAMConfig::new(64)?;

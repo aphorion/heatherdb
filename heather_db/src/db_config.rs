@@ -137,12 +137,12 @@ mod tests {
     #[test]
     fn invalid_names() {
         assert!(validate_db_name("").is_err());
-        assert!(validate_db_name("Memoria").is_err());          // uppercase
-        assert!(validate_db_name("1memoria").is_err());          // leading digit
-        assert!(validate_db_name("_system").is_err());           // leading underscore
-        assert!(validate_db_name("foo bar").is_err());           // space
-        assert!(validate_db_name("foo.bar").is_err());           // dot
-        assert!(validate_db_name(&"a".repeat(64)).is_err());     // too long
+        assert!(validate_db_name("Memoria").is_err()); // uppercase
+        assert!(validate_db_name("1memoria").is_err()); // leading digit
+        assert!(validate_db_name("_system").is_err()); // leading underscore
+        assert!(validate_db_name("foo bar").is_err()); // space
+        assert!(validate_db_name("foo.bar").is_err()); // dot
+        assert!(validate_db_name(&"a".repeat(64)).is_err()); // too long
     }
 
     #[test]

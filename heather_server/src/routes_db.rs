@@ -7,12 +7,12 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
-use heather_db::{DbConfig, Hive, Server, DEFAULT_MAP_SIZE_MB};
+use heather_db::{DEFAULT_MAP_SIZE_MB, DbConfig, Hive, Server};
 
 use crate::models::*;
 use crate::routes;
@@ -115,7 +115,12 @@ pub async fn get_database(
 ) -> Response {
     let cfg = match server.database_config(&db_name) {
         Ok(c) => c,
-        Err(_) => return err(StatusCode::NOT_FOUND, format!("database not found: {db_name}")),
+        Err(_) => {
+            return err(
+                StatusCode::NOT_FOUND,
+                format!("database not found: {db_name}"),
+            );
+        }
     };
     let collections = server
         .database(&db_name)
@@ -165,7 +170,10 @@ pub async fn list_collections(
     Extension(server): Extension<Arc<Server>>,
     Path(db_name): Path<String>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::list_collections(State(hive)).await
 }
 
@@ -174,7 +182,10 @@ pub async fn create_collection(
     Path(db_name): Path<String>,
     Json(req): Json<CreateCollectionRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::create_collection(State(hive), Json(req)).await
 }
 
@@ -182,7 +193,10 @@ pub async fn drop_collection(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::drop_collection(State(hive), Path(col)).await
 }
 
@@ -191,7 +205,10 @@ pub async fn write(
     Path((db_name, col)): Path<(String, String)>,
     Json(req): Json<WriteRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::write(State(hive), Path(col), Json(req)).await
 }
 
@@ -200,7 +217,10 @@ pub async fn read(
     Path((db_name, col)): Path<(String, String)>,
     Json(req): Json<ReadRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::read(State(hive), Path(col), Json(req)).await
 }
 
@@ -209,7 +229,10 @@ pub async fn bulk_load(
     Path((db_name, col)): Path<(String, String)>,
     Json(req): Json<BulkLoadRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::bulk_load(State(hive), Path(col), Json(req)).await
 }
 
@@ -217,7 +240,10 @@ pub async fn stats(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::stats(State(hive), Path(col)).await
 }
 
@@ -225,7 +251,10 @@ pub async fn collection_config(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::collection_config(State(hive), Path(col)).await
 }
 
@@ -234,7 +263,10 @@ pub async fn locations(
     Path((db_name, col)): Path<(String, String)>,
     q: axum::extract::Query<LocationsQuery>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::locations(State(hive), Path(col), q).await
 }
 
@@ -242,7 +274,10 @@ pub async fn fingerprint(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::fingerprint(State(hive), Path(col)).await
 }
 
@@ -251,7 +286,10 @@ pub async fn analyze(
     Path((db_name, col)): Path<(String, String)>,
     Json(req): Json<AnalyzeRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::analyze(State(hive), Path(col), Json(req)).await
 }
 
@@ -260,7 +298,10 @@ pub async fn batch_analyze(
     Path((db_name, col)): Path<(String, String)>,
     Json(req): Json<BatchAnalyzeRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::batch_analyze(State(hive), Path(col), Json(req)).await
 }
 
@@ -268,7 +309,10 @@ pub async fn get_documents(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::get_documents(State(hive), Path(col)).await
 }
 
@@ -276,7 +320,10 @@ pub async fn get_document(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col, doc_id)): Path<(String, String, u64)>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::get_document(State(hive), Path((col, doc_id))).await
 }
 
@@ -285,7 +332,10 @@ pub async fn query_documents(
     Path((db_name, col)): Path<(String, String)>,
     Json(req): Json<QueryDocumentsRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::query_documents(State(hive), Path(col), Json(req)).await
 }
 
@@ -296,7 +346,10 @@ pub async fn algebra_add(
     Path(db_name): Path<String>,
     Json(req): Json<AlgebraAddRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::algebra_add(State(hive), Json(req)).await
 }
 
@@ -305,7 +358,10 @@ pub async fn algebra_sub(
     Path(db_name): Path<String>,
     Json(req): Json<AlgebraSubRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::algebra_sub(State(hive), Json(req)).await
 }
 
@@ -314,7 +370,10 @@ pub async fn algebra_scale(
     Path(db_name): Path<String>,
     Json(req): Json<AlgebraScaleRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::algebra_scale(State(hive), Json(req)).await
 }
 
@@ -323,7 +382,10 @@ pub async fn algebra_bind(
     Path(db_name): Path<String>,
     Json(req): Json<AlgebraBindRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::algebra_bind(State(hive), Json(req)).await
 }
 
@@ -332,7 +394,10 @@ pub async fn algebra_unbind(
     Path(db_name): Path<String>,
     Json(req): Json<AlgebraUnbindRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::algebra_unbind(State(hive), Json(req)).await
 }
 
@@ -341,7 +406,10 @@ pub async fn algebra_intersect(
     Path(db_name): Path<String>,
     Json(req): Json<AlgebraIntersectRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::algebra_intersect(State(hive), Json(req)).await
 }
 
@@ -350,6 +418,9 @@ pub async fn compose_read(
     Path(db_name): Path<String>,
     Json(req): Json<ComposeReadRequest>,
 ) -> Response {
-    let hive = match resolve_db(&server, &db_name) { Ok(h) => h, Err(r) => return r };
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
     routes::compose_read(State(hive), Json(req)).await
 }

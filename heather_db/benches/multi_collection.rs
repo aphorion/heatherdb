@@ -1,7 +1,7 @@
 #[path = "helpers.rs"]
 mod helpers;
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use heather_db::ReadStrategy;
 
 fn bench_multi_collection_write(c: &mut Criterion) {
@@ -89,7 +89,8 @@ fn bench_multi_collection_read(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("collections", n_collections), |b| {
             let mut idx = 0usize;
             b.iter(|| {
-                col0.read(&queries[idx % queries.len()], ReadStrategy::HopfieldIter).unwrap();
+                col0.read(&queries[idx % queries.len()], ReadStrategy::HopfieldIter)
+                    .unwrap();
                 idx += 1;
             });
         });
@@ -110,7 +111,8 @@ fn bench_multi_collection_create(c: &mut Criterion) {
         let mut counter = 0usize;
         group.bench_function("cold", |b| {
             b.iter(|| {
-                hive.get_or_create_collection(&format!("new_{counter}")).unwrap();
+                hive.get_or_create_collection(&format!("new_{counter}"))
+                    .unwrap();
                 counter += 1;
             });
         });
@@ -121,12 +123,14 @@ fn bench_multi_collection_create(c: &mut Criterion) {
         let config = helpers::medium_config(d);
         let (_dir, hive) = helpers::open_hive(config, 4096);
         for i in 0..50 {
-            hive.get_or_create_collection(&format!("existing_{i}")).unwrap();
+            hive.get_or_create_collection(&format!("existing_{i}"))
+                .unwrap();
         }
         let mut counter = 0usize;
         group.bench_function("with_50_existing", |b| {
             b.iter(|| {
-                hive.get_or_create_collection(&format!("new_{counter}")).unwrap();
+                hive.get_or_create_collection(&format!("new_{counter}"))
+                    .unwrap();
                 counter += 1;
             });
         });

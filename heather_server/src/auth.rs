@@ -19,17 +19,17 @@
 
 use std::sync::Arc;
 
+use axum::Json;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, Request, StatusCode};
+use axum::http::{Request, StatusCode, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
-use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use base64::engine::general_purpose::STANDARD as B64;
 
 use crate::models::ErrorResponse;
-use crate::users::{is_authorized, Scope, UserStore};
+use crate::users::{Scope, UserStore, is_authorized};
 
 /// What the auth middleware needs at runtime. Cheap to clone (`Arc`s).
 #[derive(Clone)]
@@ -40,10 +40,16 @@ pub struct AuthState {
 
 impl AuthState {
     pub fn enabled(users: Arc<UserStore>) -> Self {
-        Self { users, disabled: false }
+        Self {
+            users,
+            disabled: false,
+        }
     }
     pub fn disabled(users: Arc<UserStore>) -> Self {
-        Self { users, disabled: true }
+        Self {
+            users,
+            disabled: true,
+        }
     }
 }
 
@@ -57,11 +63,7 @@ pub fn is_unauth_route(path: &str) -> bool {
 /// ```ignore
 /// .layer(middleware::from_fn_with_state(auth.clone(), auth::middleware))
 /// ```
-pub async fn middleware(
-    State(auth): State<AuthState>,
-    req: Request<Body>,
-    next: Next,
-) -> Response {
+pub async fn middleware(State(auth): State<AuthState>, req: Request<Body>, next: Next) -> Response {
     let path = req.uri().path().to_string();
 
     if auth.disabled || is_unauth_route(&path) {
@@ -119,12 +121,16 @@ fn parse_basic(header_value: &str) -> Option<BasicCreds> {
 fn deny_401(msg: &str) -> Response {
     let mut resp = (
         StatusCode::UNAUTHORIZED,
-        Json(ErrorResponse { error: msg.to_string() }),
+        Json(ErrorResponse {
+            error: msg.to_string(),
+        }),
     )
         .into_response();
     resp.headers_mut().insert(
         header::WWW_AUTHENTICATE,
-        "Basic realm=\"heatherdb\", charset=\"UTF-8\"".parse().unwrap(),
+        "Basic realm=\"heatherdb\", charset=\"UTF-8\""
+            .parse()
+            .unwrap(),
     );
     resp
 }
@@ -132,7 +138,9 @@ fn deny_401(msg: &str) -> Response {
 fn deny_403(msg: &str) -> Response {
     (
         StatusCode::FORBIDDEN,
-        Json(ErrorResponse { error: msg.to_string() }),
+        Json(ErrorResponse {
+            error: msg.to_string(),
+        }),
     )
         .into_response()
 }

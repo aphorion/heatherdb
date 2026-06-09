@@ -126,8 +126,9 @@ impl Store {
         let iter = self.registry_db.iter(&rtxn)?;
         for result in iter {
             let (key, value) = result?;
-            let name = std::str::from_utf8(key)
-                .map_err(|e| HeatherError::Storage(format!("invalid UTF-8 in registry key: {e}")))?;
+            let name = std::str::from_utf8(key).map_err(|e| {
+                HeatherError::Storage(format!("invalid UTF-8 in registry key: {e}"))
+            })?;
             if name == NEXT_COLLECTION_ID_KEY {
                 continue;
             }
@@ -271,7 +272,12 @@ impl Store {
         Ok(val.map(|v| v.to_vec()))
     }
 
-    pub fn get_document_txn(&self, txn: &RoTxn, collection_id: u32, write_index: u64) -> Result<Option<Vec<u8>>> {
+    pub fn get_document_txn(
+        &self,
+        txn: &RoTxn,
+        collection_id: u32,
+        write_index: u64,
+    ) -> Result<Option<Vec<u8>>> {
         let key = document_key(collection_id, write_index);
         let val = self.documents_db.get(txn, &key)?;
         Ok(val.map(|v| v.to_vec()))
@@ -285,9 +291,9 @@ impl Store {
         for result in iter {
             let (key, value) = result?;
             // Extract write_index from key bytes [4..12]
-            let idx_bytes: [u8; 8] = key[4..12].try_into().map_err(|_| {
-                HeatherError::Storage("invalid document key length".to_string())
-            })?;
+            let idx_bytes: [u8; 8] = key[4..12]
+                .try_into()
+                .map_err(|_| HeatherError::Storage("invalid document key length".to_string()))?;
             let write_index = u64::from_be_bytes(idx_bytes);
             docs.push((write_index, value.to_vec()));
         }

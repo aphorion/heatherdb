@@ -1,7 +1,7 @@
 #[path = "helpers.rs"]
 mod helpers;
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use heather_db::{Hive, ReadStrategy};
 
 fn bench_flush(c: &mut Criterion) {
@@ -13,14 +13,11 @@ fn bench_flush(c: &mut Criterion) {
         let (_dir, hive) = helpers::open_hive(config, 512);
         let col = helpers::populate_collection(&hive, "bench", n_writes, d);
 
-        group.bench_function(
-            BenchmarkId::new("d_w", format!("{d}_{n_writes}")),
-            |b| {
-                b.iter(|| {
-                    col.flush().unwrap();
-                });
-            },
-        );
+        group.bench_function(BenchmarkId::new("d_w", format!("{d}_{n_writes}")), |b| {
+            b.iter(|| {
+                col.flush().unwrap();
+            });
+        });
     }
 
     group.finish();

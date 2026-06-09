@@ -24,9 +24,9 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::Subcommand;
+use flate2::Compression;
 use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
-use flate2::Compression;
 use heed::{CompactionOption, EnvOpenOptions};
 
 use crate::cli::chrono_format;
@@ -95,11 +95,17 @@ pub fn run_backup(data_dir: &Path, cmd: &BackupCmd) -> ExitCode {
     match cmd {
         BackupCmd::Create { output, db } => match do_backup(data_dir, output, db.as_deref()) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(e) => { eprintln!("error: backup: {e}"); ExitCode::FAILURE }
+            Err(e) => {
+                eprintln!("error: backup: {e}");
+                ExitCode::FAILURE
+            }
         },
         BackupCmd::List => match list_backups(data_dir) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(e) => { eprintln!("error: list backups: {e}"); ExitCode::FAILURE }
+            Err(e) => {
+                eprintln!("error: list backups: {e}");
+                ExitCode::FAILURE
+            }
         },
     }
 }
@@ -108,25 +114,42 @@ pub fn run_restore(data_dir: &Path, cmd: &RestoreCmd) -> ExitCode {
     let RestoreCmd::Restore { input, db } = cmd;
     match do_restore(data_dir, input, db.as_deref()) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(e) => { eprintln!("error: restore: {e}"); ExitCode::FAILURE }
+        Err(e) => {
+            eprintln!("error: restore: {e}");
+            ExitCode::FAILURE
+        }
     }
 }
 
 pub fn run_snapshot(data_dir: &Path, cmd: &SnapshotCmd) -> ExitCode {
     match cmd {
-        SnapshotCmd::Create { db, output, compact } => {
-            match do_snapshot(data_dir, db, output.as_deref(), *compact) {
-                Ok(p) => { println!("✓ snapshot: {}", p.display()); ExitCode::SUCCESS }
-                Err(e) => { eprintln!("error: snapshot: {e}"); ExitCode::FAILURE }
+        SnapshotCmd::Create {
+            db,
+            output,
+            compact,
+        } => match do_snapshot(data_dir, db, output.as_deref(), *compact) {
+            Ok(p) => {
+                println!("✓ snapshot: {}", p.display());
+                ExitCode::SUCCESS
             }
-        }
+            Err(e) => {
+                eprintln!("error: snapshot: {e}");
+                ExitCode::FAILURE
+            }
+        },
         SnapshotCmd::List => match list_snapshots(data_dir) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(e) => { eprintln!("error: list snapshots: {e}"); ExitCode::FAILURE }
+            Err(e) => {
+                eprintln!("error: list snapshots: {e}");
+                ExitCode::FAILURE
+            }
         },
         SnapshotCmd::Delete { name } => match delete_snapshot(data_dir, name) {
             Ok(()) => ExitCode::SUCCESS,
-            Err(e) => { eprintln!("error: delete snapshot: {e}"); ExitCode::FAILURE }
+            Err(e) => {
+                eprintln!("error: delete snapshot: {e}");
+                ExitCode::FAILURE
+            }
         },
     }
 }
@@ -136,8 +159,7 @@ pub fn run_snapshot(data_dir: &Path, cmd: &SnapshotCmd) -> ExitCode {
 fn do_backup(data_dir: &Path, output: &Path, db: Option<&str>) -> Result<(), String> {
     refuse_if_engine_running(data_dir)?;
 
-    let f = fs::File::create(output)
-        .map_err(|e| format!("create {}: {e}", output.display()))?;
+    let f = fs::File::create(output).map_err(|e| format!("create {}: {e}", output.display()))?;
     let gz = GzEncoder::new(f, Compression::default());
     let mut tar = tar::Builder::new(gz);
     tar.follow_symlinks(false);
@@ -145,7 +167,10 @@ fn do_backup(data_dir: &Path, output: &Path, db: Option<&str>) -> Result<(), Str
     if let Some(name) = db {
         let dir = data_dir.join("db").join(name);
         if !dir.is_dir() {
-            return Err(format!("database not found: {name} (looked at {})", dir.display()));
+            return Err(format!(
+                "database not found: {name} (looked at {})",
+                dir.display()
+            ));
         }
         // We pack as `db/<name>/...` so the archive can be untarred at the
         // data-dir root and land back where it came from.
@@ -182,14 +207,12 @@ fn do_backup(data_dir: &Path, output: &Path, db: Option<&str>) -> Result<(), Str
 
 fn do_restore(data_dir: &Path, input: &Path, only_db: Option<&str>) -> Result<(), String> {
     refuse_if_engine_running(data_dir)?;
-    fs::create_dir_all(data_dir)
-        .map_err(|e| format!("create {}: {e}", data_dir.display()))?;
+    fs::create_dir_all(data_dir).map_err(|e| format!("create {}: {e}", data_dir.display()))?;
 
     // Two input shapes:
     //   - .tar.gz / .tgz                → unpack (with optional --db filter)
     //   - directory (a snapshot output) → copy db.toml + data/ into place
-    let meta = fs::metadata(input)
-        .map_err(|e| format!("stat {}: {e}", input.display()))?;
+    let meta = fs::metadata(input).map_err(|e| format!("stat {}: {e}", input.display()))?;
 
     if meta.is_dir() {
         // Snapshot dir restore — must have db.toml at root and a data/ subdir.
@@ -203,8 +226,8 @@ fn do_restore(data_dir: &Path, input: &Path, only_db: Option<&str>) -> Result<()
         }
         // Determine target name: the snapshot's db.toml carries it.
         let toml_text = fs::read_to_string(&db_toml).map_err(|e| e.to_string())?;
-        let parsed: toml::Value = toml::from_str(&toml_text)
-            .map_err(|e| format!("parse db.toml: {e}"))?;
+        let parsed: toml::Value =
+            toml::from_str(&toml_text).map_err(|e| format!("parse db.toml: {e}"))?;
         let name = parsed
             .get("name")
             .and_then(|v| v.as_str())
@@ -246,18 +269,14 @@ fn do_restore(data_dir: &Path, input: &Path, only_db: Option<&str>) -> Result<()
         }
         let dest = data_dir.join(&path);
         if let Some(parent) = dest.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
-        entry.unpack(&dest)
+        entry
+            .unpack(&dest)
             .map_err(|e| format!("unpack {}: {e}", path.display()))?;
     }
 
-    println!(
-        "✓ restored {} → {}",
-        input.display(),
-        data_dir.display()
-    );
+    println!("✓ restored {} → {}", input.display(), data_dir.display());
     Ok(())
 }
 
@@ -269,7 +288,10 @@ fn do_snapshot(
 ) -> Result<PathBuf, String> {
     let src_data = data_dir.join("db").join(db).join("data");
     if !src_data.is_dir() {
-        return Err(format!("database not found: {db} (looked at {})", src_data.display()));
+        return Err(format!(
+            "database not found: {db} (looked at {})",
+            src_data.display()
+        ));
     }
     let src_toml = data_dir.join("db").join(db).join("db.toml");
     if !src_toml.is_file() {
@@ -279,7 +301,9 @@ fn do_snapshot(
     // Default output: $ROOT/snapshots/<db>-<ts>/
     let out_dir = match output {
         Some(p) => p.to_path_buf(),
-        None => data_dir.join("snapshots").join(format!("{db}-{}", now_secs())),
+        None => data_dir
+            .join("snapshots")
+            .join(format!("{db}-{}", now_secs())),
     };
     if out_dir.exists() {
         return Err(format!("output already exists: {}", out_dir.display()));
@@ -291,8 +315,8 @@ fn do_snapshot(
     // Read the source DbConfig to pick the right map size for the
     // snapshot env we're about to open.
     let cfg_text = fs::read_to_string(&src_toml).map_err(|e| e.to_string())?;
-    let parsed: toml::Value = toml::from_str(&cfg_text)
-        .map_err(|e| format!("parse db.toml: {e}"))?;
+    let parsed: toml::Value =
+        toml::from_str(&cfg_text).map_err(|e| format!("parse db.toml: {e}"))?;
     let map_size_mb = parsed
         .get("map_size_mb")
         .and_then(|v| v.as_integer())
@@ -310,7 +334,11 @@ fn do_snapshot(
     };
 
     // Live consistent copy.
-    let opt = if compact { CompactionOption::Enabled } else { CompactionOption::Disabled };
+    let opt = if compact {
+        CompactionOption::Enabled
+    } else {
+        CompactionOption::Disabled
+    };
     let dst_file = out_data.join("data.mdb");
     let _file = env
         .copy_to_file(&dst_file, opt)
@@ -318,8 +346,7 @@ fn do_snapshot(
 
     // Side-by-side: keep a copy of db.toml so the snapshot is restorable
     // without the original data dir.
-    fs::copy(&src_toml, out_dir.join("db.toml"))
-        .map_err(|e| format!("copy db.toml: {e}"))?;
+    fs::copy(&src_toml, out_dir.join("db.toml")).map_err(|e| format!("copy db.toml: {e}"))?;
 
     Ok(out_dir)
 }
@@ -403,8 +430,7 @@ fn delete_snapshot(data_dir: &Path, name: &str) -> Result<(), String> {
     if !target.exists() {
         return Err(format!("snapshot not found: {}", target.display()));
     }
-    fs::remove_dir_all(&target)
-        .map_err(|e| format!("remove {}: {e}", target.display()))?;
+    fs::remove_dir_all(&target).map_err(|e| format!("remove {}: {e}", target.display()))?;
     println!("✓ deleted {}", target.display());
     Ok(())
 }
@@ -456,10 +482,15 @@ fn dir_size(p: &Path) -> Result<u64, String> {
 }
 
 fn fmt_bytes(n: u64) -> String {
-    if n >= 1 << 30 { format!("{:.1} GB", n as f64 / (1u64 << 30) as f64) }
-    else if n >= 1 << 20 { format!("{:.1} MB", n as f64 / (1u64 << 20) as f64) }
-    else if n >= 1 << 10 { format!("{:.1} KB", n as f64 / (1u64 << 10) as f64) }
-    else { format!("{n} B") }
+    if n >= 1 << 30 {
+        format!("{:.1} GB", n as f64 / (1u64 << 30) as f64)
+    } else if n >= 1 << 20 {
+        format!("{:.1} MB", n as f64 / (1u64 << 20) as f64)
+    } else if n >= 1 << 10 {
+        format!("{:.1} KB", n as f64 / (1u64 << 10) as f64)
+    } else {
+        format!("{n} B")
+    }
 }
 
 fn now_secs() -> u64 {

@@ -14,7 +14,7 @@ use rand_distr::StandardNormal;
 use heather_db::merge::knn_merge;
 use heather_db::read;
 use heather_db::vec_ops;
-use heather_db::{HardLocation, LocationId, EAMConfig};
+use heather_db::{EAMConfig, HardLocation, LocationId};
 
 use crate::error::{AlgebraError, Result};
 use crate::snapshot::EAMSnapshot;
@@ -130,11 +130,7 @@ pub struct ComposeResult {
 /// 3. Builds C's locations at those attractors using confidence-weighted reads
 /// 4. Consolidates via annealed dreaming
 /// 5. Validates the result via fingerprints
-pub fn compose(
-    a: &EAMSnapshot,
-    b: &EAMSnapshot,
-    params: &ComposeParams,
-) -> Result<ComposeResult> {
+pub fn compose(a: &EAMSnapshot, b: &EAMSnapshot, params: &ComposeParams) -> Result<ComposeResult> {
     if a.dim() != b.dim() {
         return Err(AlgebraError::DimensionMismatch {
             left: a.dim(),
@@ -158,11 +154,7 @@ pub fn compose(
     let randoms = random_probes(a.dim(), params.num_random_probes, &mut rng);
     let random_count = randoms.len();
 
-    let all_probes: Vec<Vec<f64>> = boundary
-        .into_iter()
-        .chain(parents)
-        .chain(randoms)
-        .collect();
+    let all_probes: Vec<Vec<f64>> = boundary.into_iter().chain(parents).chain(randoms).collect();
 
     let raw_attractors: Vec<Vec<f64>> = all_probes
         .iter()
@@ -228,8 +220,8 @@ pub fn compose(
             let naive_mid: Vec<f64> = fa.iter().zip(fb.iter()).map(|(a, b)| a + b).collect();
             let naive_mid = vec_ops::normalize(&naive_mid);
             let sim_naive = vec_ops::cosine_similarity(fc, &naive_mid);
-            let re_read = read::hopfield_iter(fc, &c.locations, &c.config)
-                .unwrap_or_else(|_| fc.clone());
+            let re_read =
+                read::hopfield_iter(fc, &c.locations, &c.config).unwrap_or_else(|_| fc.clone());
             let stability = vec_ops::cosine_similarity(fc, &re_read);
             (sim_a, sim_b, sim_naive, stability)
         }
@@ -381,7 +373,10 @@ fn read_with_confidence(
     let confidence = sims.first().copied().unwrap_or(0.0);
 
     let weights = vec_ops::softmax(&sims, beta);
-    let patterns: Vec<Vec<f64>> = indices.iter().map(|&i| locations[i].unit_pattern()).collect();
+    let patterns: Vec<Vec<f64>> = indices
+        .iter()
+        .map(|&i| locations[i].unit_pattern())
+        .collect();
     let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
     let recon = vec_ops::weighted_sum(&pattern_refs, &weights);
 
@@ -733,8 +728,9 @@ mod tests {
         let attractor = combined_descent(&start, &a.locations, &b.locations, &params);
 
         // Should be near normalize([1, 1, 0, ...])
-        let expected = vec_ops::normalize(&[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
-                                            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        let expected = vec_ops::normalize(&[
+            1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ]);
         let sim = vec_ops::cosine_similarity(&attractor, &expected);
         assert!(
             sim > 0.9,
@@ -761,7 +757,11 @@ mod tests {
             .collect();
 
         let unique = deduplicate_attractors(&attractors, 0.95);
-        assert_eq!(unique.len(), 1, "100 near-identical attractors should collapse to 1");
+        assert_eq!(
+            unique.len(),
+            1,
+            "100 near-identical attractors should collapse to 1"
+        );
     }
 
     // --- Test 4: read_with_confidence ---
@@ -944,7 +944,10 @@ mod tests {
     #[test]
     fn test_error_empty_snapshot() {
         let a = make_snapshot(vec![], 3);
-        let b = make_snapshot(vec![make_loc(0, &[1.0, 0.0, 0.0], &[1.0, 0.0, 0.0], 1.0)], 3);
+        let b = make_snapshot(
+            vec![make_loc(0, &[1.0, 0.0, 0.0], &[1.0, 0.0, 0.0], 1.0)],
+            3,
+        );
         let params = ComposeParams::default();
 
         assert!(compose(&a, &b, &params).is_err());
@@ -953,7 +956,10 @@ mod tests {
 
     #[test]
     fn test_error_dimension_mismatch() {
-        let a = make_snapshot(vec![make_loc(0, &[1.0, 0.0, 0.0], &[1.0, 0.0, 0.0], 1.0)], 3);
+        let a = make_snapshot(
+            vec![make_loc(0, &[1.0, 0.0, 0.0], &[1.0, 0.0, 0.0], 1.0)],
+            3,
+        );
         let b = make_snapshot(vec![make_loc(0, &[1.0, 0.0], &[1.0, 0.0], 1.0)], 2);
         let params = ComposeParams::default();
 

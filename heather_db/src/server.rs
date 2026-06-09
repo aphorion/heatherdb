@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::config::EAMConfig;
-use crate::db_config::{validate_db_name, DbConfig};
+use crate::db_config::{DbConfig, validate_db_name};
 use crate::error::{HeatherError, Result};
 use crate::hive::Hive;
 
@@ -91,9 +91,8 @@ impl Server {
         // (Pre-open keeps the first request to each DB fast and surfaces
         // any disk-corruption error at boot rather than on the request path.)
         let db_root = server.db_root();
-        std::fs::create_dir_all(&db_root).map_err(|e| {
-            HeatherError::Storage(format!("create {}: {e}", db_root.display()))
-        })?;
+        std::fs::create_dir_all(&db_root)
+            .map_err(|e| HeatherError::Storage(format!("create {}: {e}", db_root.display())))?;
 
         for entry in std::fs::read_dir(&db_root)
             .map_err(|e| HeatherError::Storage(format!("read {}: {e}", db_root.display())))?
@@ -193,9 +192,8 @@ impl Server {
 
         let dir = self.database_path(&cfg.name);
         let data_dir = dir.join("data");
-        std::fs::create_dir_all(&data_dir).map_err(|e| {
-            HeatherError::Storage(format!("create {}: {e}", data_dir.display()))
-        })?;
+        std::fs::create_dir_all(&data_dir)
+            .map_err(|e| HeatherError::Storage(format!("create {}: {e}", data_dir.display())))?;
 
         let cfg_path = dir.join("db.toml");
         cfg.save(&cfg_path)?;
@@ -248,9 +246,8 @@ impl Server {
             return Ok(true);
         }
         let trash_root = self.root.join("_trash");
-        std::fs::create_dir_all(&trash_root).map_err(|e| {
-            HeatherError::Storage(format!("create {}: {e}", trash_root.display()))
-        })?;
+        std::fs::create_dir_all(&trash_root)
+            .map_err(|e| HeatherError::Storage(format!("create {}: {e}", trash_root.display())))?;
         let trashed = trash_root.join(format!("{name}-{}", now_secs()));
         std::fs::rename(&dir, &trashed).map_err(|e| {
             HeatherError::Storage(format!(
@@ -278,9 +275,8 @@ impl Server {
 /// Open a `Hive` for a given DbConfig at `$root/db/<name>/data/`.
 fn open_hive_for(root: &Path, cfg: &DbConfig) -> Result<Hive> {
     let data_dir = root.join("db").join(&cfg.name).join("data");
-    std::fs::create_dir_all(&data_dir).map_err(|e| {
-        HeatherError::Storage(format!("create {}: {e}", data_dir.display()))
-    })?;
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| HeatherError::Storage(format!("create {}: {e}", data_dir.display())))?;
     Hive::open(&data_dir, cfg.eam.clone(), cfg.map_size_mb)
 }
 

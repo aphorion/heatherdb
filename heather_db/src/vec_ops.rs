@@ -39,7 +39,10 @@ pub fn softmax(values: &[f64], beta: f64) -> Vec<f64> {
         return vec![];
     }
     let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let exps: Vec<f64> = values.iter().map(|v| ((v - max_val) * beta).exp()).collect();
+    let exps: Vec<f64> = values
+        .iter()
+        .map(|v| ((v - max_val) * beta).exp())
+        .collect();
     let sum: f64 = exps.iter().sum();
     exps.iter().map(|e| e / sum).collect()
 }
@@ -71,9 +74,9 @@ pub fn add_scaled(a: &mut [f64], b: &[f64], scale: f64) {
 pub fn validate_vector(v: &[f64]) -> Result<()> {
     for (i, &val) in v.iter().enumerate() {
         if !val.is_finite() {
-            return Err(HeatherError::InvalidInput(
-                format!("element at index {i} is not finite: {val}"),
-            ));
+            return Err(HeatherError::InvalidInput(format!(
+                "element at index {i} is not finite: {val}"
+            )));
         }
     }
     Ok(())

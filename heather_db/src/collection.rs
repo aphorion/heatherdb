@@ -81,7 +81,8 @@ impl EAMInner {
     /// Append addresses for newly added locations.
     pub(crate) fn append_addresses(&mut self, start_idx: usize) {
         for i in start_idx..self.locations.len() {
-            self.address_matrix.extend_from_slice(&self.locations[i].address);
+            self.address_matrix
+                .extend_from_slice(&self.locations[i].address);
         }
     }
 
@@ -135,12 +136,7 @@ impl Collection {
             "next_id",
             &bincode::serialize(&next_id)?,
         )?;
-        store.put_metadata(
-            &mut txn,
-            collection_id,
-            "eta",
-            &bincode::serialize(&eta)?,
-        )?;
+        store.put_metadata(&mut txn, collection_id, "eta", &bincode::serialize(&eta)?)?;
         store.put_metadata(
             &mut txn,
             collection_id,
@@ -290,8 +286,7 @@ impl Collection {
         }
 
         for loc in &new_locs {
-            self.store
-                .put_location(&mut txn, self.collection_id, loc)?;
+            self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
 
         self.store.put_metadata(
@@ -397,8 +392,7 @@ impl Collection {
         }
 
         for loc in &all_new_locs {
-            self.store
-                .put_location(&mut txn, self.collection_id, loc)?;
+            self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
 
         self.store.put_metadata(
@@ -488,20 +482,26 @@ impl Collection {
             // Migrate posting lists: removed → survivor
             for &(removed_id, survivor_id) in &result.merge_map {
                 let removed_docs = self.store.get_doc_ids_for_location_txn(
-                    &txn, self.collection_id, removed_id,
+                    &txn,
+                    self.collection_id,
+                    removed_id,
                 )?;
                 if !removed_docs.is_empty() {
                     let mut survivor_docs = self.store.get_doc_ids_for_location_txn(
-                        &txn, self.collection_id, survivor_id,
+                        &txn,
+                        self.collection_id,
+                        survivor_id,
                     )?;
                     survivor_docs.extend(removed_docs);
                     self.store.put_doc_index_entry(
-                        &mut txn, self.collection_id, survivor_id, &survivor_docs,
+                        &mut txn,
+                        self.collection_id,
+                        survivor_id,
+                        &survivor_docs,
                     )?;
                 }
-                self.store.delete_doc_index_entry(
-                    &mut txn, self.collection_id, removed_id,
-                )?;
+                self.store
+                    .delete_doc_index_entry(&mut txn, self.collection_id, removed_id)?;
             }
 
             for &id in &result.removed_ids {
@@ -525,8 +525,7 @@ impl Collection {
 
         let mut txn = self.store.write_txn()?;
         for loc in &inner.locations {
-            self.store
-                .put_location(&mut txn, self.collection_id, loc)?;
+            self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
         self.store.put_metadata(
             &mut txn,
@@ -604,8 +603,7 @@ impl Collection {
                 .put_location(&mut txn, self.collection_id, &inner.locations[idx])?;
         }
         for loc in &new_locs {
-            self.store
-                .put_location(&mut txn, self.collection_id, loc)?;
+            self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
 
         // Persist document (vector + metadata)
@@ -713,14 +711,19 @@ impl Collection {
         let rtxn = self.store.read_txn()?;
         for &idx in &indices {
             let loc_id = inner.locations[idx].id.0;
-            let doc_ids = self.store.get_doc_ids_for_location_txn(&rtxn, self.collection_id, loc_id)?;
+            let doc_ids =
+                self.store
+                    .get_doc_ids_for_location_txn(&rtxn, self.collection_id, loc_id)?;
             candidate_ids.extend(doc_ids);
         }
 
         // Step 3: Fetch candidates and compute exact cosine similarity
         let mut scored: Vec<(u64, f64, Vec<u8>)> = Vec::with_capacity(candidate_ids.len());
         for doc_id in candidate_ids {
-            if let Some(data) = self.store.get_document_txn(&rtxn, self.collection_id, doc_id)? {
+            if let Some(data) = self
+                .store
+                .get_document_txn(&rtxn, self.collection_id, doc_id)?
+            {
                 let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
                 let sim = vec_ops::cosine_similarity(query, &vec);
                 scored.push((doc_id, sim, meta));
@@ -849,11 +852,7 @@ impl Collection {
     /// Replace this collection's in-memory EAM state from a snapshot.
     /// Flushes the new state to persistent storage atomically.
     /// Resets next_id to max(location_ids) + 1.
-    pub fn load_snapshot(
-        &self,
-        locations: Vec<HardLocation>,
-        config: EAMConfig,
-    ) -> Result<()> {
+    pub fn load_snapshot(&self, locations: Vec<HardLocation>, config: EAMConfig) -> Result<()> {
         config.validate()?;
 
         for loc in &locations {
@@ -883,8 +882,7 @@ impl Collection {
         }
 
         for loc in &locations {
-            self.store
-                .put_location(&mut txn, self.collection_id, loc)?;
+            self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
 
         self.store.put_metadata(
@@ -962,8 +960,7 @@ impl Collection {
                         .collect();
                     let alpha = vec_ops::softmax(&step_sims, inner.config.beta);
                     final_weights = alpha.clone();
-                    let pattern_refs: Vec<&[f64]> =
-                        patterns.iter().map(|p| p.as_slice()).collect();
+                    let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
                     let xi_new = vec_ops::normalize(&vec_ops::weighted_sum(&pattern_refs, &alpha));
                     let sim = vec_ops::cosine_similarity(&xi, &xi_new);
                     xi = xi_new;

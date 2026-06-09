@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 
+use heather_algebra::{EAMSnapshot, compose_read as algebra_compose_read, ops};
 use heather_db::{HardLocation, Hive, LocationId, ReadStrategy};
-use heather_algebra::{EAMSnapshot, ops, compose_read as algebra_compose_read};
 use rayon::prelude::*;
 
 use crate::models::*;
@@ -36,9 +36,7 @@ pub async fn create_collection(
     Json(req): Json<CreateCollectionRequest>,
 ) -> Response {
     let name = req.name.clone();
-    let already_exists = hive
-        .list_collections()
-        .map_or(false, |c| c.contains(&name));
+    let already_exists = hive.list_collections().map_or(false, |c| c.contains(&name));
 
     match hive.create_collection(&req.name) {
         Ok(_col) => Json(CreateCollectionResponse {
@@ -63,10 +61,7 @@ pub async fn list_collections(State(hive): State<AppState>) -> Response {
     }
 }
 
-pub async fn drop_collection(
-    State(hive): State<AppState>,
-    Path(name): Path<String>,
-) -> Response {
+pub async fn drop_collection(State(hive): State<AppState>, Path(name): Path<String>) -> Response {
     match hive.drop_collection(&name) {
         Ok(dropped) => Json(DropCollectionResponse { dropped }).into_response(),
         Err(e) => {
@@ -193,11 +188,7 @@ pub async fn bulk_load(
             }
             let mut loc = HardLocation::new(LocationId(i as u64), addr.clone());
             loc.counter = counter.clone();
-            loc.write_count = req
-                .write_counts
-                .as_ref()
-                .map(|wc| wc[i])
-                .unwrap_or(1.0);
+            loc.write_count = req.write_counts.as_ref().map(|wc| wc[i]).unwrap_or(1.0);
             locations.push(loc);
         }
 
@@ -261,10 +252,7 @@ pub async fn read(
     }
 }
 
-pub async fn stats(
-    State(hive): State<AppState>,
-    Path(name): Path<String>,
-) -> Response {
+pub async fn stats(State(hive): State<AppState>, Path(name): Path<String>) -> Response {
     let col = match hive.get_collection(&name) {
         Ok(Some(col)) => col,
         Ok(None) => {
@@ -295,10 +283,7 @@ pub async fn stats(
     }
 }
 
-pub async fn collection_config(
-    State(hive): State<AppState>,
-    Path(name): Path<String>,
-) -> Response {
+pub async fn collection_config(State(hive): State<AppState>, Path(name): Path<String>) -> Response {
     let col = match hive.get_collection(&name) {
         Ok(Some(col)) => col,
         Ok(None) => {
@@ -381,10 +366,7 @@ pub async fn locations(
     }
 }
 
-pub async fn fingerprint(
-    State(hive): State<AppState>,
-    Path(name): Path<String>,
-) -> Response {
+pub async fn fingerprint(State(hive): State<AppState>, Path(name): Path<String>) -> Response {
     let col = match hive.get_collection(&name) {
         Ok(Some(col)) => col,
         Ok(None) => {
@@ -549,10 +531,7 @@ pub async fn batch_analyze(
     }
 }
 
-pub async fn get_documents(
-    State(hive): State<AppState>,
-    Path(name): Path<String>,
-) -> Response {
+pub async fn get_documents(State(hive): State<AppState>, Path(name): Path<String>) -> Response {
     let col = match hive.get_collection(&name) {
         Ok(Some(col)) => col,
         Ok(None) => {
@@ -571,7 +550,9 @@ pub async fn get_documents(
             let documents: Vec<DocumentItem> = docs
                 .into_iter()
                 .filter_map(|(id, _vec, meta)| {
-                    serde_json::from_slice(&meta).ok().map(|metadata| DocumentItem { id, metadata })
+                    serde_json::from_slice(&meta)
+                        .ok()
+                        .map(|metadata| DocumentItem { id, metadata })
                 })
                 .collect();
             Json(DocumentsResponse { documents }).into_response()
@@ -602,9 +583,16 @@ pub async fn get_document(
         Ok(Ok(Some((_vec, meta)))) => {
             let metadata: serde_json::Value =
                 serde_json::from_slice(&meta).unwrap_or(serde_json::Value::Null);
-            Json(DocumentResponse { id: doc_id, metadata }).into_response()
+            Json(DocumentResponse {
+                id: doc_id,
+                metadata,
+            })
+            .into_response()
         }
-        Ok(Ok(None)) => error_response(StatusCode::NOT_FOUND, format!("document {doc_id} not found")),
+        Ok(Ok(None)) => error_response(
+            StatusCode::NOT_FOUND,
+            format!("document {doc_id} not found"),
+        ),
         Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
@@ -620,8 +608,7 @@ pub async fn query_documents(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
-    let result =
-        tokio::task::spawn_blocking(move || col.query_documents(&req.query, req.n)).await;
+    let result = tokio::task::spawn_blocking(move || col.query_documents(&req.query, req.n)).await;
 
     match result {
         Ok(Ok(results)) => {
@@ -630,7 +617,11 @@ pub async fn query_documents(
                 .filter_map(|(id, similarity, meta)| {
                     serde_json::from_slice(&meta)
                         .ok()
-                        .map(|metadata| QueryDocumentResult { id, similarity, metadata })
+                        .map(|metadata| QueryDocumentResult {
+                            id,
+                            similarity,
+                            metadata,
+                        })
                 })
                 .collect();
             Json(QueryDocumentsResponse { results }).into_response()
@@ -789,9 +780,8 @@ pub async fn algebra_bind(
     let result = tokio::task::spawn_blocking(move || {
         let snap_a = EAMSnapshot::from_collection(&col_a)?;
         let snap_b = EAMSnapshot::from_collection(&col_b)?;
-        let bound = heather_algebra::bind::bind_with_limit(
-            &snap_a, &snap_b, req.max_cross_k.unwrap_or(0)
-        )?;
+        let bound =
+            heather_algebra::bind::bind_with_limit(&snap_a, &snap_b, req.max_cross_k.unwrap_or(0))?;
         let num = bound.num_locations();
         bound.into_collection(&col_target)?;
         Ok::<_, heather_algebra::AlgebraError>(num)
@@ -801,7 +791,11 @@ pub async fn algebra_bind(
     match result {
         Ok(Ok(num_locations)) => {
             tracing::info!(target = %target_name, num_locations, "Algebra bind completed");
-            Json(AlgebraResponse { collection: target_name, num_locations }).into_response()
+            Json(AlgebraResponse {
+                collection: target_name,
+                num_locations,
+            })
+            .into_response()
         }
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -856,7 +850,11 @@ pub async fn algebra_unbind(
     match result {
         Ok(Ok(num_locations)) => {
             tracing::info!(target = %target_name, num_locations, "Algebra unbind completed");
-            Json(AlgebraResponse { collection: target_name, num_locations }).into_response()
+            Json(AlgebraResponse {
+                collection: target_name,
+                num_locations,
+            })
+            .into_response()
         }
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),

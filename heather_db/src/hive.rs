@@ -44,13 +44,19 @@ impl Hive {
     pub fn create_collection(&self, name: &str) -> Result<Arc<Collection>> {
         // Check in-memory cache first
         {
-            let cache = self.collections.read().map_err(|_| HeatherError::LockPoisoned)?;
+            let cache = self
+                .collections
+                .read()
+                .map_err(|_| HeatherError::LockPoisoned)?;
             if let Some(col) = cache.get(name) {
                 return Ok(col.clone());
             }
         }
 
-        let mut cache = self.collections.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut cache = self
+            .collections
+            .write()
+            .map_err(|_| HeatherError::LockPoisoned)?;
 
         // Double-check after acquiring write lock
         if let Some(col) = cache.get(name) {
@@ -70,10 +76,20 @@ impl Hive {
 
         let col = if existing_locations.is_empty() {
             // Brand new collection
-            Collection::new(collection_id, name.to_string(), self.store.clone(), &self.config)?
+            Collection::new(
+                collection_id,
+                name.to_string(),
+                self.store.clone(),
+                &self.config,
+            )?
         } else {
             // Exists on disk, load it
-            Collection::load(collection_id, name.to_string(), self.store.clone(), &self.config)?
+            Collection::load(
+                collection_id,
+                name.to_string(),
+                self.store.clone(),
+                &self.config,
+            )?
         };
 
         let col = Arc::new(col);
@@ -86,7 +102,10 @@ impl Hive {
     pub fn get_collection(&self, name: &str) -> Result<Option<Arc<Collection>>> {
         // Check in-memory cache
         {
-            let cache = self.collections.read().map_err(|_| HeatherError::LockPoisoned)?;
+            let cache = self
+                .collections
+                .read()
+                .map_err(|_| HeatherError::LockPoisoned)?;
             if let Some(col) = cache.get(name) {
                 return Ok(Some(col.clone()));
             }
@@ -99,7 +118,10 @@ impl Hive {
         };
 
         // Lazy load from disk
-        let mut cache = self.collections.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut cache = self
+            .collections
+            .write()
+            .map_err(|_| HeatherError::LockPoisoned)?;
 
         // Double-check
         if let Some(col) = cache.get(name) {
@@ -120,7 +142,10 @@ impl Hive {
     pub fn get_or_create_collection(&self, name: &str) -> Result<Arc<Collection>> {
         // Fast path: check in-memory cache with read lock
         {
-            let cache = self.collections.read().map_err(|_| HeatherError::LockPoisoned)?;
+            let cache = self
+                .collections
+                .read()
+                .map_err(|_| HeatherError::LockPoisoned)?;
             if let Some(col) = cache.get(name) {
                 return Ok(col.clone());
             }
@@ -139,11 +164,15 @@ impl Hive {
 
         // Remove from disk
         let mut txn = self.store.write_txn()?;
-        self.store.delete_collection(&mut txn, name, collection_id)?;
+        self.store
+            .delete_collection(&mut txn, name, collection_id)?;
         txn.commit()?;
 
         // Remove from memory
-        let mut cache = self.collections.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut cache = self
+            .collections
+            .write()
+            .map_err(|_| HeatherError::LockPoisoned)?;
         cache.remove(name);
 
         Ok(true)
