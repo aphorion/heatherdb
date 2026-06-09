@@ -259,6 +259,13 @@ fn compute_fingerprint(snap: &EAMSnapshot) -> Option<Vec<f64>> {
 
 #[test]
 fn compose_zone_reconstruction() {
+    // Pin rayon to a single thread so this seeded experiment is reproducible.
+    // compose()/knn_merge reduce floats in parallel, and the summation order
+    // is non-deterministic across threads — enough to wobble the Energy-vs-
+    // Pooled margin on zone Z across the assertion threshold run-to-run.
+    // Single-threaded reduction is deterministic. Set before the first rayon
+    // use (this is the only test in the binary, so there's no pool race).
+    unsafe { std::env::set_var("RAYON_NUM_THREADS", "1") };
     let mut rng = rand::rngs::StdRng::seed_from_u64(42);
 
     // --- Generate data ---
