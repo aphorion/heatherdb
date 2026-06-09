@@ -1,6 +1,7 @@
 mod auth;
 mod backup;
 mod cli;
+mod dream;
 mod models;
 mod routes;
 mod routes_db;
@@ -8,6 +9,7 @@ mod users;
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use axum::Router;
@@ -276,7 +278,8 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/db", get(routes_db::list_databases))
         .route("/db", post(routes_db::create_database))
         .route("/db/{db}", get(routes_db::get_database))
-        .route("/db/{db}", delete(routes_db::drop_database));
+        .route("/db/{db}", delete(routes_db::drop_database))
+        .route("/db/{db}/dream", post(dream::trigger));
 
     // Scoped /db/{db}/collections/... and /db/{db}/algebra/...
     let db_scoped_router = Router::new()
@@ -337,12 +340,19 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/db/{db}/algebra/unbind", post(routes_db::algebra_unbind))
         .route("/db/{db}/compose/read", post(routes_db::compose_read));
 
+    // Last-activity clock for idle detection, stamped by every request.
+    let last_activity = Arc::new(AtomicU64::new(dream::now_ms()));
+
     let app = Router::new()
         .route("/health", get(routes::health))
         .merge(legacy_router)
         .merge(db_admin_router)
         .merge(db_scoped_router)
         .layer(middleware::from_fn_with_state(auth_state, auth::middleware))
+        .layer(middleware::from_fn_with_state(
+            last_activity.clone(),
+            dream::stamp_activity,
+        ))
         .layer(Extension(server.clone()))
         .layer(
             ServiceBuilder::new()
@@ -371,6 +381,9 @@ async fn serve(args: Args) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+
+    // Idle-time dreaming: reprocess each opted-in database's memory while quiet.
+    tokio::spawn(dream::run_dream_loop(server.clone(), last_activity.clone()));
 
     if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

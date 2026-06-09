@@ -33,10 +33,63 @@ pub struct DbConfig {
     /// LMDB map size ceiling for this database's env.
     #[serde(default = "default_map_size")]
     pub map_size_mb: usize,
+
+    /// Idle-time consolidation ("dreaming"). Default: disabled — a database
+    /// dreams only when an operator opts it in via `db.toml`.
+    #[serde(default)]
+    pub dream: DreamConfig,
 }
 
 fn default_map_size() -> usize {
     DEFAULT_MAP_SIZE_MB
+}
+
+/// Settings for idle-time consolidation ("dreaming"). When `enabled`, the
+/// server's dream loop reprocesses a database's collections **in place** while
+/// it is idle: it replays each collection's stored attractors back through the
+/// EAM's own write rule (so attractors sharpen and novelty/overload splits
+/// reorganize), then merges to dedup and enforce capacity. No external input,
+/// no second collection — a collection simply wakes up better-organized.
+///
+/// `passes` > 1 extends this to multi-pass novelty organization: each
+/// successive pass operates at a coarser operand granularity (clusters of
+/// locations rather than single locations), growing higher-order structure
+/// alongside the fine attractors. Pass 0 (replay + merge) is the proven,
+/// safe default; coarser passes are the experimental frontier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DreamConfig {
+    /// Opt-in switch. Off by default.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Collections to dream over. Empty = every collection in the database.
+    #[serde(default)]
+    pub collections: Vec<String>,
+    /// Seconds of inactivity before a consolidation pass may run.
+    #[serde(default = "default_idle_secs")]
+    pub idle_secs: u64,
+    /// Granularity passes per dream. 1 = replay + merge only. >1 adds coarser
+    /// novelty-organization passes (experimental).
+    #[serde(default = "default_passes")]
+    pub passes: usize,
+}
+
+fn default_idle_secs() -> u64 {
+    60
+}
+
+fn default_passes() -> usize {
+    1
+}
+
+impl Default for DreamConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            collections: Vec::new(),
+            idle_secs: default_idle_secs(),
+            passes: default_passes(),
+        }
+    }
 }
 
 impl DbConfig {
@@ -50,6 +103,7 @@ impl DbConfig {
                 .unwrap_or(0),
             eam: EAMConfig::new(dimension)?,
             map_size_mb: DEFAULT_MAP_SIZE_MB,
+            dream: DreamConfig::default(),
         })
     }
 

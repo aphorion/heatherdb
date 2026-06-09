@@ -48,7 +48,7 @@ pub mod write;
 
 pub use collection::{Collection, EAMStats, LocationSummary, ReadStrategy};
 pub use config::EAMConfig;
-pub use db_config::{DEFAULT_MAP_SIZE_MB, DbConfig, validate_db_name};
+pub use db_config::{DEFAULT_MAP_SIZE_MB, DbConfig, DreamConfig, validate_db_name};
 pub use error::HeatherError;
 pub use hive::Hive;
 pub use location::{HardLocation, LocationId};
