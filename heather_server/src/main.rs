@@ -36,6 +36,14 @@ struct Args {
     #[arg(long, env = "HEATHER_DIMENSION", default_value = "128", global = true)]
     dimension: usize,
 
+    /// Initial hard-location count (`l_0`) for the auto-created `default`
+    /// database. 0 (the default) is data-seeded: hard locations are grown from
+    /// the first writes, never pre-seeded with random vectors. Ignored once
+    /// `default` exists on disk. Set a positive value to pre-seed a random
+    /// initial codebook.
+    #[arg(long, env = "HEATHER_L0", default_value = "0", global = true)]
+    l0: usize,
+
     /// Listen port
     #[arg(long, env = "HEATHER_PORT", default_value = "6380")]
     port: u16,
@@ -175,7 +183,8 @@ async fn serve(args: Args) -> std::process::ExitCode {
 
     // Open the multi-tenant server. On a fresh boot this lazily creates
     // the `default` database with the dimension we pass here.
-    let server = Server::open(&data_dir, args.dimension).expect("failed to open server");
+    let server =
+        Server::open_with(&data_dir, args.dimension, args.l0).expect("failed to open server");
 
     let databases = server.databases().unwrap_or_default();
     tracing::info!(
