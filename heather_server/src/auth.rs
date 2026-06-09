@@ -29,28 +29,44 @@ use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
 use crate::models::ErrorResponse;
-use crate::users::{Scope, UserStore, is_authorized};
+use crate::tokens::{AuthKind, Tokens};
+use crate::users::{Scope, User, UserStore, is_authorized};
 
 /// What the auth middleware needs at runtime. Cheap to clone (`Arc`s).
 #[derive(Clone)]
 pub struct AuthState {
     pub users: Arc<UserStore>,
+    /// Session-token store. `None` only when auth is disabled.
+    pub tokens: Option<Arc<Tokens>>,
     pub disabled: bool,
 }
 
 impl AuthState {
-    pub fn enabled(users: Arc<UserStore>) -> Self {
+    pub fn enabled(users: Arc<UserStore>, tokens: Arc<Tokens>) -> Self {
         Self {
             users,
+            tokens: Some(tokens),
             disabled: false,
         }
     }
     pub fn disabled(users: Arc<UserStore>) -> Self {
         Self {
             users,
+            tokens: None,
             disabled: true,
         }
     }
+}
+
+/// Identity resolved by the middleware and attached to the request. Handlers
+/// (the token endpoints) read this to know who is calling and how.
+#[derive(Clone)]
+pub struct AuthedUser {
+    pub user: User,
+    pub kind: AuthKind,
+    /// The bearer token presented, if `kind == Bearer` — lets a client revoke
+    /// the very token it is authenticating with.
+    pub token: Option<String>,
 }
 
 /// Routes that always pass without a credential check.
@@ -70,25 +86,36 @@ pub async fn middleware(State(auth): State<AuthState>, req: Request<Body>, next:
         return next.run(req).await;
     }
 
-    // Parse the Authorization header.
     let header_val = req
         .headers()
         .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string());
 
-    let creds = match header_val.and_then(parse_basic) {
-        Some(c) => c,
-        None => return deny_401("missing or malformed Authorization header"),
+    // Bearer (session token) skips the ~11ms Argon2 verify; Basic
+    // (user:password) pays it. Either resolves to a `User` + how they authed.
+    let (user, kind, token) = match header_val.as_deref() {
+        Some(h) if h.starts_with("Bearer ") => {
+            let tok = h["Bearer ".len()..].trim().to_string();
+            match auth.tokens.as_ref().and_then(|t| t.verify(&tok)) {
+                Some((u, _exp)) => (u, AuthKind::Bearer, Some(tok)),
+                None => return deny_401("invalid or expired bearer token"),
+            }
+        }
+        Some(h) if h.starts_with("Basic ") => match parse_basic(h) {
+            Some(c) => match auth.users.verify(&c.user, &c.password) {
+                Some(u) => (u, AuthKind::Basic, None),
+                None => return deny_401("invalid credentials"),
+            },
+            None => return deny_401("malformed Basic credentials"),
+        },
+        _ => return deny_401("missing or malformed Authorization header"),
     };
 
-    // Verify the credentials.
-    let user = match auth.users.verify(&creds.user, &creds.password) {
-        Some(u) => u,
-        None => return deny_401("invalid credentials"),
-    };
-
-    // Check scope vs route.
-    if !is_authorized(&user.scope, &path) {
+    // `/auth/*` are identity operations (mint/revoke the caller's own token) —
+    // any authenticated user may use them regardless of data scope. Every
+    // other route checks the user's scope against the path.
+    if !path.starts_with("/auth/") && !is_authorized(&user.scope, &path) {
         return deny_403(&format!(
             "user '{}' (scope {}) is not authorised for {}",
             user.name,
@@ -97,6 +124,8 @@ pub async fn middleware(State(auth): State<AuthState>, req: Request<Body>, next:
         ));
     }
 
+    let mut req = req;
+    req.extensions_mut().insert(AuthedUser { user, kind, token });
     next.run(req).await
 }
 

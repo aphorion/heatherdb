@@ -5,6 +5,7 @@ mod dream;
 mod models;
 mod routes;
 mod routes_db;
+mod tokens;
 mod users;
 
 use std::path::PathBuf;
@@ -209,6 +210,15 @@ async fn serve(args: Args) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    // Session-token store (shares the system LMDB env with the user store).
+    let tokens = match tokens::Tokens::load(&data_dir) {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            eprintln!("error: load token store: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+
     let auth_state = if args.auth_disabled {
         tracing::warn!(
             "Auth: DISABLED (HEATHER_AUTH_DISABLED=1). Anyone who can reach \
@@ -233,7 +243,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
             store = %user_store.path().display(),
             "Auth: HTTP Basic enabled"
         );
-        auth::AuthState::enabled(user_store.clone())
+        auth::AuthState::enabled(user_store.clone(), tokens.clone())
     };
 
     // Legacy default-DB router — every existing /collections/... and
@@ -340,6 +350,11 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/db/{db}/algebra/unbind", post(routes_db::algebra_unbind))
         .route("/db/{db}/compose/read", post(routes_db::compose_read));
 
+    // Session-token endpoints: mint (Basic-auth only) + revoke.
+    let auth_router = Router::new()
+        .route("/auth/token", post(tokens::mint))
+        .route("/auth/token/revoke", post(tokens::revoke));
+
     // Last-activity clock for idle detection, stamped by every request.
     let last_activity = Arc::new(AtomicU64::new(dream::now_ms()));
 
@@ -348,7 +363,9 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .merge(legacy_router)
         .merge(db_admin_router)
         .merge(db_scoped_router)
+        .merge(auth_router)
         .layer(middleware::from_fn_with_state(auth_state, auth::middleware))
+        .layer(Extension(tokens.clone()))
         .layer(middleware::from_fn_with_state(
             last_activity.clone(),
             dream::stamp_activity,
@@ -384,6 +401,21 @@ async fn serve(args: Args) -> std::process::ExitCode {
 
     // Idle-time dreaming: reprocess each opted-in database's memory while quiet.
     tokio::spawn(dream::run_dream_loop(server.clone(), last_activity.clone()));
+
+    // Sweep expired session tokens every 5 minutes.
+    {
+        let tokens = tokens.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(300));
+            loop {
+                tick.tick().await;
+                let swept = tokens.gc();
+                if swept > 0 {
+                    tracing::debug!(swept, "tokens: gc swept expired");
+                }
+            }
+        });
+    }
 
     if let Err(e) = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
