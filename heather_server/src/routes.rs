@@ -6,11 +6,45 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
-use heather_algebra::{EAMSnapshot, compose_read as algebra_compose_read, ops};
+use heather_algebra::{
+    EAMSnapshot, bind_vec, compose_read as algebra_compose_read, ops, unbind_vec,
+};
 use heather_db::{HardLocation, Hive, LocationId, ReadStrategy};
 use rayon::prelude::*;
 
 use crate::models::*;
+
+/// `POST /vec/bind` — circular-convolution bind of two raw vectors.
+pub async fn vec_bind(Json(req): Json<VecPairRequest>) -> Response {
+    if req.a.len() != req.b.len() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "a and b must have equal length" })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "result": bind_vec(&req.a, &req.b) })),
+    )
+        .into_response()
+}
+
+/// `POST /vec/unbind` — circular-correlation unbind (approximate inverse).
+pub async fn vec_unbind(Json(req): Json<VecPairRequest>) -> Response {
+    if req.a.len() != req.b.len() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "a and b must have equal length" })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "result": unbind_vec(&req.a, &req.b) })),
+    )
+        .into_response()
+}
 
 pub type AppState = Arc<Hive>;
 

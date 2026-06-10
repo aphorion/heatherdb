@@ -4,6 +4,13 @@ use serde::{Deserialize, Serialize};
 
 // --- Requests ---
 
+/// Two raw vectors for a single-vector algebra op (`/vec/bind`, `/vec/unbind`).
+#[derive(Debug, Deserialize)]
+pub struct VecPairRequest {
+    pub a: Vec<f64>,
+    pub b: Vec<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WriteRequest {
     pub vectors: Vec<Vec<f64>>,
