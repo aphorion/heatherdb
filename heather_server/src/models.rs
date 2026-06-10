@@ -11,6 +11,15 @@ pub struct VecPairRequest {
     pub b: Vec<f64>,
 }
 
+/// Knobs for description-length-minimising compression (both optional).
+#[derive(Debug, Default, Deserialize)]
+pub struct CompressRequest {
+    /// Model cost per location (bits). Default: the dimension.
+    pub kappa: Option<f64>,
+    /// Weight on the data-fit (variance) cost of a merge. Default 1.0.
+    pub lambda: Option<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WriteRequest {
     pub vectors: Vec<Vec<f64>>,
