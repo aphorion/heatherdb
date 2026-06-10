@@ -1158,6 +1158,7 @@ mod tests {
         let opts = crate::write::WriteOpts {
             gate: true,
             tau_cohere: 0.2,
+            ..Default::default()
         };
 
         col.write_two(&context, &law_x, opts).unwrap();
@@ -1195,6 +1196,7 @@ mod tests {
         let opts = crate::write::WriteOpts {
             gate: false,
             tau_cohere: 0.2,
+            ..Default::default()
         };
 
         col.write_two(&context, &law_x, opts).unwrap();
