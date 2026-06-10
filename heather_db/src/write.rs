@@ -200,8 +200,19 @@ pub fn adaptive_write_two(
             vec_ops::add_scaled(&mut loc.counter, counter, w);
             loc.write_count += w;
 
-            // Address migration: winner at η_eff, neighbors at 10%
-            let lr = if is_winner { eta_winner } else { eta_neighbor };
+            // Address migration. Legacy: winner at η_eff, neighbors at 10%.
+            // Gated: a running MEAN of the routing vectors (lr = 1/n) so a
+            // family's address converges to its context prototype with the
+            // per-member content averaged out — without that, the prototype
+            // stays stuck near the first member and higher rungs can't group
+            // same-law families.
+            let lr = if opts.gate {
+                1.0 / loc.write_count
+            } else if is_winner {
+                eta_winner
+            } else {
+                eta_neighbor
+            };
             let diff: Vec<f64> = address
                 .iter()
                 .zip(loc.address.iter())
