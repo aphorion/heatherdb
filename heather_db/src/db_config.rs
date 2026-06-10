@@ -86,6 +86,10 @@ pub struct DreamConfig {
     /// rather than spawn a new one (the gate threshold).
     #[serde(default = "default_tau_cohere")]
     pub tau_cohere: f64,
+    /// Ladder mode only: minimum address similarity for a candidate family
+    /// (scopes each rung to its own level of the hierarchy).
+    #[serde(default = "default_dream_tau_split")]
+    pub tau_split: f64,
 }
 
 /// What a dream pass does to a collection.
@@ -108,7 +112,11 @@ fn default_passes() -> usize {
 }
 
 fn default_tau_cohere() -> f64 {
-    0.1
+    0.0
+}
+
+fn default_dream_tau_split() -> f64 {
+    0.0
 }
 
 impl Default for DreamConfig {
@@ -120,6 +128,7 @@ impl Default for DreamConfig {
             passes: default_passes(),
             mode: DreamMode::Replay,
             tau_cohere: default_tau_cohere(),
+            tau_split: default_dream_tau_split(),
         }
     }
 }

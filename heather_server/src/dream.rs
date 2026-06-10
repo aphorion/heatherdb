@@ -38,6 +38,12 @@ pub struct CollectionDream {
     pub locations_before: usize,
     pub locations_after: usize,
     pub merged: usize,
+    /// Ladder rungs only: the merge boundaries used (auto-calibrated when the
+    /// caller left them unset). 0.0 for replay passes.
+    #[serde(default)]
+    pub tau_split: f64,
+    #[serde(default)]
+    pub tau_cohere: f64,
 }
 
 /// Outcome of dreaming a whole database.
@@ -140,12 +146,92 @@ pub fn dream_collection(
         locations_before: before,
         locations_after: col.num_locations()?,
         merged: merged_total,
+        tau_split: 0.0,
+        tau_cohere: 0.0,
     })
 }
 
 /// Suffix marking a ladder level collection (`<base>__L1`, `__L2`, …). Skipped
 /// when selecting base collections so the ladder doesn't climb its own output.
 const LEVEL_SUFFIX: &str = "__L";
+
+/// Auto-calibrate a rung's merge boundary from its own inputs — no fixed
+/// threshold, so the ladder scales to any depth.
+///
+/// The items entering a rung have a layered similarity structure: a tight top
+/// mode (pairs identical at THIS level) and looser modes (pairs alike only at a
+/// coarser level). The right boundary is the first gap below the top mode — cut
+/// there and the rung peels off exactly its tightest tier, leaving the rest for
+/// higher rungs. We read it as the largest gap among the upper pairwise values.
+///
+/// Applied to two signals: address similarity (which contexts are candidates)
+/// and — the one that survives the address "grid", where an item is equally
+/// close to its level-mates and its parent's other children — relation
+/// coherence (which residuals are the SAME law). Coherence is the real
+/// discriminator; address only gathers candidates.
+fn top_gap_threshold(mut vals: Vec<f64>) -> f64 {
+    if vals.len() < 2 {
+        return 0.0;
+    }
+    vals.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    // Mean floors the search to the upper region, so we cut the gap that
+    // separates the top tier — not a gap deep in the noise.
+    let mean = vals.iter().sum::<f64>() / vals.len() as f64;
+    let mut best_gap = 0.0;
+    let mut tau = 0.0;
+    for w in vals.windows(2) {
+        let gap = w[0] - w[1];
+        if w[0] >= mean && gap > best_gap {
+            best_gap = gap;
+            tau = (w[0] + w[1]) * 0.5;
+        }
+    }
+    tau.max(0.0)
+}
+
+/// Otsu's threshold: the value that best splits a distribution into two modes
+/// (maximizes between-class variance). Used for the coherence gate, whose job
+/// is the binary question "same law or not" — so the cut belongs at the valley
+/// between the within-family mode and the cross-family mode, wherever that
+/// valley sits for this rung (low for noisy single-episode relations, high for
+/// clean consolidated ones). Self-scaling, no constant.
+fn otsu_threshold(mut vals: Vec<f64>) -> f64 {
+    let n = vals.len();
+    if n < 2 {
+        return 0.0;
+    }
+    vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let total: f64 = vals.iter().sum();
+    let mut sum_low = 0.0;
+    let mut best_var = -1.0;
+    let mut thresh = 0.0;
+    for k in 1..n {
+        sum_low += vals[k - 1];
+        let w0 = k as f64 / n as f64;
+        let w1 = 1.0 - w0;
+        let mu0 = sum_low / k as f64;
+        let mu1 = (total - sum_low) / (n - k) as f64;
+        let var = w0 * w1 * (mu0 - mu1).powi(2);
+        if var > best_var {
+            best_var = var;
+            thresh = (vals[k - 1] + vals[k]) * 0.5;
+        }
+    }
+    thresh
+}
+
+/// Pairwise cosine similarities among a set of vectors (upper triangle).
+fn pairwise_cos(vecs: &[Vec<f64>]) -> Vec<f64> {
+    let n = vecs.len();
+    let norm: Vec<Vec<f64>> = vecs.iter().map(|v| heather_db_normalize(v)).collect();
+    let mut out = Vec::with_capacity(n * (n - 1) / 2);
+    for i in 0..n {
+        for j in (i + 1)..n {
+            out.push(dot(&norm[i], &norm[j]));
+        }
+    }
+    out
+}
 
 /// One consolidation rung: read each `(address, counter)` location of `src`,
 /// strip the context with `unbind(counter, address)` to get the law it carries,
@@ -187,13 +273,63 @@ fn dream_ladder(
         }
         let dst_name = format!("{base}{LEVEL_SUFFIX}{}", k + 1);
         let dst = hive.get_or_create_collection(&dst_name)?;
-        consolidate_rung(&src, &dst, opts)?;
+        // Per-rung merge boundaries: auto-calibrated from this rung's own
+        // inputs (threshold <= 0), else the caller's fixed value. Both the
+        // address candidate scope and the coherence merge test read their cut
+        // from the gap in their own distribution, so the rung adapts to its
+        // level with no fixed constant.
+        let mut rung_opts = opts;
+        if opts.tau_split <= 0.0 || opts.tau_cohere <= 0.0 {
+            let (locs, _) = src.snapshot()?;
+            let addrs: Vec<Vec<f64>> = locs.iter().map(|l| heather_db_normalize(&l.address)).collect();
+            let rels: Vec<Vec<f64>> = locs
+                .iter()
+                .map(|l| heather_db_normalize(&unbind_vec(&l.counter, &l.address)))
+                .collect();
+            let n = locs.len();
+
+            // tau_split: peel the tightest ADDRESS tier (largest gap from the top).
+            if opts.tau_split <= 0.0 {
+                let mut asims = Vec::with_capacity(n * (n - 1) / 2);
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        asims.push(dot(&addrs[i], &addrs[j]));
+                    }
+                }
+                rung_opts.tau_split = top_gap_threshold(asims);
+            }
+            // tau_cohere: the same-law / not-same-law valley — but coherence is
+            // only meaningful among ADDRESS-candidate pairs (sim > tau_split),
+            // so the split is read from those, where it is cleanly bimodal at
+            // every level. (Falls back to all pairs if too few candidates.)
+            if opts.tau_cohere <= 0.0 {
+                let mut cohs = Vec::new();
+                for i in 0..n {
+                    for j in (i + 1)..n {
+                        if dot(&addrs[i], &addrs[j]) > rung_opts.tau_split {
+                            cohs.push(dot(&rels[i], &rels[j]));
+                        }
+                    }
+                }
+                if cohs.len() < 2 {
+                    cohs = pairwise_cos(&rels);
+                }
+                rung_opts.tau_cohere = otsu_threshold(cohs);
+            }
+            tracing::info!(
+                rung = k + 1, tau_split = rung_opts.tau_split,
+                tau_cohere = rung_opts.tau_cohere, "auto-calibrated rung"
+            );
+        }
+        consolidate_rung(&src, &dst, rung_opts)?;
         reports.push(CollectionDream {
             collection: dst_name.clone(),
             passes: k + 1,
             locations_before: before,
             locations_after: dst.num_locations()?,
             merged: 0,
+            tau_split: rung_opts.tau_split,
+            tau_cohere: rung_opts.tau_cohere,
         });
         src_name = dst_name;
     }
@@ -218,6 +354,7 @@ pub fn dream_database(
     let opts = WriteOpts {
         gate: true,
         tau_cohere: cfg.tau_cohere,
+                tau_split: cfg.tau_split,
     };
     let mut collections = Vec::new();
     for name in names {
@@ -280,6 +417,7 @@ pub async fn run_dream_loop(server: Arc<Server>, last_activity_ms: Arc<AtomicU64
             let opts = WriteOpts {
                 gate: true,
                 tau_cohere: cfg.tau_cohere,
+                tau_split: cfg.tau_split,
             };
             for name in names {
                 if cfg.mode == DreamMode::Ladder && name.contains(LEVEL_SUFFIX) {
@@ -345,6 +483,7 @@ pub struct DreamQuery {
     pub mode: Option<String>,
     pub levels: Option<usize>,
     pub tau_cohere: Option<f64>,
+    pub tau_split: Option<f64>,
     pub collections: Option<String>,
 }
 
@@ -384,6 +523,9 @@ pub async fn trigger(
     }
     if let Some(tc) = q.tau_cohere {
         cfg.tau_cohere = tc;
+    }
+    if let Some(ts) = q.tau_split {
+        cfg.tau_split = ts;
     }
     if let Some(cols) = q.collections.as_deref() {
         cfg.collections = cols.split(',').map(|s| s.trim().to_string()).collect();
@@ -511,6 +653,7 @@ mod tests {
             WriteOpts {
                 gate: true,
                 tau_cohere: 0.2,
+                ..Default::default()
             },
         )
         .unwrap();

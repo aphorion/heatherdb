@@ -28,6 +28,11 @@ pub struct WriteOpts {
     /// Minimum `cos(counter_so_far, counter_in)` to JOIN under the gate. Below
     /// this, the write spawns. Ignored when `gate == false`.
     pub tau_cohere: f64,
+    /// Minimum address similarity for a candidate to be "same context" under
+    /// the gate. Scopes the candidate set to one level of a consolidation
+    /// ladder — raising it stops a coarser level's structure from merging one
+    /// rung too early. Ignored when `gate == false`.
+    pub tau_split: f64,
 }
 
 impl Default for WriteOpts {
@@ -35,6 +40,7 @@ impl Default for WriteOpts {
         Self {
             gate: false,
             tau_cohere: 0.1,
+            tau_split: 0.3,
         }
     }
 }
@@ -139,7 +145,7 @@ pub fn adaptive_write_two(
     let winner_local = if opts.gate {
         let cn = vec_ops::normalize(counter);
         let strong: Vec<usize> = (0..indices.len())
-            .filter(|&li| sims[li] >= config.tau_split)
+            .filter(|&li| sims[li] >= opts.tau_split)
             .collect();
         if strong.is_empty() {
             force_spawn = true;
