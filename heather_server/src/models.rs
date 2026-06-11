@@ -9,6 +9,21 @@ use serde::{Deserialize, Serialize};
 pub struct VecPairRequest {
     pub a: Vec<f64>,
     pub b: Vec<f64>,
+    /// `/vec/bind` only: unit-normalise the result (default true).
+    /// Set false for spiral-plane ops where spectrum magnitude is the payload.
+    pub normalize: Option<bool>,
+    /// `/vec/unbind` only: spectral division (true inverse for
+    /// non-unit-spectrum keys) instead of correlation. Default false.
+    pub exact: Option<bool>,
+    /// Null-bin threshold for exact unbind. Default 1e-9.
+    pub eps: Option<f64>,
+}
+
+/// One raw vector and a real exponent for `/vec/pow` (spectral power).
+#[derive(Debug, Deserialize)]
+pub struct VecPowRequest {
+    pub a: Vec<f64>,
+    pub t: f64,
 }
 
 /// Knobs for description-length-minimising compression (both optional).

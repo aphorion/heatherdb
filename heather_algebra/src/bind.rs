@@ -137,6 +137,61 @@ pub fn unbind_vec(c: &[f64], a: &[f64]) -> Vec<f64> {
     ifft_into(prod, d)
 }
 
+/// Spectral power: raise each Fourier bin of `a` to the real power `t`
+/// (principal branch). Integer `t` equals `t` successive binds, so
+/// `pow_vec(clock, n) = clock^⊗n` — the semigroup identity in one call.
+/// Fractional `t` is fractional power encoding. Result is NOT
+/// normalised: spectrum magnitudes carry growth/decay semantics.
+///
+/// The DC bin (and Nyquist for even `d`) of a real vector is real; its
+/// principal-branch fractional power is complex when negative, and is
+/// projected back to real here. Fractional-power semigroup exactness
+/// therefore requires non-negative DC/Nyquist bins — true of any
+/// properly constructed FPE base.
+pub fn pow_vec(a: &[f64], t: f64) -> Vec<f64> {
+    let d = a.len();
+    let spec = fft_forward(a);
+    let mut out: Vec<Complex<f64>> = spec.iter().map(|z| z.powf(t)).collect();
+    // Real-output constraint: DC (and Nyquist for even d) must stay real.
+    out[0].im = 0.0;
+    if d.is_multiple_of(2) {
+        let last = out.len() - 1;
+        out[last].im = 0.0;
+    }
+    ifft_into(out, d)
+}
+
+/// Exact unbind by spectral division: `c ⊘ a`. Unlike [`unbind_vec`]
+/// (correlation = conjugate), this is the true inverse for keys whose
+/// spectrum is not unit-magnitude: magnitudes divide instead of
+/// multiply. Bins where `|A| ≤ eps` are zeroed — the key's null space
+/// (for a differentiation operator, the constant of integration).
+pub fn unbind_exact_vec(c: &[f64], a: &[f64], eps: f64) -> Vec<f64> {
+    debug_assert_eq!(c.len(), a.len());
+    let d = a.len();
+    let spec_c = fft_forward(c);
+    let spec_a = fft_forward(a);
+    let eps2 = eps * eps;
+    let mut out: Vec<Complex<f64>> = spec_c
+        .iter()
+        .zip(spec_a.iter())
+        .map(|(zc, za)| {
+            let m2 = za.norm_sqr();
+            if m2 <= eps2 {
+                Complex::new(0.0, 0.0)
+            } else {
+                zc * za.conj() / m2
+            }
+        })
+        .collect();
+    out[0].im = 0.0;
+    if d.is_multiple_of(2) {
+        let last = out.len() - 1;
+        out[last].im = 0.0;
+    }
+    ifft_into(out, d)
+}
+
 /// Bind two unit vectors. Result is normalised so binding stays on the
 /// unit sphere (otherwise repeated binds collapse toward zero norm).
 pub fn bind_vec(a: &[f64], b: &[f64]) -> Vec<f64> {
@@ -516,6 +571,91 @@ mod tests {
             .unwrap()
             .0;
         assert_eq!(best, 0, "should recover MARY; sims={sims:?}");
+    }
+
+    #[test]
+    fn pow_two_matches_self_bind() {
+        let d = 128;
+        let mut rng = StdRng::seed_from_u64(11);
+        let a = rand_unit(d, &mut rng);
+        let squared = pow_vec(&a, 2.0);
+        let self_bound = circular_convolve(&a, &a);
+        for (x, y) in squared.iter().zip(self_bound.iter()) {
+            assert!((x - y).abs() < 1e-10, "pow2={x} bind={y}");
+        }
+    }
+
+    /// An FPE base: random phases on the interior bins, positive
+    /// DC/Nyquist (the real-carrier constraint pow_vec documents).
+    fn fpe_base(d: usize, rng: &mut StdRng) -> Vec<f64> {
+        use rand::Rng;
+        let mut v = vec![0.0; d];
+        for (i, x) in v.iter_mut().enumerate() {
+            *x = 1.0 / d as f64; // DC bin = 1
+            for k in 1..d / 2 {
+                let phi: f64 = rng.gen_range(0.0..std::f64::consts::TAU);
+                *x += 2.0 / d as f64
+                    * (std::f64::consts::TAU * k as f64 * i as f64 / d as f64 + phi).cos();
+            }
+            *x += 1.0 / d as f64 * (std::f64::consts::PI * i as f64).cos(); // Nyquist = 1
+        }
+        v
+    }
+
+    #[test]
+    fn pow_is_a_semigroup() {
+        // pow(a, s) ⊛ pow(a, t) = pow(a, s + t), fractional exponents.
+        let d = 256;
+        let mut rng = StdRng::seed_from_u64(12);
+        let a = fpe_base(d, &mut rng);
+        let lhs = circular_convolve(&pow_vec(&a, 0.3), &pow_vec(&a, 1.4));
+        let rhs = pow_vec(&a, 1.7);
+        let sim = vec_ops::cosine_similarity(&lhs, &rhs);
+        assert!(sim > 1.0 - 1e-9, "semigroup sim={sim}");
+    }
+
+    #[test]
+    fn exact_unbind_inverts_non_unitary_key() {
+        // A key with non-unit spectrum magnitudes (a spiral clock):
+        // correlation unbind distorts, spectral division is exact.
+        let d = 128;
+        let mut rng = StdRng::seed_from_u64(13);
+        let key_base = rand_unit(d, &mut rng);
+        let key = pow_vec(&key_base, 1.6); // spectrum magnitudes != 1
+        let filler = rand_unit(d, &mut rng);
+
+        let bound = circular_convolve(&key, &filler);
+        let exact = unbind_exact_vec(&bound, &key, 1e-9);
+        let approx = unbind_vec(&bound, &key);
+
+        let sim_exact = vec_ops::cosine_similarity(&exact, &filler);
+        let sim_approx = vec_ops::cosine_similarity(&approx, &filler);
+        assert!(sim_exact > 1.0 - 1e-9, "exact sim={sim_exact}");
+        assert!(
+            sim_exact > sim_approx,
+            "division should beat correlation off the unit spectrum: exact={sim_exact} approx={sim_approx}"
+        );
+        for (x, y) in exact.iter().zip(filler.iter()) {
+            assert!((x - y).abs() < 1e-8, "exact={x} filler={y}");
+        }
+    }
+
+    #[test]
+    fn exact_unbind_zeroes_null_bins() {
+        // Key with a dead DC bin: division must zero it, not blow up.
+        let d = 64;
+        let mut rng = StdRng::seed_from_u64(14);
+        let mut key = rand_unit(d, &mut rng);
+        let mean = key.iter().sum::<f64>() / d as f64;
+        for x in key.iter_mut() {
+            *x -= mean; // DC bin ~ 0
+        }
+        let filler = rand_unit(d, &mut rng);
+        let bound = circular_convolve(&key, &filler);
+        let rec = unbind_exact_vec(&bound, &key, 1e-6);
+        assert!(rec.iter().all(|x| x.is_finite()));
+        let sim = vec_ops::cosine_similarity(&rec, &filler);
+        assert!(sim > 0.99, "sim={sim}");
     }
 
     #[test]

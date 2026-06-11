@@ -8,7 +8,10 @@ pub mod routing;
 pub mod snapshot;
 mod traits;
 
-pub use bind::{bind, bind_vec, bind_with_limit, circular_convolve, involve, unbind, unbind_vec};
+pub use bind::{
+    bind, bind_vec, bind_with_limit, circular_convolve, involve, pow_vec, unbind, unbind_exact_vec,
+    unbind_vec,
+};
 pub use compose::{ComposeDiagnostics, ComposeParams, ComposeResult, compose};
 pub use error::AlgebraError;
 pub use permute::{Permutation, permute, permute_inv, permute_pow, permute_snapshot};

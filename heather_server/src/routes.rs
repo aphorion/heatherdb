@@ -7,7 +7,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use heather_algebra::{
-    EAMSnapshot, bind_vec, compose_read as algebra_compose_read, ops, unbind_vec,
+    EAMSnapshot, bind_vec, circular_convolve, compose_read as algebra_compose_read, ops, pow_vec,
+    unbind_exact_vec, unbind_vec,
 };
 use heather_db::{HardLocation, Hive, LocationId, ReadStrategy};
 use rayon::prelude::*;
@@ -15,6 +16,8 @@ use rayon::prelude::*;
 use crate::models::*;
 
 /// `POST /vec/bind` — circular-convolution bind of two raw vectors.
+/// `normalize: false` returns the raw convolution (spiral-plane ops,
+/// where spectrum magnitude carries growth/decay).
 pub async fn vec_bind(Json(req): Json<VecPairRequest>) -> Response {
     if req.a.len() != req.b.len() {
         return (
@@ -23,14 +26,22 @@ pub async fn vec_bind(Json(req): Json<VecPairRequest>) -> Response {
         )
             .into_response();
     }
+    let result = if req.normalize.unwrap_or(true) {
+        bind_vec(&req.a, &req.b)
+    } else {
+        circular_convolve(&req.a, &req.b)
+    };
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "result": bind_vec(&req.a, &req.b) })),
+        Json(serde_json::json!({ "result": result })),
     )
         .into_response()
 }
 
-/// `POST /vec/unbind` — circular-correlation unbind (approximate inverse).
+/// `POST /vec/unbind` — unbind `a` from `b`. Default is circular
+/// correlation (approximate inverse, exact on unit-spectrum keys);
+/// `exact: true` does spectral division, the true inverse for keys
+/// with non-unit spectrum magnitudes (`eps` zeroes null bins).
 pub async fn vec_unbind(Json(req): Json<VecPairRequest>) -> Response {
     if req.a.len() != req.b.len() {
         return (
@@ -39,9 +50,32 @@ pub async fn vec_unbind(Json(req): Json<VecPairRequest>) -> Response {
         )
             .into_response();
     }
+    let result = if req.exact.unwrap_or(false) {
+        unbind_exact_vec(&req.a, &req.b, req.eps.unwrap_or(1e-9))
+    } else {
+        unbind_vec(&req.a, &req.b)
+    };
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "result": unbind_vec(&req.a, &req.b) })),
+        Json(serde_json::json!({ "result": result })),
+    )
+        .into_response()
+}
+
+/// `POST /vec/pow` — spectral power: `a^⊗t` for real `t`. Integer `t`
+/// equals `t` successive binds (semigroup: `pow(clock, n) = ϕ(n·Δt)`);
+/// fractional `t` is fractional power encoding. Never normalised.
+pub async fn vec_pow(Json(req): Json<VecPowRequest>) -> Response {
+    if req.a.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "a must be non-empty" })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({ "result": pow_vec(&req.a, req.t) })),
     )
         .into_response()
 }
