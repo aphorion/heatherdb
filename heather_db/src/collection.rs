@@ -555,6 +555,53 @@ impl Collection {
         }
     }
 
+    /// Raw dot-product attention read over stored (address=K, counter=V)
+    /// locations: `Σ softmax(Q·Kᵢ · scale) · Vᵢ` over the top-k activated
+    /// locations. Unlike [`read`]'s HopfieldSS (cosine sims, normalized
+    /// patterns, normalized output), this is bit-exact transformer attention
+    /// when `scale = 1/√d` and every key participates — the read that lets a
+    /// trained model's attention run on the EAM. With top-k < |locations| it
+    /// is the sparse attention that, with elastic merging, gives unbounded
+    /// context at bounded memory.
+    pub fn read_attention(&self, query: &[f64], scale: f64) -> Result<Vec<f64>> {
+        vec_ops::validate_vector(query)?;
+
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+
+        if query.len() != inner.config.d {
+            return Err(HeatherError::DimensionMismatch {
+                expected: inner.config.d,
+                got: query.len(),
+            });
+        }
+        if inner.locations.is_empty() {
+            return Err(HeatherError::EmptyMemory);
+        }
+
+        let k = inner.config.k.min(inner.locations.len());
+        let (indices, _sims) = read::activate_auto_full(
+            query,
+            &inner.locations,
+            k,
+            &inner.landmarks,
+            &inner.id_lookup,
+            &inner.address_matrix,
+            inner.config.d,
+        );
+
+        // raw dot scores (NOT cosine), softmax with scale folded as beta
+        let sims: Vec<f64> = indices
+            .iter()
+            .map(|&i| vec_ops::dot(query, &inner.locations[i].address))
+            .collect();
+        let alpha = vec_ops::softmax(&sims, scale);
+        // raw values (V = counter / write_count), NO output normalization
+        let values: Vec<Vec<f64>> =
+            indices.iter().map(|&i| inner.locations[i].normalized_pattern()).collect();
+        let value_refs: Vec<&[f64]> = values.iter().map(|v| v.as_slice()).collect();
+        Ok(vec_ops::weighted_sum(&value_refs, &alpha))
+    }
+
     /// Run KNN merge to consolidate similar locations.
     /// Migrates document index posting lists from removed locations to survivors.
     pub fn merge(&self) -> Result<usize> {
@@ -1278,6 +1325,46 @@ mod tests {
 
         let stats = col.stats().unwrap();
         assert!(stats.total_writes > 0.0);
+    }
+
+    /// read_attention must equal a hand-computed softmax(Q·Kᵢ·scale)·Vᵢ over
+    /// the stored locations — i.e. it is bit-exact transformer attention, not
+    /// the cosine/normalized HopfieldSS read.
+    #[test]
+    fn read_attention_is_exact_softmax_dot() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let mut config = test_config();
+        config.l_0 = 0; // start empty: written pairs are the only locations
+        config.k = 64; // every key participates (full attention)
+        let col = Collection::new(col_id, "test".into(), store, &config).unwrap();
+        let d = 16;
+        let mut rng = rand::thread_rng();
+        let opts = crate::write::WriteOpts::default();
+        for _ in 0..5 {
+            let key = vec_ops::random_unit_vector(d, &mut rng);
+            let val = vec_ops::random_unit_vector(d, &mut rng);
+            col.write_two(&key, &val, opts).unwrap();
+        }
+        let query = vec_ops::random_unit_vector(d, &mut rng);
+        let scale = 1.0 / (d as f64).sqrt();
+
+        let manual = {
+            let inner = col.inner.read().unwrap();
+            let sims: Vec<f64> =
+                inner.locations.iter().map(|l| vec_ops::dot(&query, &l.address)).collect();
+            let alpha = vec_ops::softmax(&sims, scale);
+            let vals: Vec<Vec<f64>> =
+                inner.locations.iter().map(|l| l.normalized_pattern()).collect();
+            let refs: Vec<&[f64]> = vals.iter().map(|v| v.as_slice()).collect();
+            vec_ops::weighted_sum(&refs, &alpha)
+        };
+
+        let got = col.read_attention(&query, scale).unwrap();
+        assert_eq!(got.len(), d);
+        for (a, b) in got.iter().zip(&manual) {
+            assert!((a - b).abs() < 1e-9, "read_attention {a} != manual softmax-dot {b}");
+        }
     }
 
     fn empty_seeded_collection(dir: &TempDir) -> Collection {
