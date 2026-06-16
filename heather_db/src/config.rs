@@ -48,6 +48,18 @@ pub struct EAMConfig {
     /// accumulating each joining write's surprise onto the location it joined.
     #[serde(default)]
     pub mdl_gate: bool,
+    /// Competitive write toggle. When false, writes are verbatim streaming
+    /// appends: each `write`/`write_two` stores the address as-is (no
+    /// normalization) as a fresh location — no activation, no merge, no
+    /// address migration. This turns the collection into an exact growing
+    /// key→value store, the mode a raw dot read (`read_attention`) needs to
+    /// reproduce trained attention. Default true (the adaptive EAM behavior).
+    #[serde(default = "default_competitive")]
+    pub competitive: bool,
+}
+
+fn default_competitive() -> bool {
+    true
 }
 
 /// Bits to store one new hard location: log2(L+1) address bits among the existing
@@ -87,6 +99,7 @@ impl EAMConfig {
             neighbor_cap: (d / 4).max(20),
             num_landmarks: 32,
             mdl_gate: false,
+            competitive: true,
         };
         config.validate()?;
         Ok(config)

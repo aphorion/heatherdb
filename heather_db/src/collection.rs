@@ -1367,6 +1367,51 @@ mod tests {
         }
     }
 
+    /// End-to-end: a non-competitive collection stores K/V verbatim (norm
+    /// preserved), so write_two + read_attention reproduces exact dot
+    /// attention over the RAW written keys. Non-unit keys make this fail if
+    /// the write had normalized the address.
+    #[test]
+    fn non_competitive_write_then_read_attention_is_exact() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let mut config = test_config();
+        config.l_0 = 0;
+        config.k = 64;
+        config.competitive = false; // verbatim streaming append
+        let col = Collection::new(col_id, "test".into(), store, &config).unwrap();
+        let d = 16;
+        let mut rng = rand::thread_rng();
+        let opts = crate::write::WriteOpts::default();
+
+        let mut keys = Vec::new();
+        let mut vals = Vec::new();
+        for i in 0..5 {
+            // non-unit key (norm varies) — would mismatch if the write normalized
+            let key: Vec<f64> = vec_ops::random_unit_vector(d, &mut rng)
+                .iter()
+                .map(|x| x * (1.0 + i as f64 * 0.7))
+                .collect();
+            let val = vec_ops::random_unit_vector(d, &mut rng);
+            col.write_two(&key, &val, opts).unwrap();
+            keys.push(key);
+            vals.push(val);
+        }
+        let query: Vec<f64> = vec_ops::random_unit_vector(d, &mut rng);
+        let scale = 1.0 / (d as f64).sqrt();
+
+        // manual softmax-dot attention over the RAW written keys/values
+        let sims: Vec<f64> = keys.iter().map(|kk| vec_ops::dot(&query, kk)).collect();
+        let alpha = vec_ops::softmax(&sims, scale);
+        let refs: Vec<&[f64]> = vals.iter().map(|v| v.as_slice()).collect();
+        let manual = vec_ops::weighted_sum(&refs, &alpha);
+
+        let got = col.read_attention(&query, scale).unwrap();
+        for (a, b) in got.iter().zip(&manual) {
+            assert!((a - b).abs() < 1e-9, "read_attention {a} != raw-K attention {b}");
+        }
+    }
+
     fn empty_seeded_collection(dir: &TempDir) -> Collection {
         let (store, col_id) = setup_store(dir);
         let mut config = test_config();
