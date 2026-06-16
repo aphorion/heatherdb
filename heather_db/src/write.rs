@@ -1,6 +1,6 @@
 use rand::Rng;
 
-use crate::config::EAMConfig;
+use crate::config::{engram_bits, surprise_bits, EAMConfig};
 use crate::location::{HardLocation, LocationId};
 use crate::read;
 use crate::vec_ops;
@@ -229,6 +229,13 @@ pub fn adaptive_write_two(
         }
     }
 
+    // MDL: the joining write adds its residual surprise (how poorly it matched the
+    // winner) to the winner's debt. surprise·recurrence accrues here, one write at
+    // a time, until it clears an engram and the location splits in Phase 3.
+    if config.mdl_gate && !force_spawn {
+        locations[winner_global].surprise_mass += surprise_bits(sims[winner_local]);
+    }
+
     // ── Neighbor graph update ─────────────────────────────────────
     // Each activated location learns about its co-activated peers.
     // Cost: O(k²) — negligible compared to the O(LD) activation step.
@@ -273,6 +280,11 @@ pub fn adaptive_write_two(
     // law episode gets its own family.
     let spawn_novelty = if opts.gate {
         force_spawn
+    } else if config.mdl_gate {
+        // MDL novelty: spawn immediately only when a single contact is surprising
+        // enough to pay for its own engram outright. The bar is log2(L+1)+log2(d/32),
+        // not a fixed tau_split — it rises as the index fills.
+        surprise_bits(max_sim) > engram_bits(locations.len(), config.d)
     } else {
         max_sim < config.tau_split
     };
@@ -294,9 +306,16 @@ pub fn adaptive_write_two(
         new_locations.push(new_loc);
     }
 
-    // Overload split only applies when we actually joined a winner (a forced
-    // spawn touched no existing location).
-    if !force_spawn && locations[winner_global].write_count > config.tau_overload {
+    // Recurrence split: a saturated winner spawns a perturbed neighbor. Legacy
+    // fires on write_count alone (blind to coherence). MDL fires when accumulated
+    // surprise·recurrence (surprise_mass, bits) clears an engram — a high-traffic
+    // but coherent location carries ~0 debt and does NOT split.
+    let overloaded = if config.mdl_gate {
+        locations[winner_global].surprise_mass > engram_bits(locations.len(), config.d)
+    } else {
+        locations[winner_global].write_count > config.tau_overload
+    };
+    if !force_spawn && overloaded {
         // Overload split: winner is saturated — spawn perturbed neighbor
         let id = LocationId(*next_id);
         *next_id += 1;
@@ -321,6 +340,8 @@ pub fn adaptive_write_two(
             *c *= 0.5;
         }
         locations[winner_global].write_count *= 0.5;
+        // Debt is paid by the split: the refined pair now represents the traffic.
+        locations[winner_global].surprise_mass *= 0.5;
 
         // Child inherits parent's neighbors; they become mutual neighbors
         if nb_cap > 0 {
@@ -435,6 +456,73 @@ mod tests {
         assert!(!result.modified_indices.is_empty());
         // Location 0 should have received the most weight
         assert!(locations[0].write_count > locations[1].write_count);
+    }
+
+    // MDL gate: a saturated but COHERENT location does not split, where the
+    // legacy count-only overload rule would. Recurrence without surprise carries
+    // no description-length debt.
+    #[test]
+    fn test_mdl_coherent_traffic_does_not_split() {
+        let mut config = EAMConfig::new(64).unwrap();
+        config.mdl_gate = true;
+        let mut next_id = 1u64;
+        let mut rng = rand::thread_rng();
+        let input = vec_ops::normalize(&{
+            let mut v = vec![0.0; 64];
+            v[0] = 1.0;
+            v[1] = 0.3;
+            v
+        });
+        let mut locations = vec![HardLocation::new(LocationId(0), input.clone())];
+
+        // Far more identical writes than tau_overload (=8 at d=64): legacy splits, MDL must not.
+        let n = (config.tau_overload as usize) + 20;
+        for _ in 0..n {
+            let r = adaptive_write(
+                &input, &mut locations, &config, 0.01, &mut next_id, &mut rng, &[], &[],
+            );
+            for loc in r.new_locations {
+                locations.push(loc);
+            }
+        }
+        assert!(locations[0].write_count > config.tau_overload);
+        assert!(locations[0].surprise_mass < 1.0); // ~0 debt: every write matched
+        assert_eq!(locations.len(), 1, "coherent traffic must not split under MDL");
+    }
+
+    // MDL gate: a location that absorbs INCOHERENT traffic accrues surprise debt
+    // and splits once it clears an engram — surprise·recurrence > bits.
+    #[test]
+    fn test_mdl_incoherent_traffic_splits() {
+        let mut config = EAMConfig::new(64).unwrap();
+        config.mdl_gate = true;
+        config.tau_split = 0.0; // disable novelty spawn: force everything to JOIN, so debt accrues
+        let mut next_id = 1u64;
+        let mut rng = rand::thread_rng();
+        let seed = vec_ops::normalize(&{
+            let mut v = vec![0.0; 64];
+            v[0] = 1.0;
+            v
+        });
+        let mut locations = vec![HardLocation::new(LocationId(0), seed)];
+
+        let mut split = false;
+        for i in 0..200 {
+            // moderately-similar-but-varying inputs: each matches the winner only
+            // partially, so each contributes surprise debt.
+            let mut v = vec![0.0; 64];
+            v[0] = 1.0;
+            v[2 + (i % 40)] = 0.9;
+            let x = vec_ops::normalize(&v);
+            let r = adaptive_write(
+                &x, &mut locations, &config, 0.01, &mut next_id, &mut rng, &[], &[],
+            );
+            if !r.new_locations.is_empty() {
+                split = true;
+                break;
+            }
+        }
+        assert!(split, "incoherent traffic must accrue surprise debt and split under MDL");
     }
 
     #[test]

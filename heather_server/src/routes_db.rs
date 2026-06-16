@@ -85,6 +85,7 @@ pub async fn create_database(
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
     cfg.map_size_mb = req.map_size_mb.unwrap_or(DEFAULT_MAP_SIZE_MB);
+    cfg.eam.mdl_gate = req.mdl_gate;
 
     match server.create_database(cfg) {
         Ok(_) => match server.database_config(&req.name) {
