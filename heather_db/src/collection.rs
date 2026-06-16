@@ -589,12 +589,20 @@ impl Collection {
             inner.config.d,
         );
 
-        // raw dot scores (NOT cosine), softmax with scale folded as beta
-        let sims: Vec<f64> = indices
+        // Count-weighted raw-dot scores: a merged engram represents
+        // write_count tokens, so it enters the softmax with that multiplicity
+        // — αᵢ ∝ write_countᵢ · exp(scale · Q·Kᵢ), folded as the logit
+        // scale·Q·Kᵢ + ln(write_countᵢ). With write_count == 1 everywhere this
+        // is exactly softmax(Q·Kᵢ · scale); with merged engrams it reconstructs
+        // the attention the un-merged tokens would have produced.
+        let logits: Vec<f64> = indices
             .iter()
-            .map(|&i| vec_ops::dot(query, &inner.locations[i].address))
+            .map(|&i| {
+                scale * vec_ops::dot(query, &inner.locations[i].address)
+                    + inner.locations[i].write_count.max(1e-12).ln()
+            })
             .collect();
-        let alpha = vec_ops::softmax(&sims, scale);
+        let alpha = vec_ops::softmax(&logits, 1.0);
         // raw values (V = counter / write_count), NO output normalization
         let values: Vec<Vec<f64>> =
             indices.iter().map(|&i| inner.locations[i].normalized_pattern()).collect();
@@ -1351,9 +1359,13 @@ mod tests {
 
         let manual = {
             let inner = col.inner.read().unwrap();
-            let sims: Vec<f64> =
-                inner.locations.iter().map(|l| vec_ops::dot(&query, &l.address)).collect();
-            let alpha = vec_ops::softmax(&sims, scale);
+            // count-weighted logits: scale·Q·Kᵢ + ln(write_countᵢ)
+            let logits: Vec<f64> = inner
+                .locations
+                .iter()
+                .map(|l| scale * vec_ops::dot(&query, &l.address) + l.write_count.max(1e-12).ln())
+                .collect();
+            let alpha = vec_ops::softmax(&logits, 1.0);
             let vals: Vec<Vec<f64>> =
                 inner.locations.iter().map(|l| l.normalized_pattern()).collect();
             let refs: Vec<&[f64]> = vals.iter().map(|v| v.as_slice()).collect();
