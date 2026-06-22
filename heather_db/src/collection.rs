@@ -13,6 +13,70 @@ use crate::write;
 /// A stored document as it comes back off the wire: id, vector, metadata blob.
 pub type DocumentRecord = (u64, Vec<f64>, Vec<u8>);
 
+/// Select the attention inverse-temperature β by minimizing the description
+/// length of the key set. β is a Gaussian-kernel bandwidth (β = 1/σ² on the
+/// unit sphere); this is leave-one-out KDE bandwidth selection. For each key
+/// Kⱼ, the log predictive density under a kernel mixture of the *other* keys
+/// is `logsumexp_{i≠j}(β·(sᵢⱼ−1)) + (d/2)·ln(β/2π) − ln(m−1)`. The total over
+/// j is the negative description length; maximizing it picks β*. The
+/// `(d/2)ln β` term rewards sharpness, the leave-one-out logsumexp penalizes
+/// it (when β is large, excluded neighbors fall off the kernel) — the trade
+/// is the interior optimum. Swept on a log grid; falls back to `default_beta`
+/// when fewer than two keys make leave-one-out undefined.
+fn select_beta_mdl(keys: &[Vec<f64>], d: usize, default_beta: f64) -> f64 {
+    let m = keys.len();
+    if m < 2 {
+        return default_beta;
+    }
+
+    // Pairwise cosine similarities of the (unit-norm) keys.
+    let sim = |i: usize, j: usize| vec_ops::dot(&keys[i], &keys[j]);
+
+    // Negative description length (LOO log-likelihood up to β-independent
+    // constants) at inverse-temperature β.
+    let neg_dl = |beta: f64| -> f64 {
+        let half_d_ln_beta = (d as f64) / 2.0 * beta.ln();
+        let mut total = 0.0;
+        for j in 0..m {
+            // logsumexp over i≠j of β·(s_ij − 1)
+            let mut max_l = f64::NEG_INFINITY;
+            for i in 0..m {
+                if i == j {
+                    continue;
+                }
+                let l = beta * (sim(i, j) - 1.0);
+                if l > max_l {
+                    max_l = l;
+                }
+            }
+            let mut sum = 0.0;
+            for i in 0..m {
+                if i == j {
+                    continue;
+                }
+                sum += (beta * (sim(i, j) - 1.0) - max_l).exp();
+            }
+            total += max_l + sum.ln() + half_d_ln_beta;
+        }
+        total
+    };
+
+    // Log-grid sweep over plausible bandwidths.
+    let (lo, hi, steps) = (0.1_f64, 500.0_f64, 60);
+    let (ln_lo, ln_hi) = (lo.ln(), hi.ln());
+    let mut best_beta = default_beta;
+    let mut best_score = f64::NEG_INFINITY;
+    for s in 0..=steps {
+        let beta = (ln_lo + (ln_hi - ln_lo) * (s as f64) / (steps as f64)).exp();
+        let score = neg_dl(beta);
+        if score.is_finite() && score > best_score {
+            best_score = score;
+            best_beta = beta;
+        }
+    }
+    best_beta
+}
+
 /// Statistics about the current state of an EAM collection.
 #[derive(Debug, Clone)]
 pub struct EAMStats {
@@ -564,6 +628,140 @@ impl Collection {
     /// is the sparse attention that, with elastic merging, gives unbounded
     /// context at bounded memory.
     pub fn read_attention(&self, query: &[f64], scale: f64) -> Result<Vec<f64>> {
+        self.read_attention_ex(query, scale, None)
+    }
+
+    /// [`read_attention`] with an optional location index to drop from the
+    /// activated set — leave-one-out reads (a stored key queried against the
+    /// rest of the codebook) for honest held-out evaluation. When `exclude`
+    /// is set, one extra location is activated so `config.k` neighbours
+    /// survive the drop.
+    pub fn read_attention_ex(
+        &self,
+        query: &[f64],
+        scale: f64,
+        exclude: Option<usize>,
+    ) -> Result<Vec<f64>> {
+        vec_ops::validate_vector(query)?;
+
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+
+        if query.len() != inner.config.d {
+            return Err(HeatherError::DimensionMismatch {
+                expected: inner.config.d,
+                got: query.len(),
+            });
+        }
+        if inner.locations.is_empty() {
+            return Err(HeatherError::EmptyMemory);
+        }
+
+        let want = inner.config.k + exclude.is_some() as usize;
+        let k = want.min(inner.locations.len());
+        let (mut indices, _sims) = read::activate_auto_full(
+            query,
+            &inner.locations,
+            k,
+            &inner.landmarks,
+            &inner.id_lookup,
+            &inner.address_matrix,
+            inner.config.d,
+        );
+        if let Some(ex) = exclude {
+            indices.retain(|&i| i != ex);
+            indices.truncate(inner.config.k);
+        }
+
+        // Count-weighted raw-dot scores: a merged engram represents
+        // write_count tokens, so it enters the softmax with that multiplicity
+        // — αᵢ ∝ write_countᵢ · exp(scale · Q·Kᵢ), folded as the logit
+        // scale·Q·Kᵢ + ln(write_countᵢ). With write_count == 1 everywhere this
+        // is exactly softmax(Q·Kᵢ · scale); with merged engrams it reconstructs
+        // the attention the un-merged tokens would have produced.
+        let logits: Vec<f64> = indices
+            .iter()
+            .map(|&i| {
+                scale * vec_ops::dot(query, &inner.locations[i].address)
+                    + inner.locations[i].write_count.max(1e-12).ln()
+            })
+            .collect();
+        let alpha = vec_ops::softmax(&logits, 1.0);
+        // raw values (V = counter / write_count), NO output normalization
+        let values: Vec<Vec<f64>> =
+            indices.iter().map(|&i| inner.locations[i].normalized_pattern()).collect();
+        let value_refs: Vec<&[f64]> = values.iter().map(|v| v.as_slice()).collect();
+        Ok(vec_ops::weighted_sum(&value_refs, &alpha))
+    }
+
+    /// Calibrate the attention temperature by minimizing the leave-one-out
+    /// description length of the stored *values*. For each location j the value
+    /// Vⱼ is reconstructed from its top-k key-neighbours at inverse-temperature
+    /// β — `recon = Σ softmax(β·Kⱼ·Kᵢ)·Vᵢ` — and the held-out code length is
+    /// `−ln(Vⱼ·recon)` (categorical NLL when V is a one-hot label; a proper
+    /// Gaussian-residual code in general). The sum over j is convex-with-interior
+    /// in β: too flat reconstructs the mean value, too sharp reconstructs only
+    /// the nearest neighbour's value — both code the held-out value poorly. This
+    /// is the dimension-free, value-aware temperature; unlike a key-only KDE
+    /// bandwidth it does not degenerate when the ambient dimension is large.
+    /// Returns `(β*, DL*)`. The neighbour lists are β-independent, so the sweep
+    /// computes them once.
+    pub fn calibrate_beta(&self, betas: &[f64]) -> Result<(f64, f64)> {
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let n = inner.locations.len();
+        if n < 2 {
+            return Ok((inner.config.beta, 0.0));
+        }
+        let k = inner.config.k.min(n - 1);
+        let vals: Vec<Vec<f64>> =
+            inner.locations.iter().map(|l| l.normalized_pattern()).collect();
+
+        // top-k key-neighbours of each location (excluding itself), with the
+        // raw dot logit Kⱼ·Kᵢ that read_attention scales by β.
+        let neighbours: Vec<Vec<(usize, f64)>> = (0..n)
+            .map(|j| {
+                let mut sims: Vec<(usize, f64)> = (0..n)
+                    .filter(|&i| i != j)
+                    .map(|i| {
+                        (i, vec_ops::dot(&inner.locations[j].address, &inner.locations[i].address))
+                    })
+                    .collect();
+                sims.sort_by(|a, b| b.1.total_cmp(&a.1));
+                sims.truncate(k);
+                sims
+            })
+            .collect();
+
+        let mut best = (betas.first().copied().unwrap_or(inner.config.beta), f64::INFINITY);
+        for &beta in betas {
+            let mut dl = 0.0;
+            for (j, nb) in neighbours.iter().enumerate() {
+                let logits: Vec<f64> = nb.iter().map(|&(_, s)| beta * s).collect();
+                let alpha = vec_ops::softmax(&logits, 1.0);
+                let refs: Vec<&[f64]> = nb.iter().map(|&(i, _)| vals[i].as_slice()).collect();
+                let recon = vec_ops::weighted_sum(&refs, &alpha);
+                let p = vec_ops::dot(&vals[j], &recon).max(1e-12);
+                dl -= p.ln();
+            }
+            if dl < best.1 {
+                best = (beta, dl);
+            }
+        }
+        Ok(best)
+    }
+
+    /// Self-calibrating attention read. The softmax inverse-temperature is a
+    /// Gaussian-kernel bandwidth: for unit-norm keys `‖Q−Kᵢ‖² = 2−2·Q·Kᵢ`, so
+    /// `exp(β·Q·Kᵢ) ∝ exp(−‖Q−Kᵢ‖²/2σ²)` with `β = 1/σ²`. Instead of fixing the
+    /// temperature, β is chosen to minimize the description length of the
+    /// activated key set — leave-one-out KDE predictive coding: each key is
+    /// reconstructed from the others, summed log-loss plus the `d/2·ln(2π/β)`
+    /// code for the bandwidth itself. This has an interior optimum (too sharp
+    /// → each key only predicts itself → infinite loss off-codebook; too flat
+    /// → mean, no resolution). The read then runs at β*, so confidence tracks
+    /// the codebook's own geometry rather than a hard-wired knob: a query
+    /// equidistant to well-separated keys reads soft (MaxEnt abstention), a
+    /// query inside a tight cluster reads sharp. Returns `(value, β*)`.
+    pub fn read_attention_mdl(&self, query: &[f64]) -> Result<(Vec<f64>, f64)> {
         vec_ops::validate_vector(query)?;
 
         let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
@@ -589,25 +787,27 @@ impl Collection {
             inner.config.d,
         );
 
-        // Count-weighted raw-dot scores: a merged engram represents
-        // write_count tokens, so it enters the softmax with that multiplicity
-        // — αᵢ ∝ write_countᵢ · exp(scale · Q·Kᵢ), folded as the logit
-        // scale·Q·Kᵢ + ln(write_countᵢ). With write_count == 1 everywhere this
-        // is exactly softmax(Q·Kᵢ · scale); with merged engrams it reconstructs
-        // the attention the un-merged tokens would have produced.
+        // Unit-norm activated keys — kernel geometry needs the cosine sphere.
+        let keys: Vec<Vec<f64>> = indices
+            .iter()
+            .map(|&i| vec_ops::normalize(&inner.locations[i].address))
+            .collect();
+        let beta = select_beta_mdl(&keys, inner.config.d, inner.config.beta);
+
+        // Read at β*: count-weighted raw-dot attention, identical form to
+        // `read_attention` but with the self-selected temperature.
         let logits: Vec<f64> = indices
             .iter()
             .map(|&i| {
-                scale * vec_ops::dot(query, &inner.locations[i].address)
+                beta * vec_ops::dot(query, &inner.locations[i].address)
                     + inner.locations[i].write_count.max(1e-12).ln()
             })
             .collect();
         let alpha = vec_ops::softmax(&logits, 1.0);
-        // raw values (V = counter / write_count), NO output normalization
         let values: Vec<Vec<f64>> =
             indices.iter().map(|&i| inner.locations[i].normalized_pattern()).collect();
         let value_refs: Vec<&[f64]> = values.iter().map(|v| v.as_slice()).collect();
-        Ok(vec_ops::weighted_sum(&value_refs, &alpha))
+        Ok((vec_ops::weighted_sum(&value_refs, &alpha), beta))
     }
 
     /// Run KNN merge to consolidate similar locations.
@@ -1422,6 +1622,105 @@ mod tests {
         for (a, b) in got.iter().zip(&manual) {
             assert!((a - b).abs() < 1e-9, "read_attention {a} != raw-K attention {b}");
         }
+    }
+
+    /// MDL-selected temperature calibrates confidence to codebook geometry:
+    /// β* is broad (soft read) when keys are well-separated and an ambiguous
+    /// query has no honest winner, and sharp when keys cluster tightly. The
+    /// soft read is MaxEnt abstention — it refuses to amplify a hair-thin
+    /// similarity gap into a confident pick the way a hard-wired high β does.
+    fn basis_vec(d: usize, i: usize) -> Vec<f64> {
+        let mut v = vec![0.0; d];
+        v[i] = 1.0;
+        v
+    }
+
+    fn entropy(alpha: &[f64]) -> f64 {
+        -alpha.iter().filter(|&&a| a > 0.0).map(|&a| a * a.ln()).sum::<f64>()
+    }
+
+    /// Attention weights at a fixed β for raw-dot logits over `keys`.
+    fn alpha_at(query: &[f64], keys: &[Vec<f64>], beta: f64) -> Vec<f64> {
+        let logits: Vec<f64> = keys.iter().map(|kk| beta * vec_ops::dot(query, kk)).collect();
+        vec_ops::softmax(&logits, 1.0)
+    }
+
+    fn write_keys(col: &Collection, keys: &[Vec<f64>]) {
+        let opts = crate::write::WriteOpts::default();
+        for (i, k) in keys.iter().enumerate() {
+            // distinct value per key (a fresh basis dir) so reads are separable
+            let val = basis_vec(keys[0].len(), i);
+            col.write_two(k, &val, opts).unwrap();
+        }
+    }
+
+    fn separated_collection(dir: &TempDir, d: usize) -> (Collection, Vec<Vec<f64>>) {
+        let (store, col_id) = setup_store(dir);
+        let mut config = EAMConfig::new(d).unwrap();
+        config.l_0 = 0;
+        config.k = 64;
+        config.competitive = false;
+        let col = Collection::new(col_id, "sep".into(), store, &config).unwrap();
+        // two orthonormal keys — maximally separated on the sphere
+        let keys = vec![basis_vec(d, 0), basis_vec(d, 1)];
+        write_keys(&col, &keys);
+        (col, keys)
+    }
+
+    fn clustered_collection(dir: &TempDir, d: usize) -> (Collection, Vec<Vec<f64>>) {
+        let (store, col_id) = setup_store(dir);
+        let mut config = EAMConfig::new(d).unwrap();
+        config.l_0 = 0;
+        config.k = 64;
+        config.competitive = false;
+        let col = Collection::new(col_id, "tight".into(), store, &config).unwrap();
+        // keys tightly packed around e0 (pairwise cosine ≈ 0.997)
+        let keys: Vec<Vec<f64>> = (0..5)
+            .map(|i| {
+                let mut v = basis_vec(d, 0);
+                v[i + 1] = 0.05;
+                vec_ops::normalize(&v)
+            })
+            .collect();
+        write_keys(&col, &keys);
+        (col, keys)
+    }
+
+    #[test]
+    fn mdl_temperature_calibrates_to_geometry() {
+        let d = 16;
+        let dir_s = TempDir::new().unwrap();
+        let dir_t = TempDir::new().unwrap();
+        let (sep, sep_keys) = separated_collection(&dir_s, d);
+        let (tight, _tight_keys) = clustered_collection(&dir_t, d);
+
+        // Ambiguous query: nearly equidistant to the two separated keys
+        // (sims 0.51 vs 0.49 → a 0.02 hair, no honest winner).
+        let query = vec_ops::normalize(
+            &sep_keys[0].iter().zip(&sep_keys[1]).map(|(a, b)| 0.51 * a + 0.49 * b).collect::<Vec<_>>(),
+        );
+
+        let (_v_sep, beta_sep) = sep.read_attention_mdl(&query).unwrap();
+        let (_v_tight, beta_tight) = tight.read_attention_mdl(&query).unwrap();
+
+        // Calibration: a tight codebook earns a sharp temperature; a spread
+        // one does not. This is the whole claim — β tracks resolution.
+        assert!(
+            beta_tight > beta_sep,
+            "tight codebook should select sharper β: tight={beta_tight} sep={beta_sep}"
+        );
+
+        // The MDL read over the separated keys abstains: its attention entropy
+        // is far higher than a hard-wired sharp read on the same hair-thin gap.
+        let h_mdl = entropy(&alpha_at(&query, &sep_keys, beta_sep));
+        let h_hard = entropy(&alpha_at(&query, &sep_keys, 100.0));
+        assert!(
+            h_mdl > h_hard + 0.3,
+            "MDL read should abstain (high entropy) vs hard-wired sharp: \
+             h_mdl={h_mdl} (β*={beta_sep}) h_hard={h_hard}"
+        );
+        // ...and stay near the 50/50 ceiling (ln 2 ≈ 0.693) rather than collapse.
+        assert!(h_mdl > 0.6, "MDL read should be near-maximal entropy: {h_mdl}");
     }
 
     fn empty_seeded_collection(dir: &TempDir) -> Collection {
