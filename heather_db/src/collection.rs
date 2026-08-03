@@ -1073,14 +1073,22 @@ impl Collection {
             r
         };
 
-        // Capture activated location IDs before extending
+        // Capture the location IDs this write touched, before extending.
+        //
+        // Both halves are load-bearing. `modified_indices` covers locations
+        // the write joined; `new_locations` covers locations the write
+        // *created* — a novelty/overload split, and every write into an empty
+        // collection, which has nothing to join. Indexing only the former
+        // leaves such documents in no posting list at all, so
+        // `query_documents` (which gathers candidates from posting lists)
+        // can never return them: stored, counted by `stats`, unreachable.
+        let new_locs = result.new_locations;
         let activated_loc_ids: Vec<u64> = result
             .modified_indices
             .iter()
             .map(|&idx| inner.locations[idx].id.0)
+            .chain(new_locs.iter().map(|loc| loc.id.0))
             .collect();
-
-        let new_locs = result.new_locations;
 
         // Assign document ID
         let doc_id = inner.doc_next_id;
@@ -1651,6 +1659,72 @@ mod tests {
     /// query has no honest winner, and sharp when keys cluster tightly. The
     /// soft read is MaxEnt abstention — it refuses to amplify a hair-thin
     /// similarity gap into a confident pick the way a hard-wired high β does.
+    /// The very first document written into an empty collection must be
+    /// retrievable. It creates a location rather than joining one, so a
+    /// document index that only records `modified_indices` leaves it in no
+    /// posting list: stored, counted by `stats`, and permanently invisible to
+    /// `query_documents`. Regression test for exactly that.
+    #[test]
+    fn first_document_in_an_empty_collection_is_retrievable() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let mut config = EAMConfig::new(d).unwrap();
+        config.k = 1;
+        config.gamma = 0.0;
+        let col = Collection::new(col_id, "docs".into(), store, &config).unwrap();
+        let v = basis_vec(d, 0);
+
+        let id = col.write_with_metadata(&v, br#"{"kind":"first"}"#).unwrap();
+        assert_eq!(
+            col.num_locations().unwrap(),
+            1,
+            "the write created a location rather than joining one"
+        );
+
+        let got = col.query_documents(&v, 10).unwrap();
+        assert_eq!(got.len(), 1, "the first document must be queryable");
+        assert_eq!(got[0].0, id);
+    }
+
+    /// A split creates a new location too. A document that lands only on a
+    /// newly-spawned location must still be indexed.
+    #[test]
+    fn documents_on_newly_spawned_locations_are_indexed() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let mut config = EAMConfig::new(d).unwrap();
+        config.k = 1;
+        config.gamma = 0.0;
+        let col = Collection::new(col_id, "docs".into(), store, &config).unwrap();
+
+        // Mutually orthogonal patterns: each is novel enough to spawn its own
+        // location rather than join an existing one.
+        let vs = [
+            basis_vec(d, 0),
+            basis_vec(d, 4),
+            basis_vec(d, 8),
+            basis_vec(d, 12),
+        ];
+        let mut ids = Vec::new();
+        for (i, v) in vs.iter().enumerate() {
+            ids.push(
+                col.write_with_metadata(v, format!(r#"{{"i":{i}}}"#).as_bytes())
+                    .unwrap(),
+            );
+        }
+
+        // Every document must be findable by its own vector.
+        for (v, id) in vs.iter().zip(&ids) {
+            let got = col.query_documents(v, 10).unwrap();
+            assert!(
+                got.iter().any(|(g, _, _)| g == id),
+                "document {id} written to a spawned location is unreachable"
+            );
+        }
+    }
+
     fn basis_vec(d: usize, i: usize) -> Vec<f64> {
         let mut v = vec![0.0; d];
         v[i] = 1.0;
