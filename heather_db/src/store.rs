@@ -356,6 +356,52 @@ impl Store {
         Ok(())
     }
 
+    /// Remove a document from the store and from every posting list that
+    /// references it. Returns true when the document existed.
+    ///
+    /// There is no reverse (document -> locations) index, so this scans the
+    /// collection's posting lists. That is linear in the number of locations,
+    /// which is the right trade for the tombstone path: deletions are driven
+    /// by source-repository changes, not by queries, and a reverse index
+    /// would tax every write to speed up a rare operation.
+    pub fn delete_document_everywhere(
+        &self,
+        txn: &mut RwTxn,
+        collection_id: u32,
+        write_index: u64,
+    ) -> Result<bool> {
+        let key = document_key(collection_id, write_index);
+        let existed = self.documents_db.get(txn, &key)?.is_some();
+        if existed {
+            self.documents_db.delete(txn, &key)?;
+        }
+
+        // Collect the posting lists that mention this doc before mutating, so
+        // the iteration does not overlap the writes.
+        let prefix = collection_prefix(collection_id);
+        let mut rewrites: Vec<(Vec<u8>, Vec<u64>)> = Vec::new();
+        {
+            let iter = self.doc_index_db.prefix_iter(txn, &prefix)?;
+            for result in iter {
+                let (k, v) = result?;
+                let ids: Vec<u64> = bincode::deserialize(v)?;
+                if ids.contains(&write_index) {
+                    let kept: Vec<u64> = ids.into_iter().filter(|d| *d != write_index).collect();
+                    rewrites.push((k.to_vec(), kept));
+                }
+            }
+        }
+        for (k, kept) in rewrites {
+            if kept.is_empty() {
+                self.doc_index_db.delete(txn, k.as_slice())?;
+            } else {
+                self.doc_index_db
+                    .put(txn, k.as_slice(), &bincode::serialize(&kept)?)?;
+            }
+        }
+        Ok(existed)
+    }
+
     /// Set a hard location's full posting list (used during merge migration).
     pub fn put_doc_index_entry(
         &self,

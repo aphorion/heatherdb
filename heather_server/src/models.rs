@@ -245,6 +245,11 @@ pub struct DocumentItem {
     pub metadata: serde_json::Value,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DeleteDocumentResponse {
+    pub deleted: bool,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DocumentsResponse {
     pub documents: Vec<DocumentItem>,

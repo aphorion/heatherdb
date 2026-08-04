@@ -1163,6 +1163,46 @@ impl Collection {
         }
     }
 
+    /// The ids of this collection's hard locations, in storage order.
+    pub fn location_ids(&self) -> Result<Vec<u64>> {
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        Ok(inner.locations.iter().map(|l| l.id.0).collect())
+    }
+
+    /// The document ids indexed under one hard location — the posting list
+    /// `query_documents` gathers its candidates from.
+    pub fn doc_ids_for_location(&self, location_id: u64) -> Result<Vec<u64>> {
+        self.store
+            .get_doc_ids_for_location(self.collection_id, location_id)
+    }
+
+    /// Delete a document: remove it from the document store and from every
+    /// posting list that references it. Returns true when it existed.
+    ///
+    /// **This is a retrieval and citation tombstone, not an erasure of the
+    /// document's influence on the memory.** A write accumulates its pattern
+    /// into one or more hard locations, and superposition cannot cleanly
+    /// subtract one term from a merged engram — the arithmetic that added it
+    /// is not invertible once other writes have landed on the same location.
+    /// After this call the document can never be returned by
+    /// `query_documents`, fetched by id, or named as a contributor; its
+    /// residual contribution to a location's address and counter decays only
+    /// through subsequent writes and consolidation.
+    ///
+    /// Callers with a legal erasure obligation must treat that distinction as
+    /// load-bearing: use a separate collection (or database) for material
+    /// that may need to be destroyed, so the unit of erasure is one the
+    /// substrate can actually drop.
+    pub fn delete_document(&self, write_index: u64) -> Result<bool> {
+        let _guard = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut txn = self.store.write_txn()?;
+        let existed =
+            self.store
+                .delete_document_everywhere(&mut txn, self.collection_id, write_index)?;
+        txn.commit()?;
+        Ok(existed)
+    }
+
     /// List all documents in this collection.
     pub fn list_documents(&self) -> Result<Vec<DocumentRecord>> {
         let raw = self.store.list_documents(self.collection_id)?;
@@ -1723,6 +1763,57 @@ mod tests {
                 "document {id} written to a spawned location is unreachable"
             );
         }
+    }
+
+    /// Deletion removes a document from retrieval and from every posting
+    /// list, leaves its neighbours alone, and is idempotent.
+    #[test]
+    fn delete_document_removes_it_from_retrieval_and_postings() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let mut config = EAMConfig::new(d).unwrap();
+        config.k = 1;
+        config.gamma = 0.0;
+        let col = Collection::new(col_id, "docs".into(), store, &config).unwrap();
+
+        let a = basis_vec(d, 0);
+        let b = basis_vec(d, 8);
+        let victim = col.write_with_metadata(&a, br#"{"n":"remove"}"#).unwrap();
+        let survivor = col.write_with_metadata(&b, br#"{"n":"keep"}"#).unwrap();
+
+        assert!(
+            col.delete_document(victim).unwrap(),
+            "an existing document reports deleted"
+        );
+
+        // gone from query results ...
+        let after = col.query_documents(&a, 10).unwrap();
+        assert!(
+            !after.iter().any(|(id, _, _)| *id == victim),
+            "deleted document still returned by query_documents"
+        );
+        // ... and from the document store ...
+        assert!(col.get_document(victim).unwrap().is_none());
+        // ... while its neighbour survives.
+        assert!(
+            col.query_documents(&b, 10)
+                .unwrap()
+                .iter()
+                .any(|(id, _, _)| *id == survivor)
+        );
+
+        // no posting list anywhere still names it
+        for loc_id in col.location_ids().unwrap() {
+            assert!(
+                !col.doc_ids_for_location(loc_id).unwrap().contains(&victim),
+                "location {loc_id} still references the deleted document"
+            );
+        }
+
+        // idempotent: a replayed tombstone must not error
+        assert!(!col.delete_document(victim).unwrap());
+        assert!(!col.delete_document(999_999).unwrap());
     }
 
     fn basis_vec(d: usize, i: usize) -> Vec<f64> {
