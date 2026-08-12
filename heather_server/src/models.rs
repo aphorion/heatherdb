@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use heather_db::RoleCleanup;
 use serde::{Deserialize, Serialize};
 
 // --- Requests ---
@@ -290,6 +291,56 @@ pub struct QueryDocumentsRequest {
     /// See `Collection::query_documents_scoped` for why this exists.
     #[serde(default)]
     pub unbind_role: Option<Vec<f64>>,
+    /// Multi-role scoring. When non-empty, `query` is used **only** for recall
+    /// and ranking (plain full-bundle cosine) and each pair contributes one
+    /// similarity per returned document, in this order. Mutually exclusive
+    /// with `unbind_role`.
+    ///
+    /// Ranking ignores the pairs entirely, so a document that would rank well
+    /// under the caller's weighting can fail to be recalled at all — ask for
+    /// an `n` far larger than you intend to display. See
+    /// `Collection::query_documents_multi_role`.
+    #[serde(default)]
+    pub role_pairs: Vec<RoleFillerPair>,
+    /// Cleanup of the recovered filler; omitted means MDL-calibrated cleanup.
+    #[serde(default)]
+    pub cleanup: CleanupSpec,
+}
+
+/// One scoring criterion: the role to unbind by and the filler expected there.
+///
+/// Each criterion carries its own filler. `unbind_role` reuses the recall
+/// `query` as the filler, which conflates two different vectors; this does
+/// not.
+#[derive(Debug, Deserialize)]
+pub struct RoleFillerPair {
+    pub role: Vec<f64>,
+    pub filler: Vec<f64>,
+}
+
+/// Wire form of `heather_db::RoleCleanup`.
+///
+/// `"mdl"` (the default), `"off"`, or `{"beta": 100.0}`. Betas below the
+/// engine's floor are clamped; the temperature actually used comes back as
+/// `cleanup_beta`. See `heather_db::RoleCleanup` for the measured sharpness
+/// curve — a soft beta yields a plausible-looking but wrong ordering.
+#[derive(Debug, Deserialize, Default, Clone, Copy, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CleanupSpec {
+    #[default]
+    Mdl,
+    Off,
+    Beta(f64),
+}
+
+impl From<CleanupSpec> for RoleCleanup {
+    fn from(spec: CleanupSpec) -> Self {
+        match spec {
+            CleanupSpec::Mdl => RoleCleanup::Mdl,
+            CleanupSpec::Off => RoleCleanup::Off,
+            CleanupSpec::Beta(b) => RoleCleanup::Beta(b),
+        }
+    }
 }
 
 fn default_n() -> usize {
@@ -301,11 +352,19 @@ pub struct QueryDocumentResult {
     pub id: u64,
     pub similarity: f64,
     pub metadata: serde_json::Value,
+    /// One similarity per requested `role_pairs` entry, in request order.
+    /// Omitted when no pairs were requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role_scores: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct QueryDocumentsResponse {
     pub results: Vec<QueryDocumentResult>,
+    /// Cleanup temperature the engine actually ran at. Omitted when cleanup
+    /// was off or no `role_pairs` were requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cleanup_beta: Option<f64>,
 }
 
 // --- Bulk load (deterministic location placement) ---
@@ -468,5 +527,67 @@ mod tests {
         // unsupplied knobs stay None so the engine default is kept
         assert_eq!(eam.beta, None);
         assert_eq!(eam.num_landmarks, None);
+    }
+
+    /// The multi-role wire contract. Omitting `cleanup` must mean MDL cleanup,
+    /// not "no cleanup" — a client that forgets the field gets the correct
+    /// behaviour, and only an explicit `"off"` opts out.
+    #[test]
+    fn query_documents_request_defaults_to_mdl_cleanup_and_no_pairs() {
+        let req: QueryDocumentsRequest = serde_json::from_str(r#"{"query":[1.0,0.0]}"#).unwrap();
+        assert_eq!(req.cleanup, CleanupSpec::Mdl);
+        assert!(req.role_pairs.is_empty());
+        assert!(req.unbind_role.is_none());
+        assert!(matches!(RoleCleanup::from(req.cleanup), RoleCleanup::Mdl));
+    }
+
+    #[test]
+    fn cleanup_spec_parses_all_three_modes() {
+        let parse = |s: &str| -> CleanupSpec { serde_json::from_str(s).unwrap() };
+        assert_eq!(parse(r#""mdl""#), CleanupSpec::Mdl);
+        assert_eq!(parse(r#""off""#), CleanupSpec::Off);
+        assert_eq!(parse(r#"{"beta":100.0}"#), CleanupSpec::Beta(100.0));
+        assert!(matches!(
+            RoleCleanup::from(parse(r#"{"beta":100.0}"#)),
+            RoleCleanup::Beta(b) if b == 100.0
+        ));
+    }
+
+    /// Pair order is the caller's, and `role_scores` comes back in it — so the
+    /// request must preserve it verbatim rather than, say, keying by role.
+    #[test]
+    fn role_pairs_deserialize_in_request_order() {
+        let req: QueryDocumentsRequest = serde_json::from_str(
+            r#"{"query":[1.0,0.0],"n":50,"role_pairs":[
+                 {"role":[1.0,0.0],"filler":[0.0,1.0]},
+                 {"role":[0.0,1.0],"filler":[1.0,0.0]}],
+               "cleanup":"off"}"#,
+        )
+        .unwrap();
+        assert_eq!(req.n, 50);
+        assert_eq!(req.cleanup, CleanupSpec::Off);
+        assert_eq!(req.role_pairs.len(), 2);
+        assert_eq!(req.role_pairs[0].role, vec![1.0, 0.0]);
+        assert_eq!(req.role_pairs[1].role, vec![0.0, 1.0]);
+    }
+
+    /// `role_scores` and `cleanup_beta` are additive: a response with neither
+    /// must be byte-identical to what pre-multi-role clients already parse.
+    #[test]
+    fn single_role_responses_are_unchanged_on_the_wire() {
+        let body = serde_json::to_string(&QueryDocumentsResponse {
+            results: vec![QueryDocumentResult {
+                id: 7,
+                similarity: 0.5,
+                metadata: serde_json::Value::Null,
+                role_scores: None,
+            }],
+            cleanup_beta: None,
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            r#"{"results":[{"id":7,"similarity":0.5,"metadata":null}]}"#
+        );
     }
 }

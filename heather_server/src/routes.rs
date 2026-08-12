@@ -10,7 +10,7 @@ use heather_algebra::{
     EAMSnapshot, bind_vec, circular_convolve, compose_read as algebra_compose_read, ops, pow_vec,
     unbind_exact_vec, unbind_vec,
 };
-use heather_db::{HardLocation, Hive, LocationId, ReadStrategy};
+use heather_db::{HardLocation, Hive, LocationId, ReadStrategy, RoleCleanup};
 use rayon::prelude::*;
 
 use crate::limits;
@@ -874,6 +874,18 @@ pub async fn query_documents(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
+    if !req.role_pairs.is_empty() {
+        if req.unbind_role.is_some() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "`unbind_role` and `role_pairs` are mutually exclusive: the \
+                 single-role path reuses `query` as the filler, the multi-role \
+                 path gives every pair its own",
+            );
+        }
+        return multi_role_query(col, req).await;
+    }
+
     let result = tokio::task::spawn_blocking(move || {
         col.query_documents_scoped(&req.query, req.n, req.unbind_role.as_deref())
     })
@@ -890,10 +902,60 @@ pub async fn query_documents(
                             id,
                             similarity,
                             metadata,
+                            role_scores: None,
                         })
                 })
                 .collect();
-            Json(QueryDocumentsResponse { results }).into_response()
+            Json(QueryDocumentsResponse {
+                results,
+                cleanup_beta: None,
+            })
+            .into_response()
+        }
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// Multi-role arm of [`query_documents`]. `similarity` stays the plain
+/// full-bundle recall score that ordered the results; the per-criterion
+/// breakdown rides alongside it in `role_scores`, unweighted and unaggregated.
+async fn multi_role_query(
+    col: Arc<heather_db::Collection>,
+    req: QueryDocumentsRequest,
+) -> Response {
+    let cleanup: RoleCleanup = req.cleanup.into();
+    let result = tokio::task::spawn_blocking(move || {
+        let pairs: Vec<(&[f64], &[f64])> = req
+            .role_pairs
+            .iter()
+            .map(|p| (p.role.as_slice(), p.filler.as_slice()))
+            .collect();
+        col.query_documents_multi_role(&req.query, req.n, &pairs, cleanup)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(out)) => {
+            let results: Vec<QueryDocumentResult> = out
+                .hits
+                .into_iter()
+                .filter_map(|hit| {
+                    serde_json::from_slice(&hit.metadata)
+                        .ok()
+                        .map(|metadata| QueryDocumentResult {
+                            id: hit.doc_id,
+                            similarity: hit.recall_score,
+                            metadata,
+                            role_scores: Some(hit.role_scores),
+                        })
+                })
+                .collect();
+            Json(QueryDocumentsResponse {
+                results,
+                cleanup_beta: out.cleanup_beta,
+            })
+            .into_response()
         }
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
