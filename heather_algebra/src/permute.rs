@@ -1,6 +1,6 @@
 //! Permutation binding (S_D) — the non-commutative complement to convolution.
 //!
-//! EAM's primary binding operator ([`crate::bind`]) is **circular
+//! EAM's primary binding operator ([`crate::bind()`]) is **circular
 //! convolution**, which *commutes*: `a ⊛ b = b ⊛ a`. Commutativity is
 //! exactly what makes it lose **order** — convolution cannot distinguish
 //! "a then b" from "b then a". Sequences, role chains, and any structure
@@ -156,7 +156,7 @@ impl Permutation {
 
     /// Materialise the index map of ρ^k once: `out[i]` is the source
     /// coordinate that lands at position `i` after applying ρ^k. Gathering
-    /// `v` through this map (`out[i] = v[map[i]]`) equals [`apply_pow`].
+    /// `v` through this map (`out[i] = v[map[i]]`) equals [`Self::apply_pow`].
     ///
     /// Returns a borrow of the stored forward/inverse map for `k ∈ {1, -1}`
     /// (zero allocation), and an owned composed map otherwise. Useful when
