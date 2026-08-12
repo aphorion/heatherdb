@@ -10,12 +10,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::Router;
 use axum::extract::{DefaultBodyLimit, Extension};
 use axum::middleware;
 use axum::routing::{delete, get, post};
-use axum::Router;
 use clap::{Parser, Subcommand};
-use heather_db::{Server, DEFAULT_DB};
+use heather_db::{DEFAULT_DB, Server};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -135,12 +135,15 @@ fn main() -> std::process::ExitCode {
     if let Some(cmd) = &args.command {
         let data_dir = match resolve_data_dir(&args) {
             Ok(d) => d,
-            Err(e) => { eprintln!("error: {e}"); return std::process::ExitCode::FAILURE; }
+            Err(e) => {
+                eprintln!("error: {e}");
+                return std::process::ExitCode::FAILURE;
+            }
         };
         return match cmd {
-            Cmd::User     { cmd } => cli::run(&data_dir, cmd),
-            Cmd::Backup   { cmd } => backup::run_backup(&data_dir, cmd),
-            Cmd::Restore  { cmd } => backup::run_restore(&data_dir, cmd),
+            Cmd::User { cmd } => cli::run(&data_dir, cmd),
+            Cmd::Backup { cmd } => backup::run_backup(&data_dir, cmd),
+            Cmd::Restore { cmd } => backup::run_restore(&data_dir, cmd),
             Cmd::Snapshot { cmd } => backup::run_snapshot(&data_dir, cmd),
         };
     }
@@ -164,7 +167,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
 
     let data_dir = match resolve_data_dir(&args) {
         Ok(d) => d,
-        Err(e) => { eprintln!("error: {e}"); return std::process::ExitCode::FAILURE; }
+        Err(e) => {
+            eprintln!("error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
 
     // Open the multi-tenant server. On a fresh boot this lazily creates
@@ -187,7 +193,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
     // Auth — load (or create) the user store.
     let user_store = match users::UserStore::load(&data_dir) {
         Ok(s) => Arc::new(s),
-        Err(e) => { eprintln!("error: load user store: {e}"); return std::process::ExitCode::FAILURE; }
+        Err(e) => {
+            eprintln!("error: load user store: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
     let auth_state = if args.auth_disabled {
         tracing::warn!(
@@ -229,11 +238,20 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/collections/{name}/config", get(routes::collection_config))
         .route("/collections/{name}/locations", get(routes::locations))
         .route("/collections/{name}/analyze", post(routes::analyze))
-        .route("/collections/{name}/batch_analyze", post(routes::batch_analyze))
+        .route(
+            "/collections/{name}/batch_analyze",
+            post(routes::batch_analyze),
+        )
         .route("/collections/{name}/fingerprint", get(routes::fingerprint))
         .route("/collections/{name}/documents", get(routes::get_documents))
-        .route("/collections/{name}/documents/query", post(routes::query_documents))
-        .route("/collections/{name}/documents/{doc_id}", get(routes::get_document))
+        .route(
+            "/collections/{name}/documents/query",
+            post(routes::query_documents),
+        )
+        .route(
+            "/collections/{name}/documents/{doc_id}",
+            get(routes::get_document),
+        )
         .route("/algebra/add", post(routes::algebra_add))
         .route("/algebra/sub", post(routes::algebra_sub))
         .route("/algebra/scale", post(routes::algebra_scale))
@@ -254,23 +272,56 @@ async fn serve(args: Args) -> std::process::ExitCode {
     let db_scoped_router = Router::new()
         .route("/db/{db}/collections", post(routes_db::create_collection))
         .route("/db/{db}/collections", get(routes_db::list_collections))
-        .route("/db/{db}/collections/{name}", delete(routes_db::drop_collection))
+        .route(
+            "/db/{db}/collections/{name}",
+            delete(routes_db::drop_collection),
+        )
         .route("/db/{db}/collections/{name}/write", post(routes_db::write))
-        .route("/db/{db}/collections/{name}/bulk_load", post(routes_db::bulk_load))
+        .route(
+            "/db/{db}/collections/{name}/bulk_load",
+            post(routes_db::bulk_load),
+        )
         .route("/db/{db}/collections/{name}/read", post(routes_db::read))
         .route("/db/{db}/collections/{name}/stats", get(routes_db::stats))
-        .route("/db/{db}/collections/{name}/config", get(routes_db::collection_config))
-        .route("/db/{db}/collections/{name}/locations", get(routes_db::locations))
-        .route("/db/{db}/collections/{name}/analyze", post(routes_db::analyze))
-        .route("/db/{db}/collections/{name}/batch_analyze", post(routes_db::batch_analyze))
-        .route("/db/{db}/collections/{name}/fingerprint", get(routes_db::fingerprint))
-        .route("/db/{db}/collections/{name}/documents", get(routes_db::get_documents))
-        .route("/db/{db}/collections/{name}/documents/query", post(routes_db::query_documents))
-        .route("/db/{db}/collections/{name}/documents/{doc_id}", get(routes_db::get_document))
+        .route(
+            "/db/{db}/collections/{name}/config",
+            get(routes_db::collection_config),
+        )
+        .route(
+            "/db/{db}/collections/{name}/locations",
+            get(routes_db::locations),
+        )
+        .route(
+            "/db/{db}/collections/{name}/analyze",
+            post(routes_db::analyze),
+        )
+        .route(
+            "/db/{db}/collections/{name}/batch_analyze",
+            post(routes_db::batch_analyze),
+        )
+        .route(
+            "/db/{db}/collections/{name}/fingerprint",
+            get(routes_db::fingerprint),
+        )
+        .route(
+            "/db/{db}/collections/{name}/documents",
+            get(routes_db::get_documents),
+        )
+        .route(
+            "/db/{db}/collections/{name}/documents/query",
+            post(routes_db::query_documents),
+        )
+        .route(
+            "/db/{db}/collections/{name}/documents/{doc_id}",
+            get(routes_db::get_document),
+        )
         .route("/db/{db}/algebra/add", post(routes_db::algebra_add))
         .route("/db/{db}/algebra/sub", post(routes_db::algebra_sub))
         .route("/db/{db}/algebra/scale", post(routes_db::algebra_scale))
-        .route("/db/{db}/algebra/intersect", post(routes_db::algebra_intersect))
+        .route(
+            "/db/{db}/algebra/intersect",
+            post(routes_db::algebra_intersect),
+        )
         .route("/db/{db}/algebra/bind", post(routes_db::algebra_bind))
         .route("/db/{db}/algebra/unbind", post(routes_db::algebra_unbind))
         .route("/db/{db}/compose/read", post(routes_db::compose_read));
@@ -280,10 +331,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .merge(legacy_router)
         .merge(db_admin_router)
         .merge(db_scoped_router)
-        .layer(middleware::from_fn_with_state(
-            auth_state,
-            auth::middleware,
-        ))
+        .layer(middleware::from_fn_with_state(auth_state, auth::middleware))
         .layer(Extension(server.clone()))
         .layer(
             ServiceBuilder::new()
@@ -307,7 +355,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
 
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l) => l,
-        Err(e) => { eprintln!("bind error: {e}"); return std::process::ExitCode::FAILURE; }
+        Err(e) => {
+            eprintln!("bind error: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
     };
 
     if let Err(e) = axum::serve(listener, app)

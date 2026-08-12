@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use heather_db::{Collection, Hive, EAMConfig};
+use heather_db::{Collection, EAMConfig, Hive};
 use rand::Rng;
 use rand_distr::StandardNormal;
 use tempfile::TempDir;

@@ -1,5 +1,5 @@
-use heather_db::vec_ops;
 use heather_db::EAMConfig;
+use heather_db::vec_ops;
 
 use crate::consolidate::consolidate;
 use crate::error::{AlgebraError, Result};
@@ -32,7 +32,7 @@ fn extract_patterns(snap: &EAMSnapshot) -> Vec<Vec<f64>> {
 /// Create pairwise-combination locations from two sets of patterns.
 ///
 /// For each pair (i, j), creates a location whose:
-///   - counter = pattern_a[i] ± pattern_b[j]  (sign applied to b)
+///   - counter = `pattern_a[i] ± pattern_b[j]`  (sign applied to b)
 ///   - address = normalize(counter)
 ///   - write_count = 1.0
 ///
@@ -68,10 +68,7 @@ fn pairwise_combine(
                     )
                 })
                 .collect();
-            sims.sort_by(|a, b| {
-                b.1.partial_cmp(&a.1)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
+            sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
             sims.truncate(max_cross_k);
             Box::new(sims.into_iter().map(|(j, _)| j))
         };
@@ -90,8 +87,7 @@ fn pairwise_combine(
             }
 
             let address = vec_ops::normalize(&combined);
-            let mut loc =
-                heather_db::HardLocation::new(heather_db::LocationId(id), address);
+            let mut loc = heather_db::HardLocation::new(heather_db::LocationId(id), address);
             loc.counter = combined;
             loc.write_count = 1.0;
             locations.push(loc);
@@ -124,11 +120,7 @@ pub fn add(a: &EAMSnapshot, b: &EAMSnapshot) -> Result<EAMSnapshot> {
 
 /// Like [`add`], but limits each A-location to its `max_cross_k` nearest
 /// B-locations instead of the full cartesian product. Use for large EAMs.
-pub fn add_with_limit(
-    a: &EAMSnapshot,
-    b: &EAMSnapshot,
-    max_cross_k: usize,
-) -> Result<EAMSnapshot> {
+pub fn add_with_limit(a: &EAMSnapshot, b: &EAMSnapshot, max_cross_k: usize) -> Result<EAMSnapshot> {
     check_dims(a, b)?;
 
     // Edge cases: adding to/from empty is identity
@@ -159,11 +151,7 @@ pub fn sub(a: &EAMSnapshot, b: &EAMSnapshot) -> Result<EAMSnapshot> {
 }
 
 /// Like [`sub`], but with cross-pair limit for large EAMs.
-pub fn sub_with_limit(
-    a: &EAMSnapshot,
-    b: &EAMSnapshot,
-    max_cross_k: usize,
-) -> Result<EAMSnapshot> {
+pub fn sub_with_limit(a: &EAMSnapshot, b: &EAMSnapshot, max_cross_k: usize) -> Result<EAMSnapshot> {
     check_dims(a, b)?;
 
     if a.locations.is_empty() {
@@ -205,7 +193,7 @@ pub fn scale(a: &EAMSnapshot, alpha: f64) -> Result<EAMSnapshot> {
         ));
     }
 
-    let mut locations: Vec<_> = a.locations.iter().cloned().collect();
+    let mut locations: Vec<_> = a.locations.to_vec();
     for loc in &mut locations {
         for c in loc.counter.iter_mut() {
             *c *= alpha;
@@ -254,9 +242,9 @@ pub fn intersect(a: &EAMSnapshot, b: &EAMSnapshot, threshold: f64) -> Result<EAM
 #[cfg(test)]
 mod tests {
     use super::*;
+    use heather_db::HardLocation;
     use heather_db::location::LocationId;
     use heather_db::vec_ops;
-    use heather_db::HardLocation;
 
     fn make_loc(id: u64, addr: &[f64], pattern: &[f64], wc: f64) -> HardLocation {
         let mut loc = HardLocation::new(LocationId(id), vec_ops::normalize(addr));
@@ -269,7 +257,7 @@ mod tests {
         let mut config = EAMConfig::new(d).unwrap();
         config.l_0 = 1;
         config.l_0 = locations.len().max(1);
-        config.k = locations.len().min(20).max(1);
+        config.k = locations.len().clamp(1, 20);
         EAMSnapshot { locations, config }
     }
 
@@ -438,7 +426,11 @@ mod tests {
         let original_counter = a.locations[0].counter.clone();
 
         let result = negate(&negate(&a).unwrap()).unwrap();
-        for (c1, c2) in result.locations[0].counter.iter().zip(original_counter.iter()) {
+        for (c1, c2) in result.locations[0]
+            .counter
+            .iter()
+            .zip(original_counter.iter())
+        {
             assert!((c1 - c2).abs() < 1e-10);
         }
     }
@@ -495,10 +487,7 @@ mod tests {
             vec![make_loc(0, &[1.0, 0.0, 0.0], &[1.0, 0.0, 0.0], 5.0)],
             3,
         );
-        let b = make_snapshot(
-            vec![make_loc(0, &[1.0, 0.0], &[1.0, 0.0], 5.0)],
-            2,
-        );
+        let b = make_snapshot(vec![make_loc(0, &[1.0, 0.0], &[1.0, 0.0], 5.0)], 2);
 
         assert!(add(&a, &b).is_err());
         assert!(sub(&a, &b).is_err());

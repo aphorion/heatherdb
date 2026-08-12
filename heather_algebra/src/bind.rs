@@ -176,23 +176,13 @@ pub fn bind_with_limit(
     }
 
     let d = a.dim();
-    let patterns_a: Vec<Vec<f64>> = a
-        .locations
-        .iter()
-        .map(|l| l.normalized_pattern())
-        .collect();
-    let patterns_b: Vec<Vec<f64>> = b
-        .locations
-        .iter()
-        .map(|l| l.normalized_pattern())
-        .collect();
+    let patterns_a: Vec<Vec<f64>> = a.locations.iter().map(|l| l.normalized_pattern()).collect();
+    let patterns_b: Vec<Vec<f64>> = b.locations.iter().map(|l| l.normalized_pattern()).collect();
 
     // Pre-FFT every input pattern in parallel. Each pair op below is
     // then just a pointwise multiply + IFFT.
-    let specs_a: Vec<Vec<Complex<f64>>> =
-        patterns_a.par_iter().map(|p| fft_forward(p)).collect();
-    let specs_b: Vec<Vec<Complex<f64>>> =
-        patterns_b.par_iter().map(|p| fft_forward(p)).collect();
+    let specs_a: Vec<Vec<Complex<f64>>> = patterns_a.par_iter().map(|p| fft_forward(p)).collect();
+    let specs_b: Vec<Vec<Complex<f64>>> = patterns_b.par_iter().map(|p| fft_forward(p)).collect();
 
     let use_full = max_cross_k == 0 || max_cross_k >= b.locations.len();
 
@@ -209,16 +199,9 @@ pub fn bind_with_limit(
                     .locations
                     .iter()
                     .enumerate()
-                    .map(|(j, lb)| {
-                        (
-                            j,
-                            vec_ops::cosine_similarity(&la.address, &lb.address),
-                        )
-                    })
+                    .map(|(j, lb)| (j, vec_ops::cosine_similarity(&la.address, &lb.address)))
                     .collect();
-                sims.sort_by(|x, y| {
-                    y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal)
-                });
+                sims.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
                 sims.truncate(max_cross_k);
                 sims.into_iter()
                     .map(move |(j, _)| (i, j))
@@ -336,7 +319,10 @@ mod tests {
         let mut config = EAMConfig::new(d).unwrap();
         config.l_0 = 1;
         config.k = 1;
-        EAMSnapshot { locations: vec![loc], config }
+        EAMSnapshot {
+            locations: vec![loc],
+            config,
+        }
     }
 
     #[test]
@@ -541,13 +527,13 @@ mod tests {
         let b = rand_unit(d, &mut rng);
 
         let mut naive = vec![0.0; d];
-        for k in 0..d {
+        for (k, out) in naive.iter_mut().enumerate() {
             let mut sum = 0.0;
-            for i in 0..d {
+            for (i, ai) in a.iter().enumerate() {
                 let j = (k + d - i) % d;
-                sum += a[i] * b[j];
+                sum += ai * b[j];
             }
-            naive[k] = sum;
+            *out = sum;
         }
         let fft = circular_convolve(&a, &b);
         for (x, y) in naive.iter().zip(fft.iter()) {

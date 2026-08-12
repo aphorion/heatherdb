@@ -111,17 +111,19 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   # ─── msrv: ensure we still build on the documented minimum supported Rust ──
-  # Set MSRV to the Cargo.toml `rust-version` if present, otherwise pick a
-  # known-good floor. Adjust as needed.
+  # Mirrors `rust-version` in every crate's Cargo.toml — keep the two in step.
   msrv:
-    name: msrv (1.84)
+    name: msrv (1.88)
     runs-on: ubuntu-latest
     needs: fmt
     steps:
       - uses: actions/checkout@v4
-      # Cargo workspace uses resolver = "3", which requires Rust 1.84+.
-      # Bump alongside any Cargo.toml `rust-version` change.
-      - uses: dtolnay/rust-toolchain@1.84
+      # 1.88 is the real floor, and each constraint below subsumes the last:
+      # resolver = "3" needs 1.84, edition = "2024" needs 1.85, and the
+      # let-chains in heather_db::read need 1.88. This job pinned 1.84 until
+      # the fmt gate ahead of it started passing, at which point it could
+      # never have succeeded — cargo refuses the edition outright.
+      - uses: dtolnay/rust-toolchain@1.88
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: ci-msrv

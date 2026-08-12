@@ -46,11 +46,11 @@ pub mod store;
 pub mod vec_ops;
 pub mod write;
 
-pub use collection::{Collection, LocationSummary, ReadStrategy, EAMStats};
+pub use collection::{Collection, EAMStats, LocationSummary, ReadStrategy};
 pub use config::EAMConfig;
-pub use db_config::{validate_db_name, DbConfig, DEFAULT_MAP_SIZE_MB};
+pub use db_config::{DEFAULT_MAP_SIZE_MB, DbConfig, validate_db_name};
 pub use error::HeatherError;
 pub use hive::Hive;
 pub use location::{HardLocation, LocationId};
 pub use read::{ActivatedLocation, ReadTrace};
-pub use server::{default_db_config, Server, DEFAULT_DB};
+pub use server::{DEFAULT_DB, Server, default_db_config};

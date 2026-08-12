@@ -10,6 +10,9 @@ use crate::store::Store;
 use crate::vec_ops;
 use crate::write;
 
+/// A stored document as it comes back off the wire: id, vector, metadata blob.
+pub type DocumentRecord = (u64, Vec<f64>, Vec<u8>);
+
 /// Statistics about the current state of an EAM collection.
 #[derive(Debug, Clone)]
 pub struct EAMStats {
@@ -48,7 +51,7 @@ pub(crate) struct EAMInner {
     /// Flat LocationId → index lookup array for O(1) graph traversal
     pub(crate) id_lookup: Vec<u32>,
     /// Contiguous [L × D] address matrix for cache-friendly brute-force activation.
-    /// Row i = locations[i].address. Updated incrementally on writes.
+    /// Row i = `locations[i].address`. Updated incrementally on writes.
     pub(crate) address_matrix: Vec<f64>,
 }
 
@@ -81,7 +84,8 @@ impl EAMInner {
     /// Append addresses for newly added locations.
     pub(crate) fn append_addresses(&mut self, start_idx: usize) {
         for i in start_idx..self.locations.len() {
-            self.address_matrix.extend_from_slice(&self.locations[i].address);
+            self.address_matrix
+                .extend_from_slice(&self.locations[i].address);
         }
     }
 
@@ -135,12 +139,7 @@ impl Collection {
             "next_id",
             &bincode::serialize(&next_id)?,
         )?;
-        store.put_metadata(
-            &mut txn,
-            collection_id,
-            "eta",
-            &bincode::serialize(&eta)?,
-        )?;
+        store.put_metadata(&mut txn, collection_id, "eta", &bincode::serialize(&eta)?)?;
         store.put_metadata(
             &mut txn,
             collection_id,
@@ -202,13 +201,13 @@ impl Collection {
             .unwrap_or(0);
 
         // Verify dimensionality
-        if let Some(first) = locations.first() {
-            if first.address.len() != config.d {
-                return Err(HeatherError::DimensionMismatch {
-                    expected: config.d,
-                    got: first.address.len(),
-                });
-            }
+        if let Some(first) = locations.first()
+            && first.address.len() != config.d
+        {
+            return Err(HeatherError::DimensionMismatch {
+                expected: config.d,
+                got: first.address.len(),
+            });
         }
 
         let id_lookup = read::build_id_lookup(&locations);
@@ -290,8 +289,7 @@ impl Collection {
         }
 
         for loc in &new_locs {
-            self.store
-                .put_location(&mut txn, self.collection_id, loc)?;
+            self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
 
         self.store.put_metadata(
@@ -397,8 +395,7 @@ impl Collection {
         }
 
         for loc in &all_new_locs {
-            self.store
-                .put_location(&mut txn, self.collection_id, loc)?;
+            self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
 
         self.store.put_metadata(
@@ -488,20 +485,26 @@ impl Collection {
             // Migrate posting lists: removed → survivor
             for &(removed_id, survivor_id) in &result.merge_map {
                 let removed_docs = self.store.get_doc_ids_for_location_txn(
-                    &txn, self.collection_id, removed_id,
+                    &txn,
+                    self.collection_id,
+                    removed_id,
                 )?;
                 if !removed_docs.is_empty() {
                     let mut survivor_docs = self.store.get_doc_ids_for_location_txn(
-                        &txn, self.collection_id, survivor_id,
+                        &txn,
+                        self.collection_id,
+                        survivor_id,
                     )?;
                     survivor_docs.extend(removed_docs);
                     self.store.put_doc_index_entry(
-                        &mut txn, self.collection_id, survivor_id, &survivor_docs,
+                        &mut txn,
+                        self.collection_id,
+                        survivor_id,
+                        &survivor_docs,
                     )?;
                 }
-                self.store.delete_doc_index_entry(
-                    &mut txn, self.collection_id, removed_id,
-                )?;
+                self.store
+                    .delete_doc_index_entry(&mut txn, self.collection_id, removed_id)?;
             }
 
             for &id in &result.removed_ids {
@@ -525,8 +528,7 @@ impl Collection {
 
         let mut txn = self.store.write_txn()?;
         for loc in &inner.locations {
-            self.store
-                .put_location(&mut txn, self.collection_id, loc)?;
+            self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
         self.store.put_metadata(
             &mut txn,
@@ -604,8 +606,7 @@ impl Collection {
                 .put_location(&mut txn, self.collection_id, &inner.locations[idx])?;
         }
         for loc in &new_locs {
-            self.store
-                .put_location(&mut txn, self.collection_id, loc)?;
+            self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
 
         // Persist document (vector + metadata)
@@ -666,7 +667,7 @@ impl Collection {
     }
 
     /// List all documents in this collection.
-    pub fn list_documents(&self) -> Result<Vec<(u64, Vec<f64>, Vec<u8>)>> {
+    pub fn list_documents(&self) -> Result<Vec<DocumentRecord>> {
         let raw = self.store.list_documents(self.collection_id)?;
         let mut docs = Vec::with_capacity(raw.len());
         for (id, data) in raw {
@@ -713,14 +714,19 @@ impl Collection {
         let rtxn = self.store.read_txn()?;
         for &idx in &indices {
             let loc_id = inner.locations[idx].id.0;
-            let doc_ids = self.store.get_doc_ids_for_location_txn(&rtxn, self.collection_id, loc_id)?;
+            let doc_ids =
+                self.store
+                    .get_doc_ids_for_location_txn(&rtxn, self.collection_id, loc_id)?;
             candidate_ids.extend(doc_ids);
         }
 
         // Step 3: Fetch candidates and compute exact cosine similarity
         let mut scored: Vec<(u64, f64, Vec<u8>)> = Vec::with_capacity(candidate_ids.len());
         for doc_id in candidate_ids {
-            if let Some(data) = self.store.get_document_txn(&rtxn, self.collection_id, doc_id)? {
+            if let Some(data) = self
+                .store
+                .get_document_txn(&rtxn, self.collection_id, doc_id)?
+            {
                 let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
                 let sim = vec_ops::cosine_similarity(query, &vec);
                 scored.push((doc_id, sim, meta));
@@ -849,11 +855,7 @@ impl Collection {
     /// Replace this collection's in-memory EAM state from a snapshot.
     /// Flushes the new state to persistent storage atomically.
     /// Resets next_id to max(location_ids) + 1.
-    pub fn load_snapshot(
-        &self,
-        locations: Vec<HardLocation>,
-        config: EAMConfig,
-    ) -> Result<()> {
+    pub fn load_snapshot(&self, locations: Vec<HardLocation>, config: EAMConfig) -> Result<()> {
         config.validate()?;
 
         for loc in &locations {
@@ -883,8 +885,7 @@ impl Collection {
         }
 
         for loc in &locations {
-            self.store
-                .put_location(&mut txn, self.collection_id, loc)?;
+            self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
 
         self.store.put_metadata(
@@ -962,8 +963,7 @@ impl Collection {
                         .collect();
                     let alpha = vec_ops::softmax(&step_sims, inner.config.beta);
                     final_weights = alpha.clone();
-                    let pattern_refs: Vec<&[f64]> =
-                        patterns.iter().map(|p| p.as_slice()).collect();
+                    let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
                     let xi_new = vec_ops::normalize(&vec_ops::weighted_sum(&pattern_refs, &alpha));
                     let sim = vec_ops::cosine_similarity(&xi, &xi_new);
                     xi = xi_new;
@@ -1066,7 +1066,7 @@ mod tests {
         let config = test_config();
         let col = Collection::new(col_id, "test".into(), store, &config).unwrap();
 
-        let pattern = vec_ops::normalize(&vec![1.0; 16]);
+        let pattern = vec_ops::normalize(&[1.0; 16]);
 
         for _ in 0..20 {
             col.write(&pattern).unwrap();
@@ -1092,7 +1092,7 @@ mod tests {
 
         {
             let col = Collection::new(col_id, "test".into(), store.clone(), &config).unwrap();
-            let pattern = vec_ops::normalize(&vec![1.0; 16]);
+            let pattern = vec_ops::normalize(&[1.0; 16]);
             for _ in 0..10 {
                 col.write(&pattern).unwrap();
             }
@@ -1139,7 +1139,7 @@ mod tests {
         let config = test_config();
         let col = Arc::new(Collection::new(col_id, "test".into(), store, &config).unwrap());
 
-        let pattern = vec_ops::normalize(&vec![1.0; 16]);
+        let pattern = vec_ops::normalize(&[1.0; 16]);
         for _ in 0..10 {
             col.write(&pattern).unwrap();
         }

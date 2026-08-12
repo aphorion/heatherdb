@@ -1,9 +1,9 @@
 #[path = "helpers.rs"]
 mod helpers;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use heather_db::store::Store;
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use heather_db::location::{HardLocation, LocationId};
+use heather_db::store::Store;
 
 fn make_location(id: u64, d: usize) -> HardLocation {
     let vecs = helpers::random_vectors(1, d);
@@ -99,18 +99,20 @@ fn bench_prefix_isolation(c: &mut Criterion) {
 
         let target_col = col_ids[0];
 
-        group.bench_function(
-            BenchmarkId::new("other_cols", n_other_collections),
-            |b| {
-                b.iter(|| {
-                    let _locs = store.load_all_locations(target_col).unwrap();
-                });
-            },
-        );
+        group.bench_function(BenchmarkId::new("other_cols", n_other_collections), |b| {
+            b.iter(|| {
+                let _locs = store.load_all_locations(target_col).unwrap();
+            });
+        });
     }
 
     group.finish();
 }
 
-criterion_group!(benches, bench_put_location, bench_load_all_locations, bench_prefix_isolation);
+criterion_group!(
+    benches,
+    bench_put_location,
+    bench_load_all_locations,
+    bench_prefix_isolation
+);
 criterion_main!(benches);

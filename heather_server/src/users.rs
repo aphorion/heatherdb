@@ -21,13 +21,13 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use argon2::{
-    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
-use rand::rngs::OsRng;
 use rand::Rng;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
 const SYSTEM_SUBDIR: &str = "system/data";
@@ -53,8 +53,7 @@ impl Scope {
         if s.eq_ignore_ascii_case("root") || s == "*" {
             Ok(Scope::Root)
         } else {
-            heather_db::validate_db_name(s)
-                .map_err(|e| format!("invalid scope '{s}': {e}"))?;
+            heather_db::validate_db_name(s).map_err(|e| format!("invalid scope '{s}': {e}"))?;
             Ok(Scope::Database(s.to_string()))
         }
     }
@@ -91,8 +90,7 @@ impl UserStore {
     /// Open (or create) the user store under `data_dir`.
     pub fn load(data_dir: &Path) -> Result<Self, String> {
         let env_path = data_dir.join(SYSTEM_SUBDIR);
-        fs::create_dir_all(&env_path)
-            .map_err(|e| format!("create {}: {e}", env_path.display()))?;
+        fs::create_dir_all(&env_path).map_err(|e| format!("create {}: {e}", env_path.display()))?;
 
         let env = unsafe {
             EnvOpenOptions::new()
@@ -108,7 +106,11 @@ impl UserStore {
             .map_err(|e| format!("create users db: {e}"))?;
         wtxn.commit().map_err(|e| e.to_string())?;
 
-        Ok(Self { env, users, env_path })
+        Ok(Self {
+            env,
+            users,
+            env_path,
+        })
     }
 
     pub fn path(&self) -> &Path {
@@ -154,7 +156,12 @@ impl UserStore {
         };
 
         let mut wtxn = self.env.write_txn().map_err(|e| e.to_string())?;
-        if self.users.get(&wtxn, name).map_err(|e| e.to_string())?.is_some() {
+        if self
+            .users
+            .get(&wtxn, name)
+            .map_err(|e| e.to_string())?
+            .is_some()
+        {
             return Err(format!("user already exists: {name}"));
         }
         self.put_user(&mut wtxn, &user)?;
@@ -170,12 +177,13 @@ impl UserStore {
         let hash = hash_password(new_password)?;
 
         let mut wtxn = self.env.write_txn().map_err(|e| e.to_string())?;
-        let raw = self.users
+        let raw = self
+            .users
             .get(&wtxn, name)
             .map_err(|e| e.to_string())?
             .ok_or_else(|| format!("user not found: {name}"))?;
-        let mut user: User = bincode::deserialize(raw)
-            .map_err(|e| format!("deserialise user: {e}"))?;
+        let mut user: User =
+            bincode::deserialize(raw).map_err(|e| format!("deserialise user: {e}"))?;
         user.password_hash = hash;
         self.put_user(&mut wtxn, &user)?;
         wtxn.commit().map_err(|e| e.to_string())?;
@@ -185,7 +193,8 @@ impl UserStore {
     /// Delete a user. Returns `true` if a user was actually removed.
     pub fn delete(&self, name: &str) -> Result<bool, String> {
         let mut wtxn = self.env.write_txn().map_err(|e| e.to_string())?;
-        let removed = self.users
+        let removed = self
+            .users
             .delete(&mut wtxn, name)
             .map_err(|e| e.to_string())?;
         wtxn.commit().map_err(|e| e.to_string())?;
@@ -220,14 +229,12 @@ impl UserStore {
     /* ─── internals ───────────────────────────────────────────────────── */
 
     fn put_user(&self, wtxn: &mut heed::RwTxn, user: &User) -> Result<(), String> {
-        let bytes = bincode::serialize(user)
-            .map_err(|e| format!("serialise user: {e}"))?;
+        let bytes = bincode::serialize(user).map_err(|e| format!("serialise user: {e}"))?;
         self.users
             .put(wtxn, &user.name, &bytes)
             .map_err(|e| format!("write user: {e}"))?;
         Ok(())
     }
-
 }
 
 /* ─── auth-route classifier (unchanged from JSON era) ─────────────────────── */
@@ -356,7 +363,7 @@ mod tests {
         // the same dir, write through one, see it from the other.
         let dir = tempfile::tempdir().unwrap();
         let server = UserStore::load(dir.path()).unwrap();
-        let cli    = UserStore::load(dir.path()).unwrap();
+        let cli = UserStore::load(dir.path()).unwrap();
 
         // CLI creates a user. Server (no restart) should see it.
         cli.create("alice", "passw0rd!", Scope::Root).unwrap();

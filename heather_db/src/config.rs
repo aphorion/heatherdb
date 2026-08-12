@@ -91,47 +91,69 @@ impl EAMConfig {
             return Err(HeatherError::InvalidConfig("k must be > 0".into()));
         }
         if self.eta_0 <= 0.0 || !self.eta_0.is_finite() {
-            return Err(HeatherError::InvalidConfig("eta_0 must be > 0 and finite".into()));
+            return Err(HeatherError::InvalidConfig(
+                "eta_0 must be > 0 and finite".into(),
+            ));
         }
         if self.eta_min <= 0.0 || !self.eta_min.is_finite() {
-            return Err(HeatherError::InvalidConfig("eta_min must be > 0 and finite".into()));
+            return Err(HeatherError::InvalidConfig(
+                "eta_min must be > 0 and finite".into(),
+            ));
         }
         if self.eta_min > self.eta_0 {
-            return Err(HeatherError::InvalidConfig(
-                format!("eta_min ({}) must be <= eta_0 ({})", self.eta_min, self.eta_0),
-            ));
+            return Err(HeatherError::InvalidConfig(format!(
+                "eta_min ({}) must be <= eta_0 ({})",
+                self.eta_min, self.eta_0
+            )));
         }
         if self.lambda <= 0.0 || self.lambda > 1.0 || !self.lambda.is_finite() {
-            return Err(HeatherError::InvalidConfig("lambda must be in (0, 1]".into()));
-        }
-        if self.tau_split < 0.0 || !self.tau_split.is_finite() {
-            return Err(HeatherError::InvalidConfig("tau_split must be >= 0 and finite".into()));
-        }
-        if self.tau_merge > 1.0 || !self.tau_merge.is_finite() {
-            return Err(HeatherError::InvalidConfig("tau_merge must be <= 1 and finite".into()));
-        }
-        if self.tau_split >= self.tau_merge {
             return Err(HeatherError::InvalidConfig(
-                format!("tau_split ({}) must be < tau_merge ({})", self.tau_split, self.tau_merge),
+                "lambda must be in (0, 1]".into(),
             ));
         }
+        if self.tau_split < 0.0 || !self.tau_split.is_finite() {
+            return Err(HeatherError::InvalidConfig(
+                "tau_split must be >= 0 and finite".into(),
+            ));
+        }
+        if self.tau_merge > 1.0 || !self.tau_merge.is_finite() {
+            return Err(HeatherError::InvalidConfig(
+                "tau_merge must be <= 1 and finite".into(),
+            ));
+        }
+        if self.tau_split >= self.tau_merge {
+            return Err(HeatherError::InvalidConfig(format!(
+                "tau_split ({}) must be < tau_merge ({})",
+                self.tau_split, self.tau_merge
+            )));
+        }
         if self.gamma < 0.0 || !self.gamma.is_finite() {
-            return Err(HeatherError::InvalidConfig("gamma must be >= 0 and finite".into()));
+            return Err(HeatherError::InvalidConfig(
+                "gamma must be >= 0 and finite".into(),
+            ));
         }
         if self.tau_damp <= 0.0 || !self.tau_damp.is_finite() {
-            return Err(HeatherError::InvalidConfig("tau_damp must be > 0 and finite".into()));
+            return Err(HeatherError::InvalidConfig(
+                "tau_damp must be > 0 and finite".into(),
+            ));
         }
         if self.tau_overload <= 0.0 || !self.tau_overload.is_finite() {
-            return Err(HeatherError::InvalidConfig("tau_overload must be > 0 and finite".into()));
+            return Err(HeatherError::InvalidConfig(
+                "tau_overload must be > 0 and finite".into(),
+            ));
         }
         if self.beta <= 0.0 || !self.beta.is_finite() {
-            return Err(HeatherError::InvalidConfig("beta must be > 0 and finite".into()));
+            return Err(HeatherError::InvalidConfig(
+                "beta must be > 0 and finite".into(),
+            ));
         }
         if self.t_max == 0 {
             return Err(HeatherError::InvalidConfig("t_max must be > 0".into()));
         }
         if self.epsilon <= 0.0 || !self.epsilon.is_finite() {
-            return Err(HeatherError::InvalidConfig("epsilon must be > 0 and finite".into()));
+            return Err(HeatherError::InvalidConfig(
+                "epsilon must be > 0 and finite".into(),
+            ));
         }
         if self.neighbor_cap > 0 && self.num_landmarks == 0 {
             return Err(HeatherError::InvalidConfig(

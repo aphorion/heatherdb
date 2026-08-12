@@ -1,4 +1,4 @@
-use heather_db::{Collection, HardLocation, LocationId, EAMConfig};
+use heather_db::{Collection, EAMConfig, HardLocation, LocationId};
 
 use crate::error::{AlgebraError, Result};
 

@@ -1,7 +1,7 @@
 #[path = "helpers.rs"]
 mod helpers;
 
-use criterion::{criterion_group, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group};
 use heather_db::ReadStrategy;
 use std::time::Instant;
 

@@ -1,7 +1,7 @@
 #[path = "helpers.rs"]
 mod helpers;
 
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
+use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 
 fn bench_write_single(c: &mut Criterion) {
     let mut group = c.benchmark_group("write/single");
@@ -121,5 +121,11 @@ fn bench_write_batch(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_write_single, bench_write_sustained, bench_write_warmed, bench_write_batch);
+criterion_group!(
+    benches,
+    bench_write_single,
+    bench_write_sustained,
+    bench_write_warmed,
+    bench_write_batch
+);
 criterion_main!(benches);

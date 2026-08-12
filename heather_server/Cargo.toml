@@ -2,6 +2,7 @@
 name = "heather_server"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 
 # The binary is named `heather` (not `heather_server`) — operators get
 # a short, memorable command:

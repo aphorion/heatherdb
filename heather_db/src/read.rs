@@ -47,11 +47,7 @@ impl Ord for MinEntry {
 /// Returns (indices, similarities) sorted descending by similarity.
 /// Uses a min-heap for O(n log k) instead of O(n log n) full sort.
 /// Parallelizes similarity computation with rayon when the work exceeds PARALLEL_THRESHOLD.
-pub fn activate(
-    query: &[f64],
-    locations: &[HardLocation],
-    k: usize,
-) -> (Vec<usize>, Vec<f64>) {
+pub fn activate(query: &[f64], locations: &[HardLocation], k: usize) -> (Vec<usize>, Vec<f64>) {
     let work = locations.len() * query.len();
 
     // Normalize query once — all addresses are unit vectors,
@@ -77,20 +73,24 @@ pub fn activate(
     let mut heap: BinaryHeap<MinEntry> = BinaryHeap::with_capacity(k + 1);
     for (i, sim) in sims {
         if heap.len() < k {
-            heap.push(MinEntry { index: i, similarity: sim });
-        } else if let Some(min) = heap.peek() {
-            if sim > min.similarity {
-                heap.pop();
-                heap.push(MinEntry { index: i, similarity: sim });
-            }
+            heap.push(MinEntry {
+                index: i,
+                similarity: sim,
+            });
+        } else if let Some(min) = heap.peek()
+            && sim > min.similarity
+        {
+            heap.pop();
+            heap.push(MinEntry {
+                index: i,
+                similarity: sim,
+            });
         }
     }
 
     // Drain into a vec sorted descending by similarity
-    let mut entries: Vec<(usize, f64)> = heap
-        .into_iter()
-        .map(|e| (e.index, e.similarity))
-        .collect();
+    let mut entries: Vec<(usize, f64)> =
+        heap.into_iter().map(|e| (e.index, e.similarity)).collect();
     entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
     let indices: Vec<usize> = entries.iter().map(|(i, _)| *i).collect();
@@ -113,19 +113,23 @@ pub fn activate_soa(
     let mut heap: BinaryHeap<MinEntry> = BinaryHeap::with_capacity(k + 1);
     for (i, sim) in all_sims.into_iter().enumerate() {
         if heap.len() < k {
-            heap.push(MinEntry { index: i, similarity: sim });
-        } else if let Some(min) = heap.peek() {
-            if sim > min.similarity {
-                heap.pop();
-                heap.push(MinEntry { index: i, similarity: sim });
-            }
+            heap.push(MinEntry {
+                index: i,
+                similarity: sim,
+            });
+        } else if let Some(min) = heap.peek()
+            && sim > min.similarity
+        {
+            heap.pop();
+            heap.push(MinEntry {
+                index: i,
+                similarity: sim,
+            });
         }
     }
 
-    let mut entries: Vec<(usize, f64)> = heap
-        .into_iter()
-        .map(|e| (e.index, e.similarity))
-        .collect();
+    let mut entries: Vec<(usize, f64)> =
+        heap.into_iter().map(|e| (e.index, e.similarity)).collect();
     entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
 
     let indices = entries.iter().map(|(i, _)| *i).collect();
@@ -300,14 +304,14 @@ pub fn graph_activate(
                     index: idx,
                     similarity: sim,
                 });
-            } else if let Some(worst) = result.peek() {
-                if sim > worst.similarity {
-                    result.pop();
-                    result.push(MinEntry {
-                        index: idx,
-                        similarity: sim,
-                    });
-                }
+            } else if let Some(worst) = result.peek()
+                && sim > worst.similarity
+            {
+                result.pop();
+                result.push(MinEntry {
+                    index: idx,
+                    similarity: sim,
+                });
             }
 
             match best_next {
@@ -321,12 +325,11 @@ pub fn graph_activate(
             None => break,
             Some((next_idx, next_sim)) => {
                 // Stop if best neighbor can't improve our k-th best
-                if result.len() >= k {
-                    if let Some(worst) = result.peek() {
-                        if next_sim < worst.similarity {
-                            break;
-                        }
-                    }
+                if result.len() >= k
+                    && let Some(worst) = result.peek()
+                    && next_sim < worst.similarity
+                {
+                    break;
                 }
                 current = next_idx;
             }
@@ -425,7 +428,10 @@ pub fn hopfield_iter(
         .map(|&i| locations[i].unit_pattern())
         .collect();
 
-    let addresses: Vec<&[f64]> = indices.iter().map(|&i| locations[i].address.as_slice()).collect();
+    let addresses: Vec<&[f64]> = indices
+        .iter()
+        .map(|&i| locations[i].address.as_slice())
+        .collect();
 
     // ξ₀ = normalize(query)
     let mut xi = vec_ops::normalize(query);
@@ -492,7 +498,10 @@ pub fn hopfield_iter_traced(
         .map(|&i| locations[i].unit_pattern())
         .collect();
 
-    let addresses: Vec<&[f64]> = indices.iter().map(|&i| locations[i].address.as_slice()).collect();
+    let addresses: Vec<&[f64]> = indices
+        .iter()
+        .map(|&i| locations[i].address.as_slice())
+        .collect();
 
     let mut xi = vec_ops::normalize(query);
     let mut converged = false;
@@ -587,7 +596,12 @@ mod tests {
         let pattern = vec_ops::normalize(&[1.0, 2.0, 3.0]);
         let locations = vec![
             make_loc(0, pattern.clone(), pattern.clone(), 5.0),
-            make_loc(1, vec_ops::normalize(&[-1.0, 0.0, 0.0]), vec_ops::normalize(&[-1.0, 0.0, 0.0]), 5.0),
+            make_loc(
+                1,
+                vec_ops::normalize(&[-1.0, 0.0, 0.0]),
+                vec_ops::normalize(&[-1.0, 0.0, 0.0]),
+                5.0,
+            ),
         ];
 
         let result = hopfield_iter(&pattern, &locations, &config).unwrap();
@@ -599,9 +613,7 @@ mod tests {
     fn test_hopfield_ss() {
         let config = EAMConfig::new(3).unwrap();
         let pattern = vec_ops::normalize(&[1.0, 2.0, 3.0]);
-        let locations = vec![
-            make_loc(0, pattern.clone(), pattern.clone(), 5.0),
-        ];
+        let locations = vec![make_loc(0, pattern.clone(), pattern.clone(), 5.0)];
 
         let result = hopfield_ss(&pattern, &locations, &config).unwrap();
         let sim = vec_ops::cosine_similarity(&result, &pattern);

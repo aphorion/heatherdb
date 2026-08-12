@@ -1,9 +1,11 @@
 #[path = "helpers.rs"]
 mod helpers;
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use heather_db::location::HardLocation;
-use heather_db::read::{activate, build_id_lookup, graph_activate, is_graph_ready, select_landmarks};
+use heather_db::read::{
+    activate, build_id_lookup, graph_activate, is_graph_ready, select_landmarks,
+};
 use heather_db::vec_ops;
 /// Single-threaded brute-force activate (no rayon) for fair comparison.
 /// Same algorithm as read::activate but always sequential.
@@ -74,7 +76,13 @@ fn bench_activate_three_way(c: &mut Criterion) {
             group.bench_function(BenchmarkId::new("graph", n_writes), |b| {
                 let mut idx = 0usize;
                 b.iter(|| {
-                    let _ = graph_activate(&queries[idx % queries.len()], &locations, k, &landmarks, &id_lookup);
+                    let _ = graph_activate(
+                        &queries[idx % queries.len()],
+                        &locations,
+                        k,
+                        &landmarks,
+                        &id_lookup,
+                    );
                     idx += 1;
                 });
             });
@@ -84,7 +92,11 @@ fn bench_activate_three_way(c: &mut Criterion) {
         let avg_neighbors: f64 = if locations.is_empty() {
             0.0
         } else {
-            locations.iter().map(|l| l.neighbors.len() as f64).sum::<f64>() / locations.len() as f64
+            locations
+                .iter()
+                .map(|l| l.neighbors.len() as f64)
+                .sum::<f64>()
+                / locations.len() as f64
         };
         eprintln!(
             "  n_writes={n_writes}, L={num_locs}, avg_neighbors={avg_neighbors:.1}, graph_ready={graph_ready}, landmarks={}",
@@ -115,7 +127,9 @@ fn bench_reconstruction_quality(_c: &mut Criterion) {
         for _ in 0..n_writes {
             let ci: usize = rng.gen_range(0..clusters.len());
             let center = &clusters[ci];
-            let noise: Vec<f64> = (0..d).map(|i| center[i] + rng.r#gen::<f64>() * 0.1 - 0.05).collect();
+            let noise: Vec<f64> = (0..d)
+                .map(|i| center[i] + rng.r#gen::<f64>() * 0.1 - 0.05)
+                .collect();
             let v = vec_ops::normalize(&noise);
             col.write(&v).unwrap();
         }
@@ -143,8 +157,10 @@ fn bench_reconstruction_quality(_c: &mut Criterion) {
             overlap_total += overlap;
 
             // Reconstruct via Hopfield from each activation set
-            let flat_result = heather_db::read::hopfield_iter_from(query, &locations, &cfg, &flat_idx).unwrap();
-            let graph_result = heather_db::read::hopfield_iter_from(query, &locations, &cfg, &graph_idx).unwrap();
+            let flat_result =
+                heather_db::read::hopfield_iter_from(query, &locations, &cfg, &flat_idx).unwrap();
+            let graph_result =
+                heather_db::read::hopfield_iter_from(query, &locations, &cfg, &graph_idx).unwrap();
 
             flat_total_sim += vec_ops::cosine_similarity(query, &flat_result);
             graph_total_sim += vec_ops::cosine_similarity(query, &graph_result);

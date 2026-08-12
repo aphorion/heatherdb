@@ -35,9 +35,7 @@ pub enum UserCmd {
     /// List users (name + scope; never prints hashes).
     List,
     /// Delete a user.
-    Delete {
-        name: String,
-    },
+    Delete { name: String },
     /// Rotate a user's password.
     Passwd {
         name: String,
@@ -64,10 +62,17 @@ pub fn run(data_dir: &PathBuf, cmd: &UserCmd) -> ExitCode {
     };
 
     match cmd {
-        UserCmd::Create { name, password, scope } => {
+        UserCmd::Create {
+            name,
+            password,
+            scope,
+        } => {
             let scope = match Scope::parse(scope) {
                 Ok(s) => s,
-                Err(e) => { eprintln!("error: {e}"); return ExitCode::FAILURE; }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    return ExitCode::FAILURE;
+                }
             };
             match store.create(name, password, scope.clone()) {
                 Ok(u) => {
@@ -75,7 +80,10 @@ pub fn run(data_dir: &PathBuf, cmd: &UserCmd) -> ExitCode {
                     println!("  → file: {}", store.path().display());
                     ExitCode::SUCCESS
                 }
-                Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::FAILURE
+                }
             }
         }
         UserCmd::List => {
@@ -84,7 +92,7 @@ pub fn run(data_dir: &PathBuf, cmd: &UserCmd) -> ExitCode {
                 println!("(no users)");
                 return ExitCode::SUCCESS;
             }
-            println!("{:<24} {:<14} {}", "NAME", "SCOPE", "CREATED");
+            println!("{:<24} {:<14} CREATED", "NAME", "SCOPE");
             for u in users {
                 let ts = chrono_format(u.created_at);
                 println!("{:<24} {:<14} {}", u.name, u.scope.label(), ts);
@@ -92,13 +100,28 @@ pub fn run(data_dir: &PathBuf, cmd: &UserCmd) -> ExitCode {
             ExitCode::SUCCESS
         }
         UserCmd::Delete { name } => match store.delete(name) {
-            Ok(true) => { println!("✓ deleted user '{name}'"); ExitCode::SUCCESS }
-            Ok(false) => { eprintln!("error: user not found: {name}"); ExitCode::FAILURE }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+            Ok(true) => {
+                println!("✓ deleted user '{name}'");
+                ExitCode::SUCCESS
+            }
+            Ok(false) => {
+                eprintln!("error: user not found: {name}");
+                ExitCode::FAILURE
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
         },
         UserCmd::Passwd { name, password } => match store.set_password(name, password) {
-            Ok(()) => { println!("✓ password rotated for '{name}'"); ExitCode::SUCCESS }
-            Err(e) => { eprintln!("error: {e}"); ExitCode::FAILURE }
+            Ok(()) => {
+                println!("✓ password rotated for '{name}'");
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
         },
     }
 }

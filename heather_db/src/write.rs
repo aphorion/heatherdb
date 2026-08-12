@@ -20,6 +20,12 @@ pub struct WriteResult {
 /// Phase 1 — Select: k-NN activation, weight computation, conscience winner.
 /// Phase 2 — Update: counter accumulation + competitive address migration in one pass.
 /// Phase 3 — Regulate: topology maintenance (novelty/overload split, local dedup).
+// The eight parameters are the write pipeline's full state: the input, the
+// locations it mutates, the config and learning rate that govern it, the id
+// counter it draws from, the rng it splits with, and the landmark/lookup
+// indices the k-NN search needs. Bundling them into a struct would only move
+// the arity somewhere less legible.
+#[allow(clippy::too_many_arguments)]
 pub fn adaptive_write(
     input: &[f64],
     locations: &mut [HardLocation],
@@ -283,7 +289,16 @@ mod tests {
         let mut next_id = 3u64;
         let mut rng = rand::thread_rng();
 
-        let result = adaptive_write(&input, &mut locations, &config, 0.01, &mut next_id, &mut rng, &[], &[]);
+        let result = adaptive_write(
+            &input,
+            &mut locations,
+            &config,
+            0.01,
+            &mut next_id,
+            &mut rng,
+            &[],
+            &[],
+        );
         assert!(!result.modified_indices.is_empty());
         // Location 0 should have received the most weight
         assert!(locations[0].write_count > locations[1].write_count);
@@ -293,14 +308,24 @@ mod tests {
     fn test_novelty_split() {
         let mut config = EAMConfig::new(3).unwrap();
         config.tau_split = 0.99; // very high threshold -> always split
-        let mut locations = vec![
-            HardLocation::new(LocationId(0), vec_ops::normalize(&[1.0, 0.0, 0.0])),
-        ];
+        let mut locations = vec![HardLocation::new(
+            LocationId(0),
+            vec_ops::normalize(&[1.0, 0.0, 0.0]),
+        )];
         let input = vec_ops::normalize(&[0.0, 1.0, 0.0]); // very different
         let mut next_id = 1u64;
         let mut rng = rand::thread_rng();
 
-        let result = adaptive_write(&input, &mut locations, &mut config, 0.01, &mut next_id, &mut rng, &[], &[]);
+        let result = adaptive_write(
+            &input,
+            &mut locations,
+            &config,
+            0.01,
+            &mut next_id,
+            &mut rng,
+            &[],
+            &[],
+        );
         // Should have created at least one new location (novelty split)
         assert!(!result.new_locations.is_empty());
     }
