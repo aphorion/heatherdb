@@ -100,7 +100,10 @@ fn heather_db_normalize(v: &[f64]) -> Vec<f64> {
 
 /// Dream a single collection in place. Returns the before/after location counts
 /// and how many locations were merged across all passes.
-pub fn dream_collection(col: &Collection, passes: usize) -> heather_db::error::Result<CollectionDream> {
+pub fn dream_collection(
+    col: &Collection,
+    passes: usize,
+) -> heather_db::error::Result<CollectionDream> {
     let name = col.name().to_string();
     let before = col.num_locations()?;
     let mut merged_total = 0usize;
@@ -219,7 +222,9 @@ pub async fn run_dream_loop(server: Arc<Server>, last_activity_ms: Arc<AtomicU64
                         );
                         last_dreamed.insert(key, r.locations_after);
                     }
-                    Err(e) => tracing::warn!(db = %db, collection = %name, error = %e, "dream failed"),
+                    Err(e) => {
+                        tracing::warn!(db = %db, collection = %name, error = %e, "dream failed")
+                    }
                 }
             }
         }
@@ -318,7 +323,10 @@ mod tests {
                 .iter()
                 .map(|l| dot(&l.address, p))
                 .fold(f64::MIN, f64::max);
-            assert!(best > 0.9, "attractor lost after dream (best cos {best:.3})");
+            assert!(
+                best > 0.9,
+                "attractor lost after dream (best cos {best:.3})"
+            );
         }
     }
 
