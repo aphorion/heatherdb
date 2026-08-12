@@ -264,6 +264,32 @@ pub struct AlgebraScaleRequest {
     pub alpha: f64,
 }
 
+/// Apply a permutation ρ^k (the non-commutative S_D bind) to every
+/// location of `source`, writing the result to `target`.
+///
+/// The permutation is identified by exactly one of `seed` (a raw u64) or
+/// `name` (hashed to a seed via SHA-256, the project's symbol convention);
+/// supplying neither or both is an error. `power` (default 1) is the
+/// integer exponent k — negative applies ρ⁻¹.
+#[derive(Debug, Deserialize)]
+pub struct AlgebraPermuteRequest {
+    pub source: String,
+    pub target: String,
+    /// Seed for the permutation. Mutually exclusive with `name`.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Name hashed (SHA-256) into a seed. Mutually exclusive with `seed`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Exponent k: ρ^k. Negative applies the inverse. Defaults to 1.
+    #[serde(default = "default_permute_power")]
+    pub power: i64,
+}
+
+fn default_permute_power() -> i64 {
+    1
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AlgebraIntersectRequest {
     pub source_a: String,
