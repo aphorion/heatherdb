@@ -637,6 +637,7 @@ dependencies = [
  "rand",
  "rand_distr",
  "rayon",
+ "realfft",
  "serde",
  "tempfile",
  "thiserror",

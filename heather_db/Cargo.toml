@@ -11,6 +11,10 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 bincode = "1"
 rayon = "1"
+# Role-scoped scoring unbinds by circular correlation; doing it in the
+# frequency domain is O(d log d) instead of the O(d²) direct form, and this
+# runs once per candidate document. Same crate heather_algebra binds with.
+realfft = "3"
 # Per-database persisted config (db.toml) — see db_config.rs.
 toml = "0.8"
 # Used by `Server`'s tests AND by downstream tooling that wants scratch
