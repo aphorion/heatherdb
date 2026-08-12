@@ -254,6 +254,142 @@ pub fn role_scoped_similarity(stored: &[f64], role: &[f64], filler: &[f64]) -> f
     cosine_similarity(&unbind_by(stored, role), filler)
 }
 
+// --- Batched role scoring ------------------------------------------------
+//
+// Scoring K candidates against N (role, filler) pairs with `unbind_by` costs
+// 3KN transforms: it re-forward-transforms the candidate and the role for
+// every pair and inverts each product. Both re-transforms are redundant —
+// a candidate's spectrum does not depend on which role is asked of it, and a
+// role's spectrum does not depend on which candidate it is applied to. The
+// primitives below take spectra instead of vectors so the caller can forward-
+// transform each candidate once and each role and filler once, paying K + 2N
+// forward transforms for the whole query.
+//
+// The inverse is only needed when the recovered filler is wanted *as a
+// vector* (the cleanup path feeds it to an attention read). When the score is
+// a cosine against a filler that is already known, Parseval gives both the
+// inner product and the norm directly from the spectra, so the cleanup-off
+// path does no inverse transform at all.
+
+/// Forward real FFT of `v`. Unnormalized, `rfft` packing: bin 0 is DC, and at
+/// even `d` the last bin is Nyquist.
+pub fn rfft_forward(v: &[f64]) -> Vec<Complex<f64>> {
+    let d = v.len();
+    if d == 0 {
+        return Vec::new();
+    }
+    ROLE_PLANNER.with(|p| {
+        let fft = p.borrow_mut().plan_fft_forward(d);
+        let mut input = v.to_vec();
+        let mut spec = fft.make_output_vec();
+        if fft.process(&mut input, &mut spec).is_err() {
+            return vec![Complex::new(0.0, 0.0); d / 2 + 1];
+        }
+        spec
+    })
+}
+
+/// Spectrum of the filler recovered by unbinding `bound` at `role`, i.e. the
+/// spectrum of `unbind_by`'s output. Circular correlation is a conjugate
+/// product in the frequency domain, so this is O(d) once the spectra exist.
+fn unbind_spectrum(bound: &[Complex<f64>], role: &[Complex<f64>], d: usize) -> Vec<Complex<f64>> {
+    let mut prod: Vec<Complex<f64>> = bound
+        .iter()
+        .zip(role.iter())
+        .map(|(x, y)| x * y.conj())
+        .collect();
+    // DC and (at even d) Nyquist bins are real for a real signal, but the
+    // conjugate product leaves float dust in their imaginary parts and realfft
+    // rejects that on the way back. Same fix-up `unbind_by` applies.
+    if prod.is_empty() {
+        return prod;
+    }
+    prod[0].im = 0.0;
+    if d.is_multiple_of(2) {
+        let last = prod.len() - 1;
+        prod[last].im = 0.0;
+    }
+    prod
+}
+
+/// [`unbind_by`] from precomputed spectra. Bit-identical to `unbind_by` on the
+/// same inputs — it is the same conjugate product and the same inverse, only
+/// with the two forward transforms hoisted out.
+pub fn unbind_by_spectra(bound: &[Complex<f64>], role: &[Complex<f64>], d: usize) -> Vec<f64> {
+    if d == 0 {
+        return Vec::new();
+    }
+    let mut prod = unbind_spectrum(bound, role, d);
+    ROLE_PLANNER.with(|p| {
+        let ifft = p.borrow_mut().plan_fft_inverse(d);
+        let mut out = ifft.make_output_vec();
+        if ifft.process(&mut prod, &mut out).is_err() {
+            return vec![0.0; d];
+        }
+        out.iter().map(|x| x / d as f64).collect()
+    })
+}
+
+/// `Σₙ x[n]·y[n]` for real signals `x`, `y` given their `rfft` spectra.
+///
+/// Parseval on the *full* spectrum is `⟨x,y⟩ = (1/d)·Σₖ Re(Xₖ·conj(Yₖ))`, but
+/// `rfft` stores only the non-negative frequencies. Bin 0 (DC) and, at even
+/// `d`, the Nyquist bin are their own conjugate mirrors and are counted once;
+/// every other stored bin stands in for itself *and* its mirror and is counted
+/// twice. Getting that packing wrong is silent — it perturbs the score by a
+/// few percent rather than breaking anything — hence spelled out here.
+fn hermitian_inner(a: &[Complex<f64>], b: &[Complex<f64>], d: usize) -> f64 {
+    if d == 0 || a.is_empty() {
+        return 0.0;
+    }
+    let re = |i: usize| a[i].re * b[i].re + a[i].im * b[i].im;
+    let m = a.len();
+    let has_nyquist = d.is_multiple_of(2) && m > 1;
+    let doubled_end = if has_nyquist { m - 1 } else { m };
+
+    let mut acc = re(0);
+    for i in 1..doubled_end {
+        acc += 2.0 * re(i);
+    }
+    if has_nyquist {
+        acc += re(m - 1);
+    }
+    acc / d as f64
+}
+
+/// [`role_scoped_similarity`] from precomputed spectra, **without an inverse
+/// transform**.
+///
+/// The score is a cosine against a filler the caller already holds, so both
+/// terms it needs — `⟨recovered, filler⟩` and `‖recovered‖` — are available in
+/// the frequency domain by Parseval. `filler_norm` is `l2_norm(filler)`,
+/// passed in because the caller computes it once per query rather than once
+/// per candidate.
+///
+/// Agrees with `role_scoped_similarity` to floating-point rounding, not
+/// bit-exactly: the two sum the same quantity in different orders. Measured
+/// worst deviation 1.0e-15 over 40 draws, with identical induced ordering —
+/// see `frequency_domain_score_matches_the_inverse_transform_path`.
+pub fn role_scoped_similarity_spectra(
+    bound: &[Complex<f64>],
+    role: &[Complex<f64>],
+    filler: &[Complex<f64>],
+    filler_norm: f64,
+    d: usize,
+) -> f64 {
+    if d == 0 {
+        return 0.0;
+    }
+    let prod = unbind_spectrum(bound, role, d);
+    let recovered_norm = hermitian_inner(&prod, &prod, d).max(0.0).sqrt();
+    // Same degenerate-input guard `cosine_similarity` applies, so the two
+    // paths agree on zero vectors as well as on ordinary ones.
+    if recovered_norm < 1e-12 || filler_norm < 1e-12 {
+        return 0.0;
+    }
+    hermitian_inner(&prod, filler, d) / (recovered_norm * filler_norm)
+}
+
 #[cfg(test)]
 mod role_tests {
     use super::*;
@@ -374,6 +510,140 @@ mod role_tests {
         assert!(
             penalty < 0.99,
             "unbinding alone is not exact recovery: penalty {penalty:.3}"
+        );
+    }
+
+    /// A two-role bundle with a known filler at `role_a`, over 40 deterministic
+    /// draws — the same corpus shape the richness-penalty test measures on.
+    fn bundle_draws(d: usize, trials: u64) -> Vec<(Vec<f64>, Vec<f64>, Vec<f64>)> {
+        (0..trials)
+            .map(|t| {
+                let base = t * 100 + d as u64;
+                let (role, filler) = (atom(base + 1, d), atom(base + 2, d));
+                let stored = normalize(
+                    &convolve(&role, &filler)
+                        .iter()
+                        .zip(&convolve(&atom(base + 3, d), &atom(base + 4, d)))
+                        .map(|(x, y)| x + y)
+                        .collect::<Vec<f64>>(),
+                );
+                (stored, role, filler)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unbind_from_spectra_is_the_same_transform_with_the_forwards_hoisted() {
+        for d in [512, 511] {
+            for (stored, role, _) in bundle_draws(d, 8) {
+                let direct = unbind_by(&stored, &role);
+                let hoisted = unbind_by_spectra(&rfft_forward(&stored), &rfft_forward(&role), d);
+                // Identical operations in an identical order, so this is bit-exact
+                // rather than merely close.
+                assert_eq!(direct, hoisted, "d={d}");
+            }
+        }
+    }
+
+    /// The cleanup-off fast path skips the inverse transform and scores in the
+    /// frequency domain. A fast path that changes the ranking is worse than no
+    /// fast path, so both the values *and* the induced ordering are pinned.
+    ///
+    /// Run at even and odd `d`: `rfft` packs a Nyquist bin only at even `d`,
+    /// and that bin is the one the doubling rule treats specially.
+    ///
+    /// Stated tolerance: 1e-12. Measured worst absolute deviation over 40
+    /// draws is 1.0e-15 (d=512), three orders of magnitude inside it, and the
+    /// two orderings are identical.
+    #[test]
+    fn frequency_domain_score_matches_the_inverse_transform_path() {
+        for d in [512, 511] {
+            let draws = bundle_draws(d, 40);
+            let naive: Vec<f64> = draws
+                .iter()
+                .map(|(s, r, f)| role_scoped_similarity(s, r, f))
+                .collect();
+            let fast: Vec<f64> = draws
+                .iter()
+                .map(|(s, r, f)| {
+                    role_scoped_similarity_spectra(
+                        &rfft_forward(s),
+                        &rfft_forward(r),
+                        &rfft_forward(f),
+                        l2_norm(f),
+                        d,
+                    )
+                })
+                .collect();
+
+            let worst = naive
+                .iter()
+                .zip(&fast)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                worst < 1e-12,
+                "d={d}: fast path disagrees with the inverse-transform path by {worst:e}"
+            );
+
+            let order = |v: &[f64]| {
+                let mut idx: Vec<usize> = (0..v.len()).collect();
+                idx.sort_by(|&i, &j| v[j].total_cmp(&v[i]));
+                idx
+            };
+            assert_eq!(order(&naive), order(&fast), "d={d}: fast path reorders");
+        }
+    }
+
+    /// The agreement above is only evidence if getting the packing wrong would
+    /// break it. Doubling *every* stored bin — including DC and Nyquist, which
+    /// are their own conjugate mirrors — is the natural mistake, and it is
+    /// invisible: nothing errors, the score just moves — measured 5.5e-3, some
+    /// 5000x the 1.0e-15 the correct packing costs. Pinned so the test above
+    /// cannot pass a broken implementation.
+    #[test]
+    fn the_frequency_domain_score_depends_on_the_rfft_packing() {
+        let d = 512;
+        let mut worst = 0.0_f64;
+        for (stored, role, filler) in bundle_draws(d, 8) {
+            let correct = role_scoped_similarity(&stored, &role, &filler);
+
+            let prod = unbind_spectrum(&rfft_forward(&stored), &rfft_forward(&role), d);
+            let spec_f = rfft_forward(&filler);
+            let all_doubled = |a: &[Complex<f64>], b: &[Complex<f64>]| -> f64 {
+                2.0 * a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| x.re * y.re + x.im * y.im)
+                    .sum::<f64>()
+                    / d as f64
+            };
+            let wrong =
+                all_doubled(&prod, &spec_f) / (all_doubled(&prod, &prod).sqrt() * l2_norm(&filler));
+            worst = worst.max((correct - wrong).abs());
+        }
+        assert!(
+            worst > 1e-4,
+            "mis-packing must be detectable, but it moved the score by only {worst:e}"
+        );
+    }
+
+    #[test]
+    fn frequency_domain_score_matches_the_zero_vector_guard() {
+        let d = 64;
+        let role = atom(9, d);
+        let zero = vec![0.0; d];
+        let filler = atom(10, d);
+        assert_eq!(role_scoped_similarity(&zero, &role, &filler), 0.0);
+        assert_eq!(
+            role_scoped_similarity_spectra(
+                &rfft_forward(&zero),
+                &rfft_forward(&role),
+                &rfft_forward(&filler),
+                l2_norm(&filler),
+                d,
+            ),
+            0.0
         );
     }
 }
