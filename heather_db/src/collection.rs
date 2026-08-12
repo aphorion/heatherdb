@@ -357,8 +357,8 @@ impl Collection {
                 ..
             } = *inner;
             let r = write::adaptive_write_two(
-                address, counter, locations, config, *eta, next_id, &mut rng, landmarks,
-                id_lookup, opts,
+                address, counter, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                opts,
             );
             *eta = r.eta;
             r

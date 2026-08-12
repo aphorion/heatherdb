@@ -238,7 +238,11 @@ fn pairwise_cos(vecs: &[Vec<f64>]) -> Vec<f64> {
 /// and route that law by its context into `dst` via the gated two-field write.
 /// `dst` is cleared first. Out come `(context prototype, accumulated law)`
 /// locations — the families/mnemonics of `src`.
-fn consolidate_rung(src: &Collection, dst: &Collection, opts: WriteOpts) -> heather_db::error::Result<()> {
+fn consolidate_rung(
+    src: &Collection,
+    dst: &Collection,
+    opts: WriteOpts,
+) -> heather_db::error::Result<()> {
     let (locs, _) = src.snapshot()?;
     let cfg = dst.config()?;
     dst.load_snapshot(Vec::new(), cfg)?; // clear
@@ -281,7 +285,10 @@ fn dream_ladder(
         let mut rung_opts = opts;
         if opts.tau_split <= 0.0 || opts.tau_cohere <= 0.0 {
             let (locs, _) = src.snapshot()?;
-            let addrs: Vec<Vec<f64>> = locs.iter().map(|l| heather_db_normalize(&l.address)).collect();
+            let addrs: Vec<Vec<f64>> = locs
+                .iter()
+                .map(|l| heather_db_normalize(&l.address))
+                .collect();
             let rels: Vec<Vec<f64>> = locs
                 .iter()
                 .map(|l| heather_db_normalize(&unbind_vec(&l.counter, &l.address)))
@@ -317,8 +324,10 @@ fn dream_ladder(
                 rung_opts.tau_cohere = otsu_threshold(cohs);
             }
             tracing::info!(
-                rung = k + 1, tau_split = rung_opts.tau_split,
-                tau_cohere = rung_opts.tau_cohere, "auto-calibrated rung"
+                rung = k + 1,
+                tau_split = rung_opts.tau_split,
+                tau_cohere = rung_opts.tau_cohere,
+                "auto-calibrated rung"
             );
         }
         consolidate_rung(&src, &dst, rung_opts)?;
@@ -354,7 +363,7 @@ pub fn dream_database(
     let opts = WriteOpts {
         gate: true,
         tau_cohere: cfg.tau_cohere,
-                tau_split: cfg.tau_split,
+        tau_split: cfg.tau_split,
     };
     let mut collections = Vec::new();
     for name in names {
@@ -440,12 +449,14 @@ pub async fn run_dream_loop(server: Arc<Server>, last_activity_ms: Arc<AtomicU64
                             merged = r.merged, passes = r.passes, "dreamed collection"
                         );
                     }),
-                    DreamMode::Ladder => dream_ladder(&hive, &name, cfg.passes, opts).map(|rungs| {
-                        tracing::info!(
-                            db = %db, base = %name, levels = rungs.len(),
-                            "climbed consolidation ladder"
-                        );
-                    }),
+                    DreamMode::Ladder => {
+                        dream_ladder(&hive, &name, cfg.passes, opts).map(|rungs| {
+                            tracing::info!(
+                                db = %db, base = %name, levels = rungs.len(),
+                                "climbed consolidation ladder"
+                            );
+                        })
+                    }
                 };
                 match result {
                     Ok(()) => {
