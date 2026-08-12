@@ -92,7 +92,7 @@ pub fn run(data_dir: &PathBuf, cmd: &UserCmd) -> ExitCode {
                 println!("(no users)");
                 return ExitCode::SUCCESS;
             }
-            println!("{:<24} {:<14} {}", "NAME", "SCOPE", "CREATED");
+            println!("{:<24} {:<14} CREATED", "NAME", "SCOPE");
             for u in users {
                 let ts = chrono_format(u.created_at);
                 println!("{:<24} {:<14} {}", u.name, u.scope.label(), ts);

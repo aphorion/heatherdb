@@ -527,13 +527,13 @@ mod tests {
         let b = rand_unit(d, &mut rng);
 
         let mut naive = vec![0.0; d];
-        for k in 0..d {
+        for (k, out) in naive.iter_mut().enumerate() {
             let mut sum = 0.0;
-            for i in 0..d {
+            for (i, ai) in a.iter().enumerate() {
                 let j = (k + d - i) % d;
-                sum += a[i] * b[j];
+                sum += ai * b[j];
             }
-            naive[k] = sum;
+            *out = sum;
         }
         let fft = circular_convolve(&a, &b);
         for (x, y) in naive.iter().zip(fft.iter()) {

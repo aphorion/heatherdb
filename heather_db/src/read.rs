@@ -77,14 +77,14 @@ pub fn activate(query: &[f64], locations: &[HardLocation], k: usize) -> (Vec<usi
                 index: i,
                 similarity: sim,
             });
-        } else if let Some(min) = heap.peek() {
-            if sim > min.similarity {
-                heap.pop();
-                heap.push(MinEntry {
-                    index: i,
-                    similarity: sim,
-                });
-            }
+        } else if let Some(min) = heap.peek()
+            && sim > min.similarity
+        {
+            heap.pop();
+            heap.push(MinEntry {
+                index: i,
+                similarity: sim,
+            });
         }
     }
 
@@ -117,14 +117,14 @@ pub fn activate_soa(
                 index: i,
                 similarity: sim,
             });
-        } else if let Some(min) = heap.peek() {
-            if sim > min.similarity {
-                heap.pop();
-                heap.push(MinEntry {
-                    index: i,
-                    similarity: sim,
-                });
-            }
+        } else if let Some(min) = heap.peek()
+            && sim > min.similarity
+        {
+            heap.pop();
+            heap.push(MinEntry {
+                index: i,
+                similarity: sim,
+            });
         }
     }
 
@@ -304,14 +304,14 @@ pub fn graph_activate(
                     index: idx,
                     similarity: sim,
                 });
-            } else if let Some(worst) = result.peek() {
-                if sim > worst.similarity {
-                    result.pop();
-                    result.push(MinEntry {
-                        index: idx,
-                        similarity: sim,
-                    });
-                }
+            } else if let Some(worst) = result.peek()
+                && sim > worst.similarity
+            {
+                result.pop();
+                result.push(MinEntry {
+                    index: idx,
+                    similarity: sim,
+                });
             }
 
             match best_next {
@@ -325,12 +325,11 @@ pub fn graph_activate(
             None => break,
             Some((next_idx, next_sim)) => {
                 // Stop if best neighbor can't improve our k-th best
-                if result.len() >= k {
-                    if let Some(worst) = result.peek() {
-                        if next_sim < worst.similarity {
-                            break;
-                        }
-                    }
+                if result.len() >= k
+                    && let Some(worst) = result.peek()
+                    && next_sim < worst.similarity
+                {
+                    break;
                 }
                 current = next_idx;
             }

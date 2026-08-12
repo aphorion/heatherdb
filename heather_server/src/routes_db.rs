@@ -19,6 +19,10 @@ use crate::routes;
 
 /// Resolve a DB name to its `Arc<Hive>`. Returns a `404 Response` if the
 /// name doesn't exist on this server.
+// The `Err` variant is axum's own `Response`, which is genuinely large.
+// Every caller immediately `?`-propagates it into a handler's return, so
+// boxing here would only add an indirection that is unwrapped one frame up.
+#[allow(clippy::result_large_err)]
 fn resolve_db(server: &Arc<Server>, name: &str) -> Result<Arc<Hive>, Response> {
     server.database(name).ok_or_else(|| {
         (

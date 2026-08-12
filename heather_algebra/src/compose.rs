@@ -8,7 +8,8 @@
 //! 5. Dream-consolidate to deepen basins
 //! 6. Validate via fingerprint comparison
 
-use rand::Rng;
+use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use rand_distr::StandardNormal;
 
 use heather_db::merge::knn_merge;
@@ -63,6 +64,13 @@ pub struct ComposeParams {
     /// Write weight during dreaming (default 0.2).
     pub dream_write_weight: f64,
 
+    // --- Determinism ---
+    /// RNG seed. `None` (the default) draws probes and dream noise from
+    /// entropy, so each composition explores a different sample. `Some(s)`
+    /// pins the draw, making `compose` reproducible run-to-run — required
+    /// by any test that asserts on the resulting geometry.
+    pub seed: Option<u64>,
+
     // --- Step 6: Validation ---
     /// Max fingerprint similarity before C is "just a copy" (default 0.9).
     pub validation_max_similarity: f64,
@@ -87,6 +95,7 @@ impl Default for ComposeParams {
             dream_noise_initial: 0.1,
             dream_noise_decay: 0.8,
             dream_write_weight: 0.2,
+            seed: None,
             validation_max_similarity: 0.9,
             validation_min_stability: 0.99,
         }
@@ -141,7 +150,14 @@ pub fn compose(a: &EAMSnapshot, b: &EAMSnapshot, params: &ComposeParams) -> Resu
         return Err(AlgebraError::EmptySnapshot);
     }
 
-    let mut rng = rand::thread_rng();
+    // Seeded when the caller pins `params.seed`; from entropy otherwise.
+    // Every downstream draw (random probes, attractor sub-sampling, dream
+    // noise) flows from this one generator, so a pinned seed makes the
+    // whole composition reproducible.
+    let mut rng = match params.seed {
+        Some(s) => StdRng::seed_from_u64(s),
+        None => StdRng::from_entropy(),
+    };
 
     // Step 1: Pool (conceptual)
     let pool_size = a.num_locations() + b.num_locations();
@@ -636,7 +652,7 @@ mod tests {
     fn make_snapshot(locations: Vec<HardLocation>, d: usize) -> EAMSnapshot {
         let mut config = EAMConfig::new(d).unwrap();
         config.l_0 = 1;
-        config.k = locations.len().min(20).max(1);
+        config.k = locations.len().clamp(1, 20);
         config.beta = 5.0;
         config.t_max = 10;
         config.epsilon = 1e-6;
@@ -644,14 +660,18 @@ mod tests {
     }
 
     /// Build a cluster of locations around a direction with some spread.
+    ///
+    /// `seed` pins the jitter so tests that assert on the resulting
+    /// geometry get the same cluster every run.
     fn make_cluster(
+        seed: u64,
         start_id: u64,
         center: &[f64],
         pattern: &[f64],
         count: usize,
         spread: f64,
     ) -> Vec<HardLocation> {
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::seed_from_u64(seed);
         let center_norm = vec_ops::normalize(center);
         let pattern_norm = vec_ops::normalize(pattern);
         let mut locs = Vec::new();
@@ -710,11 +730,11 @@ mod tests {
         addr_b[1] = 1.0;
 
         // A has a strong attractor at [1, 0, 0, ...]
-        let locs_a = make_cluster(0, &addr_a, &addr_a, 10, 0.05);
+        let locs_a = make_cluster(1, 0, &addr_a, &addr_a, 10, 0.05);
         let a = make_snapshot(locs_a, d);
 
         // B has a strong attractor at [0, 1, 0, ...]
-        let locs_b = make_cluster(0, &addr_b, &addr_b, 10, 0.05);
+        let locs_b = make_cluster(2, 0, &addr_b, &addr_b, 10, 0.05);
         let b = make_snapshot(locs_b, d);
 
         // Start from somewhere between
@@ -743,7 +763,7 @@ mod tests {
     #[test]
     fn test_dedup_collapses_duplicates() {
         let base = vec_ops::normalize(&[1.0, 0.0, 0.0, 0.0, 0.0]);
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::seed_from_u64(0xBEEF);
 
         // 100 noisy copies
         let attractors: Vec<Vec<f64>> = (0..100)
@@ -771,7 +791,7 @@ mod tests {
         let d = 8;
         let mut addr = vec![0.0; d];
         addr[0] = 1.0;
-        let locs = make_cluster(0, &addr, &addr, 5, 0.05);
+        let locs = make_cluster(3, 0, &addr, &addr, 5, 0.05);
 
         // Query at the cluster center: high confidence
         let (_, conf_near) = read_with_confidence(&vec_ops::normalize(&addr), &locs, 5, 5.0);
@@ -800,15 +820,18 @@ mod tests {
         let mut center_b = vec![0.0; d];
         center_b[1] = 1.0;
 
-        let locs_a = make_cluster(0, &center_a, &center_a, 10, 0.05);
+        let locs_a = make_cluster(4, 0, &center_a, &center_a, 10, 0.05);
         let a = make_snapshot(locs_a, d);
 
-        let locs_b = make_cluster(0, &center_b, &center_b, 10, 0.05);
+        let locs_b = make_cluster(5, 0, &center_b, &center_b, 10, 0.05);
         let b = make_snapshot(locs_b, d);
 
-        let mut params = ComposeParams::default();
-        params.num_random_probes = 20; // fewer for test speed
-        params.dream_rounds = 3;
+        let params = ComposeParams {
+            seed: Some(0xC0FFEE),
+            num_random_probes: 20, // fewer for test speed
+            dream_rounds: 3,
+            ..Default::default()
+        };
 
         let result = compose(&a, &b, &params).unwrap();
         let diag = &result.diagnostics;
@@ -843,14 +866,17 @@ mod tests {
         let d = 16;
         let mut center = vec![0.0; d];
         center[0] = 1.0;
-        let locs = make_cluster(0, &center, &center, 10, 0.05);
+        let locs = make_cluster(6, 0, &center, &center, 10, 0.05);
         let a = make_snapshot(locs, d);
 
-        let mut params = ComposeParams::default();
-        params.num_random_probes = 10;
-        params.dream_rounds = 2;
-        // Relax validation since A+A will naturally be similar to A
-        params.validation_max_similarity = 1.0;
+        let params = ComposeParams {
+            seed: Some(0xC0FFEE),
+            num_random_probes: 10,
+            dream_rounds: 2,
+            // Relax validation since A+A will naturally be similar to A
+            validation_max_similarity: 1.0,
+            ..Default::default()
+        };
 
         let result = compose(&a, &a, &params).unwrap();
 
@@ -872,12 +898,15 @@ mod tests {
         let mut cb = vec![0.0; d];
         cb[1] = 1.0;
 
-        let a = make_snapshot(make_cluster(0, &ca, &ca, 5, 0.1), d);
-        let b = make_snapshot(make_cluster(0, &cb, &cb, 5, 0.1), d);
+        let a = make_snapshot(make_cluster(7, 0, &ca, &ca, 5, 0.1), d);
+        let b = make_snapshot(make_cluster(8, 0, &cb, &cb, 5, 0.1), d);
 
-        let mut params = ComposeParams::default();
-        params.num_random_probes = 5;
-        params.dream_rounds = 2;
+        let params = ComposeParams {
+            seed: Some(0xC0FFEE),
+            num_random_probes: 5,
+            dream_rounds: 2,
+            ..Default::default()
+        };
 
         let result = compose(&a, &b, &params).unwrap();
         let d = &result.diagnostics;
@@ -903,7 +932,7 @@ mod tests {
         center[0] = 1.0;
 
         // Create many redundant locations around the same point
-        let locs = make_cluster(0, &center, &center, 30, 0.02);
+        let locs = make_cluster(9, 0, &center, &center, 30, 0.02);
         let mut config = EAMConfig::new(d).unwrap();
         config.k = 10;
         config.tau_merge = 0.95;
@@ -915,13 +944,14 @@ mod tests {
         let before = snap.num_locations();
 
         let params = ComposeParams {
+            seed: Some(0xC0FFEE),
             dream_rounds: 5,
             dream_noise_initial: 0.05,
             dream_noise_decay: 0.8,
             dream_write_weight: 0.2,
             ..Default::default()
         };
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::seed_from_u64(0xBEEF);
         let all_for_read = snap.locations.clone();
         let read_config = snap.config.clone();
         dream_consolidate_hybrid(
@@ -971,21 +1001,24 @@ mod tests {
     #[test]
     fn test_stress_128d() {
         let d = 128;
-        let mut rng = rand::thread_rng();
+        let mut rng = StdRng::seed_from_u64(0xBEEF);
 
         // A: cluster in one region
         let center_a: Vec<f64> = vec_ops::random_unit_vector(d, &mut rng);
-        let locs_a = make_cluster(0, &center_a, &center_a, 50, 0.1);
+        let locs_a = make_cluster(10, 0, &center_a, &center_a, 50, 0.1);
         let a = make_snapshot(locs_a, d);
 
         // B: cluster in a different region
         let center_b: Vec<f64> = vec_ops::random_unit_vector(d, &mut rng);
-        let locs_b = make_cluster(0, &center_b, &center_b, 50, 0.1);
+        let locs_b = make_cluster(11, 0, &center_b, &center_b, 50, 0.1);
         let b = make_snapshot(locs_b, d);
 
-        let mut params = ComposeParams::default();
-        params.num_random_probes = 20;
-        params.dream_rounds = 3;
+        let params = ComposeParams {
+            seed: Some(0xC0FFEE),
+            num_random_probes: 20,
+            dream_rounds: 3,
+            ..Default::default()
+        };
 
         let result = compose(&a, &b, &params).unwrap();
         assert!(result.snapshot.num_locations() > 0);

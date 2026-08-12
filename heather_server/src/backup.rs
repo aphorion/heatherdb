@@ -2,22 +2,20 @@
 //!
 //! Three flavours, each tuned to a different operational story:
 //!
-//! - **backup**   — tar.gz the data dir (or a single database). Cold by
-//!                  default (refuses if the engine is running). Bundles
-//!                  `users.json`, `server.toml`, and `db/<name>/...`.
-//!                  Round-trip portable; restore extracts back into place.
+//! - **backup** — tar.gz the data dir (or a single database). Cold by
+//!   default (refuses if the engine is running). Bundles `users.json`,
+//!   `server.toml`, and `db/<name>/...`. Round-trip portable; restore
+//!   extracts back into place.
 //!
-//! - **restore**  — extract a backup over the target data dir. Refuses if
-//!                  the engine is running on the same dir (LMDB lock).
-//!                  Optional `--db NAME` to restore only one database
-//!                  from a full backup.
+//! - **restore** — extract a backup over the target data dir. Refuses if
+//!   the engine is running on the same dir (LMDB lock). Optional
+//!   `--db NAME` to restore only one database from a full backup.
 //!
 //! - **snapshot** — **live, hot** consistent copy of one database via
-//!                  LMDB's `Env::copy_to_file` (the same primitive
-//!                  `mdb_copy` uses). Safe to run while the engine is
-//!                  serving traffic. Output: a single `<name>.snapshot`
-//!                  directory containing `db.toml` + `data.mdb`.
-//!                  Restorable via `restore --input <dir>`.
+//!   LMDB's `Env::copy_to_file` (the same primitive `mdb_copy` uses).
+//!   Safe to run while the engine is serving traffic. Output: a single
+//!   `<name>.snapshot` directory containing `db.toml` + `data.mdb`.
+//!   Restorable via `restore --input <dir>`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -73,7 +71,7 @@ pub enum SnapshotCmd {
         /// Database to snapshot.
         #[arg(long)]
         db: String,
-        /// Output directory. Default: $DATA_DIR/snapshots/<db>-<ts>.
+        /// Output directory. Default: `$DATA_DIR/snapshots/<db>-<ts>`.
         #[arg(long)]
         output: Option<PathBuf>,
         /// Use LMDB compaction (smaller files, slightly slower).
@@ -180,7 +178,8 @@ fn do_backup(data_dir: &Path, output: &Path, db: Option<&str>) -> Result<(), Str
         println!("✓ backed up database '{name}' → {}", output.display());
     } else {
         // Full backup: server.toml + system/ (users env) + db/.
-        for f in ["server.toml"] {
+        {
+            let f = "server.toml";
             let p = data_dir.join(f);
             if p.is_file() {
                 tar.append_path_with_name(&p, f)
@@ -373,7 +372,7 @@ fn list_backups(data_dir: &Path) -> Result<(), String> {
         println!("(no backups in {})", dir.display());
         return Ok(());
     }
-    println!("{:<54} {:>12} {}", "FILE", "SIZE", "MODIFIED");
+    println!("{:<54} {:>12} MODIFIED", "FILE", "SIZE");
     for e in entries {
         let p = e.path();
         let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("?");
@@ -405,7 +404,7 @@ fn list_snapshots(data_dir: &Path) -> Result<(), String> {
         println!("(no snapshots in {})", dir.display());
         return Ok(());
     }
-    println!("{:<40} {:>12} {}", "NAME", "SIZE", "CREATED");
+    println!("{:<40} {:>12} CREATED", "NAME", "SIZE");
     for e in entries {
         let p = e.path();
         let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("?");

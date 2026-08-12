@@ -26,7 +26,7 @@ fn one_loc(pattern: Vec<f64>) -> HardLocation {
 fn make_snapshot(n: usize, d: usize, rng: &mut StdRng) -> EAMSnapshot {
     let mut config = EAMConfig::new(d).unwrap();
     config.l_0 = n.max(1);
-    config.k = n.max(1).min(20);
+    config.k = n.clamp(1, 20);
     let locations: Vec<HardLocation> = (0..n)
         .map(|i| {
             let p = rand_unit(d, rng);

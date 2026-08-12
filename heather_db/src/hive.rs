@@ -260,8 +260,8 @@ mod tests {
         let col_a = hive.get_or_create_collection("a").unwrap();
         let col_b = hive.get_or_create_collection("b").unwrap();
 
-        let pattern_a = vec_ops::normalize(&vec![1.0; 16]);
-        let pattern_b = vec_ops::normalize(&vec![-1.0; 16]);
+        let pattern_a = vec_ops::normalize(&[1.0; 16]);
+        let pattern_b = vec_ops::normalize(&[-1.0; 16]);
 
         for _ in 0..20 {
             col_a.write(&pattern_a).unwrap();
@@ -298,7 +298,7 @@ mod tests {
     fn test_persistence_across_reopen() {
         let dir = TempDir::new().unwrap();
         let config = test_config();
-        let pattern = vec_ops::normalize(&vec![1.0; 16]);
+        let pattern = vec_ops::normalize(&[1.0; 16]);
 
         // Write data, then drop the Hive
         {

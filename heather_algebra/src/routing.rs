@@ -217,7 +217,7 @@ mod tests {
     fn make_snapshot(locations: Vec<HardLocation>, d: usize) -> EAMSnapshot {
         let mut config = EAMConfig::new(d).unwrap();
         config.l_0 = 1;
-        config.k = locations.len().min(20).max(1);
+        config.k = locations.len().clamp(1, 20);
         config.beta = 5.0;
         config.t_max = 10;
         config.epsilon = 1e-6;

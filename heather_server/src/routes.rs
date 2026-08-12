@@ -36,7 +36,7 @@ pub async fn create_collection(
     Json(req): Json<CreateCollectionRequest>,
 ) -> Response {
     let name = req.name.clone();
-    let already_exists = hive.list_collections().map_or(false, |c| c.contains(&name));
+    let already_exists = hive.list_collections().is_ok_and(|c| c.contains(&name));
 
     match hive.create_collection(&req.name) {
         Ok(_col) => Json(CreateCollectionResponse {
@@ -154,17 +154,17 @@ pub async fn bulk_load(
             ),
         );
     }
-    if let Some(wc) = &req.write_counts {
-        if wc.len() != req.addresses.len() {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "write_counts ({}) must match addresses ({})",
-                    wc.len(),
-                    req.addresses.len()
-                ),
-            );
-        }
+    if let Some(wc) = &req.write_counts
+        && wc.len() != req.addresses.len()
+    {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "write_counts ({}) must match addresses ({})",
+                wc.len(),
+                req.addresses.len()
+            ),
+        );
     }
 
     let col = match hive.get_or_create_collection(&name) {

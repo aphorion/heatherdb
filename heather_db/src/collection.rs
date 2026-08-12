@@ -10,6 +10,9 @@ use crate::store::Store;
 use crate::vec_ops;
 use crate::write;
 
+/// A stored document as it comes back off the wire: id, vector, metadata blob.
+pub type DocumentRecord = (u64, Vec<f64>, Vec<u8>);
+
 /// Statistics about the current state of an EAM collection.
 #[derive(Debug, Clone)]
 pub struct EAMStats {
@@ -48,7 +51,7 @@ pub(crate) struct EAMInner {
     /// Flat LocationId → index lookup array for O(1) graph traversal
     pub(crate) id_lookup: Vec<u32>,
     /// Contiguous [L × D] address matrix for cache-friendly brute-force activation.
-    /// Row i = locations[i].address. Updated incrementally on writes.
+    /// Row i = `locations[i].address`. Updated incrementally on writes.
     pub(crate) address_matrix: Vec<f64>,
 }
 
@@ -198,13 +201,13 @@ impl Collection {
             .unwrap_or(0);
 
         // Verify dimensionality
-        if let Some(first) = locations.first() {
-            if first.address.len() != config.d {
-                return Err(HeatherError::DimensionMismatch {
-                    expected: config.d,
-                    got: first.address.len(),
-                });
-            }
+        if let Some(first) = locations.first()
+            && first.address.len() != config.d
+        {
+            return Err(HeatherError::DimensionMismatch {
+                expected: config.d,
+                got: first.address.len(),
+            });
         }
 
         let id_lookup = read::build_id_lookup(&locations);
@@ -664,7 +667,7 @@ impl Collection {
     }
 
     /// List all documents in this collection.
-    pub fn list_documents(&self) -> Result<Vec<(u64, Vec<f64>, Vec<u8>)>> {
+    pub fn list_documents(&self) -> Result<Vec<DocumentRecord>> {
         let raw = self.store.list_documents(self.collection_id)?;
         let mut docs = Vec::with_capacity(raw.len());
         for (id, data) in raw {
@@ -1063,7 +1066,7 @@ mod tests {
         let config = test_config();
         let col = Collection::new(col_id, "test".into(), store, &config).unwrap();
 
-        let pattern = vec_ops::normalize(&vec![1.0; 16]);
+        let pattern = vec_ops::normalize(&[1.0; 16]);
 
         for _ in 0..20 {
             col.write(&pattern).unwrap();
@@ -1089,7 +1092,7 @@ mod tests {
 
         {
             let col = Collection::new(col_id, "test".into(), store.clone(), &config).unwrap();
-            let pattern = vec_ops::normalize(&vec![1.0; 16]);
+            let pattern = vec_ops::normalize(&[1.0; 16]);
             for _ in 0..10 {
                 col.write(&pattern).unwrap();
             }
@@ -1136,7 +1139,7 @@ mod tests {
         let config = test_config();
         let col = Arc::new(Collection::new(col_id, "test".into(), store, &config).unwrap());
 
-        let pattern = vec_ops::normalize(&vec![1.0; 16]);
+        let pattern = vec_ops::normalize(&[1.0; 16]);
         for _ in 0..10 {
             col.write(&pattern).unwrap();
         }

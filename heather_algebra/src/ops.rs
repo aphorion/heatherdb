@@ -32,7 +32,7 @@ fn extract_patterns(snap: &EAMSnapshot) -> Vec<Vec<f64>> {
 /// Create pairwise-combination locations from two sets of patterns.
 ///
 /// For each pair (i, j), creates a location whose:
-///   - counter = pattern_a[i] ± pattern_b[j]  (sign applied to b)
+///   - counter = `pattern_a[i] ± pattern_b[j]`  (sign applied to b)
 ///   - address = normalize(counter)
 ///   - write_count = 1.0
 ///
@@ -193,7 +193,7 @@ pub fn scale(a: &EAMSnapshot, alpha: f64) -> Result<EAMSnapshot> {
         ));
     }
 
-    let mut locations: Vec<_> = a.locations.iter().cloned().collect();
+    let mut locations: Vec<_> = a.locations.to_vec();
     for loc in &mut locations {
         for c in loc.counter.iter_mut() {
             *c *= alpha;
@@ -257,7 +257,7 @@ mod tests {
         let mut config = EAMConfig::new(d).unwrap();
         config.l_0 = 1;
         config.l_0 = locations.len().max(1);
-        config.k = locations.len().min(20).max(1);
+        config.k = locations.len().clamp(1, 20);
         EAMSnapshot { locations, config }
     }
 

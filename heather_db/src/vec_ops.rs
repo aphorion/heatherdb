@@ -47,7 +47,7 @@ pub fn softmax(values: &[f64], beta: f64) -> Vec<f64> {
     exps.iter().map(|e| e / sum).collect()
 }
 
-/// Compute weighted sum: result = Σ weights[i] * vectors[i]
+/// Compute weighted sum: result = Σ `weights[i] * vectors[i]`
 pub fn weighted_sum(vectors: &[&[f64]], weights: &[f64]) -> Vec<f64> {
     if vectors.is_empty() {
         return vec![];
