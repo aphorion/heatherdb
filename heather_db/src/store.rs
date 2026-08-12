@@ -369,6 +369,18 @@ impl Store {
         self.doc_index_db.put(txn, &key, &data)?;
         Ok(())
     }
+
+    /// Close the LMDB environment and block until the OS has released it.
+    ///
+    /// `Drop` alone is not enough for a caller that is about to move or
+    /// delete the environment's directory: Windows refuses to rename a
+    /// directory while a mapping into it is still open, and the release is
+    /// asynchronous. POSIX permits the rename regardless, so this is a
+    /// no-op there in practice.
+    pub fn close_and_wait(self) {
+        let Store { env, .. } = self;
+        env.prepare_for_closing().wait();
+    }
 }
 
 #[cfg(test)]

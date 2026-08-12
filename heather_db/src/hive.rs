@@ -212,6 +212,22 @@ impl Hive {
     pub fn config(&self) -> &EAMConfig {
         &self.config
     }
+
+    /// Close the underlying environment, blocking until it is released.
+    ///
+    /// Collections are dropped first because each holds its own `Arc<Store>`;
+    /// the environment can only be closed once this Hive owns the last
+    /// reference. If a request-scoped clone is still alive elsewhere the
+    /// store outlives this call and closing is left to `Drop`.
+    pub fn close_and_wait(self) {
+        let Hive {
+            store, collections, ..
+        } = self;
+        drop(collections);
+        if let Ok(store) = Arc::try_unwrap(store) {
+            store.close_and_wait();
+        }
+    }
 }
 
 #[cfg(test)]

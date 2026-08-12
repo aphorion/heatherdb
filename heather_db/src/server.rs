@@ -234,11 +234,16 @@ impl Server {
             }
         };
 
-        // Drop our reference so the LMDB env can close. There may still be
-        // request-scoped clones holding the Hive — we don't block on them
-        // here; the OS will release the env once the last ref is dropped,
-        // which happens at most a few seconds later.
-        drop(arc);
+        // Close the LMDB env before touching its directory. Windows refuses
+        // to rename a directory that still has a mapping open, so relying on
+        // `Drop` here loses the race and fails the drop outright. When this
+        // was the last reference we close explicitly and wait; when a
+        // request-scoped clone is still alive we fall back to dropping and
+        // let the retry below cover the gap.
+        match Arc::try_unwrap(arc) {
+            Ok(hive) => hive.close_and_wait(),
+            Err(shared) => drop(shared),
+        }
 
         // Move to trash atomically (rename within the same filesystem).
         let dir = self.database_path(name);
@@ -249,14 +254,26 @@ impl Server {
         std::fs::create_dir_all(&trash_root)
             .map_err(|e| HeatherError::Storage(format!("create {}: {e}", trash_root.display())))?;
         let trashed = trash_root.join(format!("{name}-{}", now_secs()));
-        std::fs::rename(&dir, &trashed).map_err(|e| {
-            HeatherError::Storage(format!(
-                "move {} → {}: {e}",
-                dir.display(),
-                trashed.display()
-            ))
-        })?;
-        Ok(true)
+
+        // A surviving Hive clone, or Windows' asynchronous release of the
+        // mapping, can leave the directory briefly un-renameable. Retry for
+        // up to ~2s rather than failing a drop that is about to succeed.
+        let mut last_err = None;
+        for _ in 0..40 {
+            match std::fs::rename(&dir, &trashed) {
+                Ok(()) => return Ok(true),
+                Err(e) => {
+                    last_err = Some(e);
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+        Err(HeatherError::Storage(format!(
+            "move {} → {}: {}",
+            dir.display(),
+            trashed.display(),
+            last_err.expect("loop runs at least once")
+        )))
     }
 
     /// Default dimension that was used to seed the default DB on this run.
