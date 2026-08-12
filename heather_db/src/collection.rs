@@ -256,9 +256,8 @@ impl Collection {
             });
         }
 
-        if inner.locations.is_empty() {
-            return Err(HeatherError::EmptyMemory);
-        }
+        // No EmptyMemory guard: a data-seeded index (l_0 == 0) starts empty and
+        // is seeded by the first write (adaptive_write cold-start).
 
         let mut rng = rand::thread_rng();
         let result = {
@@ -328,9 +327,7 @@ impl Collection {
 
         let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
 
-        if inner.locations.is_empty() {
-            return Err(HeatherError::EmptyMemory);
-        }
+        // No EmptyMemory guard: data-seeded index is seeded by the first write.
 
         let d = inner.config.d;
         for input in inputs {
@@ -561,9 +558,8 @@ impl Collection {
             });
         }
 
-        if inner.locations.is_empty() {
-            return Err(HeatherError::EmptyMemory);
-        }
+        // No EmptyMemory guard: a data-seeded index (l_0 == 0) starts empty and
+        // is seeded by the first write (adaptive_write cold-start).
 
         // Run adaptive write (same as write())
         let mut rng = rand::thread_rng();

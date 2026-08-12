@@ -43,9 +43,18 @@ pub fn adaptive_write(
     let (indices, sims) = read::activate_auto(input, locations, k, landmarks, id_lookup);
 
     if indices.is_empty() {
+        // Cold start: the index is empty (data-seeded, l_0 == 0). Seed the first
+        // hard location directly from the input rather than no-op'ing — this is
+        // how a data-seeded index grows its initial codebook. Subsequent writes
+        // activate against it and either consolidate or novelty-split.
+        let id = LocationId(*next_id);
+        *next_id += 1;
+        let mut new_loc = HardLocation::new(id, vec_ops::normalize(input));
+        new_loc.counter = input.to_vec();
+        new_loc.write_count = 1.0;
         return WriteResult {
             modified_indices: vec![],
-            new_locations: vec![],
+            new_locations: vec![new_loc],
             eta,
         };
     }

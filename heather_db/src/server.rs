@@ -65,6 +65,15 @@ impl Server {
     /// runs. Set this to whatever your "out of the box" workload uses
     /// (commonly 128).
     pub fn open(root: &Path, default_dimension: usize) -> Result<Self> {
+        // Default to a data-seeded index (no random pre-seeded locations).
+        Self::open_with(root, default_dimension, 0)
+    }
+
+    /// Like [`Server::open`], but also sets the initial hard-location count
+    /// (`l_0`) for the default DB created on a fresh boot. `default_l_0 == 0`
+    /// is data-seeded (the agreed default); a positive value pre-seeds that
+    /// many random locations.
+    pub fn open_with(root: &Path, default_dimension: usize, default_l_0: usize) -> Result<Self> {
         std::fs::create_dir_all(root)
             .map_err(|e| HeatherError::Storage(format!("create root {}: {e}", root.display())))?;
 
@@ -128,7 +137,9 @@ impl Server {
             .map_err(|_| HeatherError::LockPoisoned)?
             .is_empty();
         if needs_default {
-            let cfg = DbConfig::new(DEFAULT_DB, default_dimension)?;
+            let mut cfg = DbConfig::new(DEFAULT_DB, default_dimension)?;
+            cfg.eam.l_0 = default_l_0;
+            cfg.eam.validate()?;
             server.create_database(cfg)?;
         }
 

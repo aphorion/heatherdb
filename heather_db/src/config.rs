@@ -46,7 +46,10 @@ impl EAMConfig {
     pub fn new(d: usize) -> Result<Self> {
         let config = EAMConfig {
             d,
-            l_0: 1000,
+            // 0 = data-seeded: hard locations are grown from the first writes,
+            // never pre-seeded with random unit vectors. Set a positive l_0 only
+            // when a random initial codebook is explicitly wanted.
+            l_0: 0,
             k: 20,
             eta_0: 0.01,
             lambda: 0.9999,
@@ -84,9 +87,8 @@ impl EAMConfig {
         if self.d == 0 {
             return Err(HeatherError::InvalidConfig("d must be > 0".into()));
         }
-        if self.l_0 == 0 {
-            return Err(HeatherError::InvalidConfig("l_0 must be > 0".into()));
-        }
+        // l_0 == 0 is valid and is the default: the index is seeded from data
+        // (first writes), not from random vectors.
         if self.k == 0 {
             return Err(HeatherError::InvalidConfig("k must be > 0".into()));
         }
