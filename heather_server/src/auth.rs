@@ -125,7 +125,8 @@ pub async fn middleware(State(auth): State<AuthState>, req: Request<Body>, next:
     }
 
     let mut req = req;
-    req.extensions_mut().insert(AuthedUser { user, kind, token });
+    req.extensions_mut()
+        .insert(AuthedUser { user, kind, token });
     next.run(req).await
 }
 

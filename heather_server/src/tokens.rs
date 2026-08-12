@@ -32,12 +32,12 @@ use axum::response::{IntoResponse, Response};
 
 use crate::auth::AuthedUser;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use heed::types::{Bytes, Str};
 use heed::{Database, Env, EnvOpenOptions};
-use rand::rngs::OsRng;
 use rand::RngCore;
+use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::users::User;
@@ -89,8 +89,7 @@ impl Tokens {
     /// start.
     pub fn load(data_dir: &Path) -> Result<Self, String> {
         let env_path = data_dir.join(SYSTEM_SUBDIR);
-        fs::create_dir_all(&env_path)
-            .map_err(|e| format!("create {}: {e}", env_path.display()))?;
+        fs::create_dir_all(&env_path).map_err(|e| format!("create {}: {e}", env_path.display()))?;
 
         let env = unsafe {
             EnvOpenOptions::new()
@@ -177,21 +176,20 @@ impl Tokens {
         // Fast path: read lock the cache.
         {
             let guard = self.cache.read().expect("tokens cache poisoned");
-            if let Some(entry) = guard.get(token) {
-                if entry.expires_at > now_secs() {
-                    return Some((entry.user.clone(), entry.expires_at));
-                }
-            } else {
-                return None;
+            // Unknown token: nothing to sweep, so leave immediately. A known
+            // but expired one falls through to the write-lock sweep below.
+            let entry = guard.get(token)?;
+            if entry.expires_at > now_secs() {
+                return Some((entry.user.clone(), entry.expires_at));
             }
         }
         // Expired — sweep cache + LMDB.
         {
             let mut guard = self.cache.write().expect("tokens cache poisoned");
-            if let Some(entry) = guard.get(token) {
-                if entry.expires_at <= now_secs() {
-                    guard.remove(token);
-                }
+            if let Some(entry) = guard.get(token)
+                && entry.expires_at <= now_secs()
+            {
+                guard.remove(token);
             }
         }
         let _ = self.remove_persisted(token);
@@ -250,8 +248,7 @@ impl Tokens {
     /* ─── internals ─────────────────────────────────────────────── */
 
     fn persist(&self, token: &str, entry: &TokenEntry) -> Result<(), String> {
-        let bytes = bincode::serialize(entry)
-            .map_err(|e| format!("serialise token: {e}"))?;
+        let bytes = bincode::serialize(entry).map_err(|e| format!("serialise token: {e}"))?;
         let mut wtxn = self.env.write_txn().map_err(|e| e.to_string())?;
         self.db
             .put(&mut wtxn, token, &bytes)
@@ -309,7 +306,11 @@ pub async fn revoke(
     match authed.token {
         Some(tok) => {
             let revoked = tokens.revoke(&tok);
-            (StatusCode::OK, Json(serde_json::json!({ "revoked": revoked }))).into_response()
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({ "revoked": revoked })),
+            )
+                .into_response()
         }
         None => (
             StatusCode::BAD_REQUEST,
@@ -344,7 +345,7 @@ mod tests {
         // Tokens shares the env with UserStore. Loading the user store
         // first creates `system/data/` + the `users` sub-DB; Tokens
         // then adds its own `tokens` sub-DB.
-        
+
         let _us = UserStore::load(dir.path()).unwrap();
         let t = Tokens::load(dir.path()).unwrap();
         (dir, t)
@@ -405,7 +406,7 @@ mod tests {
     fn gc_sweeps_expired() {
         let (_dir, t) = store_pair();
         let (_a, _) = t.mint(user("alice"), Duration::from_secs(0));
-        let (b, _)  = t.mint(user("bob"),   Duration::from_secs(60));
+        let (b, _) = t.mint(user("bob"), Duration::from_secs(60));
         assert_eq!(t.len(), 2);
         let removed = t.gc();
         assert_eq!(removed, 1);
