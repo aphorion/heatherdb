@@ -104,8 +104,11 @@ pub fn knn_merge(locations: &mut Vec<HardLocation>, config: &EAMConfig) -> Merge
             // Non-competitive (exact key→value, e.g. attention KV) keeps the
             // count-weighted mean in raw K-space so ‖K‖ survives the merge and
             // a count-weighted dot read reconstructs the un-merged attention.
-            locations[i].address =
-                if config.competitive { vec_ops::normalize(&new_addr) } else { new_addr };
+            locations[i].address = if config.competitive {
+                vec_ops::normalize(&new_addr)
+            } else {
+                new_addr
+            };
         }
 
         // Additive counters

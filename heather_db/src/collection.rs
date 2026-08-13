@@ -631,7 +631,7 @@ impl Collection {
         self.read_attention_ex(query, scale, None)
     }
 
-    /// [`read_attention`] with an optional location index to drop from the
+    /// [`Self::read_attention`] with an optional location index to drop from the
     /// activated set — leave-one-out reads (a stored key queried against the
     /// rest of the codebook) for honest held-out evaluation. When `exclude`
     /// is set, one extra location is activated so `config.k` neighbours
@@ -687,8 +687,10 @@ impl Collection {
             .collect();
         let alpha = vec_ops::softmax(&logits, 1.0);
         // raw values (V = counter / write_count), NO output normalization
-        let values: Vec<Vec<f64>> =
-            indices.iter().map(|&i| inner.locations[i].normalized_pattern()).collect();
+        let values: Vec<Vec<f64>> = indices
+            .iter()
+            .map(|&i| inner.locations[i].normalized_pattern())
+            .collect();
         let value_refs: Vec<&[f64]> = values.iter().map(|v| v.as_slice()).collect();
         Ok(vec_ops::weighted_sum(&value_refs, &alpha))
     }
@@ -712,8 +714,11 @@ impl Collection {
             return Ok((inner.config.beta, 0.0));
         }
         let k = inner.config.k.min(n - 1);
-        let vals: Vec<Vec<f64>> =
-            inner.locations.iter().map(|l| l.normalized_pattern()).collect();
+        let vals: Vec<Vec<f64>> = inner
+            .locations
+            .iter()
+            .map(|l| l.normalized_pattern())
+            .collect();
 
         // top-k key-neighbours of each location (excluding itself), with the
         // raw dot logit Kⱼ·Kᵢ that read_attention scales by β.
@@ -722,7 +727,10 @@ impl Collection {
                 let mut sims: Vec<(usize, f64)> = (0..n)
                     .filter(|&i| i != j)
                     .map(|i| {
-                        (i, vec_ops::dot(&inner.locations[j].address, &inner.locations[i].address))
+                        (
+                            i,
+                            vec_ops::dot(&inner.locations[j].address, &inner.locations[i].address),
+                        )
                     })
                     .collect();
                 sims.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -731,7 +739,10 @@ impl Collection {
             })
             .collect();
 
-        let mut best = (betas.first().copied().unwrap_or(inner.config.beta), f64::INFINITY);
+        let mut best = (
+            betas.first().copied().unwrap_or(inner.config.beta),
+            f64::INFINITY,
+        );
         for &beta in betas {
             let mut dl = 0.0;
             for (j, nb) in neighbours.iter().enumerate() {
@@ -804,8 +815,10 @@ impl Collection {
             })
             .collect();
         let alpha = vec_ops::softmax(&logits, 1.0);
-        let values: Vec<Vec<f64>> =
-            indices.iter().map(|&i| inner.locations[i].normalized_pattern()).collect();
+        let values: Vec<Vec<f64>> = indices
+            .iter()
+            .map(|&i| inner.locations[i].normalized_pattern())
+            .collect();
         let value_refs: Vec<&[f64]> = values.iter().map(|v| v.as_slice()).collect();
         Ok((vec_ops::weighted_sum(&value_refs, &alpha), beta))
     }
@@ -1566,8 +1579,11 @@ mod tests {
                 .map(|l| scale * vec_ops::dot(&query, &l.address) + l.write_count.max(1e-12).ln())
                 .collect();
             let alpha = vec_ops::softmax(&logits, 1.0);
-            let vals: Vec<Vec<f64>> =
-                inner.locations.iter().map(|l| l.normalized_pattern()).collect();
+            let vals: Vec<Vec<f64>> = inner
+                .locations
+                .iter()
+                .map(|l| l.normalized_pattern())
+                .collect();
             let refs: Vec<&[f64]> = vals.iter().map(|v| v.as_slice()).collect();
             vec_ops::weighted_sum(&refs, &alpha)
         };
@@ -1575,7 +1591,10 @@ mod tests {
         let got = col.read_attention(&query, scale).unwrap();
         assert_eq!(got.len(), d);
         for (a, b) in got.iter().zip(&manual) {
-            assert!((a - b).abs() < 1e-9, "read_attention {a} != manual softmax-dot {b}");
+            assert!(
+                (a - b).abs() < 1e-9,
+                "read_attention {a} != manual softmax-dot {b}"
+            );
         }
     }
 
@@ -1620,7 +1639,10 @@ mod tests {
 
         let got = col.read_attention(&query, scale).unwrap();
         for (a, b) in got.iter().zip(&manual) {
-            assert!((a - b).abs() < 1e-9, "read_attention {a} != raw-K attention {b}");
+            assert!(
+                (a - b).abs() < 1e-9,
+                "read_attention {a} != raw-K attention {b}"
+            );
         }
     }
 
@@ -1636,12 +1658,19 @@ mod tests {
     }
 
     fn entropy(alpha: &[f64]) -> f64 {
-        -alpha.iter().filter(|&&a| a > 0.0).map(|&a| a * a.ln()).sum::<f64>()
+        -alpha
+            .iter()
+            .filter(|&&a| a > 0.0)
+            .map(|&a| a * a.ln())
+            .sum::<f64>()
     }
 
     /// Attention weights at a fixed β for raw-dot logits over `keys`.
     fn alpha_at(query: &[f64], keys: &[Vec<f64>], beta: f64) -> Vec<f64> {
-        let logits: Vec<f64> = keys.iter().map(|kk| beta * vec_ops::dot(query, kk)).collect();
+        let logits: Vec<f64> = keys
+            .iter()
+            .map(|kk| beta * vec_ops::dot(query, kk))
+            .collect();
         vec_ops::softmax(&logits, 1.0)
     }
 
@@ -1697,7 +1726,11 @@ mod tests {
         // Ambiguous query: nearly equidistant to the two separated keys
         // (sims 0.51 vs 0.49 → a 0.02 hair, no honest winner).
         let query = vec_ops::normalize(
-            &sep_keys[0].iter().zip(&sep_keys[1]).map(|(a, b)| 0.51 * a + 0.49 * b).collect::<Vec<_>>(),
+            &sep_keys[0]
+                .iter()
+                .zip(&sep_keys[1])
+                .map(|(a, b)| 0.51 * a + 0.49 * b)
+                .collect::<Vec<_>>(),
         );
 
         let (_v_sep, beta_sep) = sep.read_attention_mdl(&query).unwrap();
@@ -1720,7 +1753,10 @@ mod tests {
              h_mdl={h_mdl} (β*={beta_sep}) h_hard={h_hard}"
         );
         // ...and stay near the 50/50 ceiling (ln 2 ≈ 0.693) rather than collapse.
-        assert!(h_mdl > 0.6, "MDL read should be near-maximal entropy: {h_mdl}");
+        assert!(
+            h_mdl > 0.6,
+            "MDL read should be near-maximal entropy: {h_mdl}"
+        );
     }
 
     fn empty_seeded_collection(dir: &TempDir) -> Collection {

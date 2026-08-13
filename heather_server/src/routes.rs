@@ -330,11 +330,16 @@ pub async fn attention(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
     let scale = req.scale;
-    let result =
-        tokio::task::spawn_blocking(move || col.read_attention_ex(&req.query, req.scale, req.exclude_id))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        col.read_attention_ex(&req.query, req.scale, req.exclude_id)
+    })
+    .await;
     match result {
-        Ok(Ok(vec)) => Json(AttentionResponse { result: vec, beta: scale }).into_response(),
+        Ok(Ok(vec)) => Json(AttentionResponse {
+            result: vec,
+            beta: scale,
+        })
+        .into_response(),
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
@@ -352,7 +357,9 @@ pub async fn calibrate(
     // default sweep: 80 log-spaced points in [0.5, 200]
     let betas = req.betas.unwrap_or_else(|| {
         let (lo, hi, steps) = (0.5_f64.ln(), 200.0_f64.ln(), 80usize);
-        (0..=steps).map(|s| (lo + (hi - lo) * s as f64 / steps as f64).exp()).collect()
+        (0..=steps)
+            .map(|s| (lo + (hi - lo) * s as f64 / steps as f64).exp())
+            .collect()
     });
     let result = tokio::task::spawn_blocking(move || col.calibrate_beta(&betas)).await;
     match result {
