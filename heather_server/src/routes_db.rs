@@ -87,6 +87,30 @@ pub async fn create_database(
     cfg.map_size_mb = req.map_size_mb.unwrap_or(DEFAULT_MAP_SIZE_MB);
     cfg.eam.mdl_gate = req.mdl_gate;
 
+    if let Some(o) = req.eam {
+        if let Some(v) = o.k {
+            cfg.eam.k = v;
+        }
+        if let Some(v) = o.t_max {
+            cfg.eam.t_max = v;
+        }
+        if let Some(v) = o.beta {
+            cfg.eam.beta = v;
+        }
+        if let Some(v) = o.neighbor_cap {
+            cfg.eam.neighbor_cap = v;
+        }
+        if let Some(v) = o.num_landmarks {
+            cfg.eam.num_landmarks = v;
+        }
+        if let Some(v) = o.l_0 {
+            cfg.eam.l_0 = v;
+        }
+        if let Err(e) = cfg.eam.validate() {
+            return err(StatusCode::BAD_REQUEST, e);
+        }
+    }
+
     match server.create_database(cfg) {
         Ok(_) => match server.database_config(&req.name) {
             Ok(c) => {

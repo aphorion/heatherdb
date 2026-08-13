@@ -139,6 +139,23 @@ pub struct CreateDatabaseRequest {
     /// (surprise·recurrence > engram bits) instead of fixed tau_split/tau_overload.
     #[serde(default)]
     pub mdl_gate: bool,
+    /// Optional EAM-config overrides. Any unset field keeps the engine default.
+    #[serde(default)]
+    pub eam: Option<EamConfigOverride>,
+}
+
+/// Per-database EAM knobs settable at creation. Unset fields keep the engine
+/// default; supplied fields are validated before the database is created. Lets
+/// callers (e.g. ingested-model DBs) request full-softmax `k`, single-step
+/// `t_max`, or a disabled neighbor graph without hand-editing `db.toml`.
+#[derive(Debug, Deserialize, Default)]
+pub struct EamConfigOverride {
+    pub k: Option<usize>,
+    pub t_max: Option<usize>,
+    pub beta: Option<f64>,
+    pub neighbor_cap: Option<usize>,
+    pub num_landmarks: Option<usize>,
+    pub l_0: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -417,4 +434,32 @@ pub struct ComposeReadResponse {
     pub result: Vec<f64>,
     pub weights: HashMap<String, f64>,
     pub confidences: HashMap<String, f64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_db_request_without_eam_defaults_to_none() {
+        let req: CreateDatabaseRequest =
+            serde_json::from_str(r#"{"name":"d","dimension":128}"#).unwrap();
+        assert!(req.eam.is_none());
+        assert!(req.map_size_mb.is_none());
+    }
+
+    #[test]
+    fn create_db_request_parses_partial_eam_overrides() {
+        let req: CreateDatabaseRequest = serde_json::from_str(
+            r#"{"name":"enc","dimension":1024,"eam":{"k":3840,"t_max":1,"neighbor_cap":0}}"#,
+        )
+        .unwrap();
+        let eam = req.eam.expect("eam present");
+        assert_eq!(eam.k, Some(3840));
+        assert_eq!(eam.t_max, Some(1));
+        assert_eq!(eam.neighbor_cap, Some(0));
+        // unsupplied knobs stay None so the engine default is kept
+        assert_eq!(eam.beta, None);
+        assert_eq!(eam.num_landmarks, None);
+    }
 }
