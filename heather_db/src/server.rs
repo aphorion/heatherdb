@@ -42,6 +42,41 @@ pub const DEFAULT_DB: &str = "default";
 /// the layout and refuse to mount it with an incompatible reader.
 const SERVER_TAG: &str = "server.toml";
 
+/// The data-dir layout this engine build reads and writes. `Server::open`
+/// refuses any other value (pre-1.0 policy: back up and recreate, no
+/// migration shims).
+const SUPPORTED_LAYOUT: &str = "v0.2";
+
+/// Advisory lock file held (flock-exclusive) for the lifetime of an open
+/// `Server`. Cold backup/restore tooling takes the same lock to refuse
+/// running against a live engine.
+const ENGINE_LOCK: &str = "engine.lock";
+
+/// Try to acquire the exclusive engine lock for a data dir. Returns the
+/// held lock file on success (the lock releases when the file drops) or
+/// `None` if another process currently holds it — i.e. an engine is
+/// running on this data dir.
+pub fn try_acquire_engine_lock(root: &Path) -> Result<Option<std::fs::File>> {
+    use fs4::fs_std::FileExt;
+    std::fs::create_dir_all(root)
+        .map_err(|e| HeatherError::Storage(format!("create root {}: {e}", root.display())))?;
+    let path = root.join(ENGINE_LOCK);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| HeatherError::Storage(format!("open {}: {e}", path.display())))?;
+    match file.try_lock_exclusive() {
+        Ok(true) => Ok(Some(file)),
+        Ok(false) => Ok(None),
+        Err(e) => Err(HeatherError::Storage(format!(
+            "lock {}: {e}",
+            path.display()
+        ))),
+    }
+}
+
 /// Multi-database engine root.
 ///
 /// Cheap to clone (`Arc<RwLock<...>>` internally). Pass `Arc<Server>` into
@@ -55,6 +90,8 @@ pub struct Server {
     /// `name → Arc<Hive>`. Read-heavy: handlers acquire a read lock,
     /// look up the Arc, and drop the lock before doing any work.
     inner: RwLock<HashMap<String, Arc<Hive>>>,
+    /// Held exclusively for the Server's lifetime; see [`try_acquire_engine_lock`].
+    _engine_lock: std::fs::File,
 }
 
 impl Server {
@@ -77,13 +114,39 @@ impl Server {
         std::fs::create_dir_all(root)
             .map_err(|e| HeatherError::Storage(format!("create root {}: {e}", root.display())))?;
 
-        // Touch the server tag file so future tooling can identify the layout.
+        // Refuse to double-mount: two engines on one data dir corrupt LMDB.
+        let engine_lock = try_acquire_engine_lock(root)?.ok_or_else(|| {
+            HeatherError::Storage(format!(
+                "another engine process holds the lock on {} — refusing to double-mount",
+                root.display()
+            ))
+        })?;
+
+        // Layout tag: write on first boot, verify on every subsequent one.
+        // An unknown layout means the data was written by a different
+        // engine generation — mounting it blind risks silent corruption.
         let tag = root.join(SERVER_TAG);
-        if !tag.exists() {
+        if tag.exists() {
+            let text = std::fs::read_to_string(&tag)
+                .map_err(|e| HeatherError::Storage(format!("read {}: {e}", tag.display())))?;
+            let parsed: toml::Value = toml::from_str(&text)
+                .map_err(|e| HeatherError::Storage(format!("parse {}: {e}", tag.display())))?;
+            let layout = parsed
+                .get("layout")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(missing)");
+            if layout != SUPPORTED_LAYOUT {
+                return Err(HeatherError::Storage(format!(
+                    "data dir {} has layout '{layout}' but this engine reads '{SUPPORTED_LAYOUT}' \
+                     — refusing to mount. Use a matching engine version, or back up and recreate.",
+                    root.display()
+                )));
+            }
+        } else {
             std::fs::write(
                 &tag,
                 format!(
-                    "# heatherdb server data root\nlayout = \"v0.2\"\ncreated_at = {}\n",
+                    "# heatherdb server data root\nlayout = \"{SUPPORTED_LAYOUT}\"\ncreated_at = {}\n",
                     now_secs()
                 ),
             )
@@ -94,6 +157,7 @@ impl Server {
             root: root.to_path_buf(),
             default_dimension,
             inner: RwLock::new(HashMap::new()),
+            _engine_lock: engine_lock,
         };
 
         // Discover existing databases on disk and pre-open their hives.
@@ -403,6 +467,64 @@ mod tests {
             Err(e) => assert!(format!("{e}").contains("already exists")),
             Ok(_) => panic!("expected duplicate-create to fail"),
         }
+    }
+
+    #[test]
+    fn refuses_unknown_layout() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("server.toml"), "layout = \"v9.9\"\n").unwrap();
+        match Server::open(dir.path(), 64) {
+            Err(e) => assert!(format!("{e}").contains("layout")),
+            Ok(_) => panic!("expected layout mismatch to refuse mount"),
+        }
+    }
+
+    #[test]
+    fn engine_lock_blocks_second_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let _server = Server::open(dir.path(), 64).unwrap();
+        match Server::open(dir.path(), 64) {
+            Err(e) => assert!(format!("{e}").contains("lock")),
+            Ok(_) => panic!("expected second open to fail while lock held"),
+        }
+        assert!(try_acquire_engine_lock(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn engine_lock_released_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _server = Server::open(dir.path(), 64).unwrap();
+        }
+        assert!(try_acquire_engine_lock(dir.path()).unwrap().is_some());
+    }
+
+    #[test]
+    fn load_snapshot_checked_detects_concurrent_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(dir.path(), 64).unwrap();
+        let hive = server.database(DEFAULT_DB).unwrap();
+        let col = hive.get_or_create_collection("c").unwrap();
+
+        let mut v = vec![0.0; 64];
+        v[0] = 1.0;
+        col.write(&v).unwrap();
+
+        let (locs, cfg, ver) = col.snapshot_versioned().unwrap();
+
+        // A write lands between snapshot and load — the load must refuse.
+        let mut w = vec![0.0; 64];
+        w[1] = 1.0;
+        col.write(&w).unwrap();
+
+        match col.load_snapshot_checked(locs.clone(), cfg.clone(), Some(ver)) {
+            Err(HeatherError::Conflict(_)) => {}
+            Err(e) => panic!("expected Conflict, got {e}"),
+            Ok(_) => panic!("expected Conflict, load succeeded"),
+        }
+
+        // Unchecked load (legacy behaviour) still goes through.
+        col.load_snapshot(locs, cfg).unwrap();
     }
 
     #[test]

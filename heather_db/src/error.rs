@@ -28,6 +28,9 @@ pub enum HeatherError {
 
     #[error("lock poisoned: a thread panicked while holding a lock")]
     LockPoisoned,
+
+    #[error("conflict: {0}")]
+    Conflict(String),
 }
 
 impl From<heed::Error> for HeatherError {

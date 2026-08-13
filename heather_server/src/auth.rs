@@ -185,13 +185,17 @@ fn deny_403(msg: &str) -> Response {
 /// - The password comes from `--admin-password` / `HEATHER_ADMIN_PASSWORD`
 ///   when set, otherwise a 24-char random string is generated.
 /// - When the password was generated (no env), it's printed once in a
-///   fenced ASCII box on stderr — that's the operator's only chance to
-///   catch it. When supplied via env, nothing is printed (the operator
+///   fenced ASCII box on stderr AND written to
+///   `$DATA_DIR/initial-admin-password` (mode 0600) — stderr alone is
+///   too easy to lose in container/Coolify log capture, and there is no
+///   other recovery path. Delete the file after copying the password.
+///   When supplied via env, nothing is printed or written (the operator
 ///   already has it).
 pub fn bootstrap_admin_if_needed(
     users: &UserStore,
     user_name: &str,
     explicit_password: Option<&str>,
+    data_dir: &std::path::Path,
 ) -> Result<(), String> {
     if !users.is_empty() {
         return Ok(());
@@ -203,6 +207,14 @@ pub fn bootstrap_admin_if_needed(
     users.create(user_name, &password, Scope::Root)?;
 
     if was_generated {
+        let pw_file = data_dir.join("initial-admin-password");
+        match write_password_file(&pw_file, user_name, &password) {
+            Ok(()) => eprintln!(
+                "first-boot admin password also written to {}",
+                pw_file.display()
+            ),
+            Err(e) => tracing::warn!(error = %e, "could not persist first-boot password file"),
+        }
         eprintln!();
         eprintln!("┌─────────────────────────────────────────────────────────────────────┐");
         eprintln!("│ HeatherDB ⋅ first-boot admin user created.                          │");
@@ -212,8 +224,9 @@ pub fn bootstrap_admin_if_needed(
         eprintln!("│   scope     root                                                    │");
         eprintln!("│                                                                     │");
         eprintln!("│ Save this password — it's NOT printed again.                        │");
-        eprintln!("│ Set HEATHER_ADMIN_USER + HEATHER_ADMIN_PASSWORD next time to skip   │");
-        eprintln!("│ the random-password dance, or rotate this one with:                 │");
+        eprintln!("│ A copy is at $DATA_DIR/initial-admin-password (0600) — delete it    │");
+        eprintln!("│ once saved. Set HEATHER_ADMIN_USER + HEATHER_ADMIN_PASSWORD next    │");
+        eprintln!("│ time to skip the random-password dance, or rotate this one with:    │");
         eprintln!("│   heather_server user passwd <user> --password '<new>'              │");
         eprintln!("└─────────────────────────────────────────────────────────────────────┘");
         eprintln!();
@@ -224,6 +237,20 @@ pub fn bootstrap_admin_if_needed(
         );
     }
     Ok(())
+}
+
+/// Write the first-boot password file, owner-readable only on unix.
+fn write_password_file(path: &std::path::Path, user: &str, password: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path).map_err(|e| e.to_string())?;
+    writeln!(f, "user = \"{user}\"\npassword = \"{password}\"").map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

@@ -53,5 +53,5 @@ pub use error::HeatherError;
 pub use hive::Hive;
 pub use location::{HardLocation, LocationId};
 pub use read::{ActivatedLocation, ReadTrace};
-pub use server::{DEFAULT_DB, Server, default_db_config};
+pub use server::{DEFAULT_DB, Server, default_db_config, try_acquire_engine_lock};
 pub use write::WriteOpts;
