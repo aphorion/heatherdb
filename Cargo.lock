@@ -633,7 +633,7 @@ checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 
 [[package]]
 name = "heather_algebra"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "criterion",
  "heather_db",
@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "heather_db"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "bincode",
  "criterion",
@@ -666,7 +666,7 @@ dependencies = [
 
 [[package]]
 name = "heather_fornix"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -677,7 +677,7 @@ dependencies = [
 
 [[package]]
 name = "heather_server"
-version = "0.1.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "axum",
