@@ -40,6 +40,28 @@ pub struct EAMConfig {
     pub neighbor_cap: usize,
     /// Number of landmark entry points for graph search (default 32)
     pub num_landmarks: usize,
+    /// MDL allocation gate. When true, the spawn/split decision is driven by
+    /// description length: allocate a distinct location iff accumulated surprise
+    /// (bits) clears the cost of an engram, log2(L+1) + log2(d/32) — replacing the
+    /// fixed `tau_split` (novelty) and `tau_overload` (recurrence) thresholds with
+    /// the single rule surprise·recurrence > bits. Recurrence enters by
+    /// accumulating each joining write's surprise onto the location it joined.
+    #[serde(default)]
+    pub mdl_gate: bool,
+}
+
+/// Bits to store one new hard location: log2(L+1) address bits among the existing
+/// locations + log2(d/32) value bits at the per-read capacity resolution. The
+/// address term rises with L, so the spawn bar self-anneals as the index fills.
+pub fn engram_bits(num_locations: usize, d: usize) -> f64 {
+    ((num_locations + 1) as f64).log2() + ((d as f64 / 32.0).max(2.0)).log2()
+}
+
+/// Residual surprise of a write that matched its winner at cosine `sim`, in bits:
+/// -log2(sim) with sim read as a match probability. A perfect match costs ~0 bits;
+/// a poor match accrues debt toward a split.
+pub fn surprise_bits(sim: f64) -> f64 {
+    -sim.clamp(2f64.powi(-12), 1.0).log2()
 }
 
 impl EAMConfig {
@@ -64,6 +86,7 @@ impl EAMConfig {
             epsilon: 1e-6,
             neighbor_cap: (d / 4).max(20),
             num_landmarks: 32,
+            mdl_gate: false,
         };
         config.validate()?;
         Ok(config)

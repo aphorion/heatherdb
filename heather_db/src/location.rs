@@ -18,6 +18,11 @@ pub struct HardLocation {
     /// Forms a navigable graph for O(kD log L) reads instead of O(LD) brute force.
     #[serde(default)]
     pub neighbors: Vec<u64>,
+    /// Accumulated residual surprise (bits) routed into this location since its
+    /// last split. The MDL gate splits this location once the debt exceeds the
+    /// engram bit cost. Unused when `config.mdl_gate` is false.
+    #[serde(default)]
+    pub surprise_mass: f64,
 }
 
 impl HardLocation {
@@ -29,6 +34,7 @@ impl HardLocation {
             counter: vec![0.0; d],
             write_count: 0.0,
             neighbors: Vec::new(),
+            surprise_mass: 0.0,
         }
     }
 

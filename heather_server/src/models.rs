@@ -107,6 +107,10 @@ pub struct CreateDatabaseRequest {
     /// Optional LMDB map size in MB (default: 4096).
     #[serde(default)]
     pub map_size_mb: Option<usize>,
+    /// Opt into the MDL allocation gate: spawn/split by description length
+    /// (surprise·recurrence > engram bits) instead of fixed tau_split/tau_overload.
+    #[serde(default)]
+    pub mdl_gate: bool,
 }
 
 #[derive(Debug, Serialize)]
