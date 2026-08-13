@@ -23,6 +23,16 @@ pub struct EAMStats {
     pub max_write_count: f64,
 }
 
+/// Outcome of a description-length-minimising compression pass.
+#[derive(Debug, Clone)]
+pub struct CompressResult {
+    pub locations_before: usize,
+    pub locations_after: usize,
+    pub description_length_before: f64,
+    pub description_length_after: f64,
+    pub merges: usize,
+}
+
 /// Summary of a single hard location for UI display.
 #[derive(Debug, Clone)]
 pub struct LocationSummary {
@@ -597,6 +607,141 @@ impl Collection {
         }
 
         Ok(result.merge_count)
+    }
+
+    /// Description length (bits) of the collection under a minimum-description-length
+    /// reading: `L·kappa` to specify the L locations (the model) plus `W·log2(L)` to
+    /// encode each of the W writes as which location it selects (the data). This is
+    /// the engine's native entropy readout; compression lowers it.
+    pub fn description_length(&self, kappa: f64) -> Result<f64> {
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let l = inner.locations.len().max(1) as f64;
+        let w: f64 = inner
+            .locations
+            .iter()
+            .map(|x| x.write_count)
+            .sum::<f64>()
+            .max(1.0);
+        Ok(l * kappa + w * l.log2())
+    }
+
+    /// Minimise description length: greedily merge the closest two locations while it
+    /// pays — model saving (`kappa` + cheaper encoding) exceeds the merge's data-fit
+    /// cost (`lambda` × the variance increase) — and stop at the minimum. The engine
+    /// auto-calibrates how many locations its data actually warrants. Compression is
+    /// the native objective; the location count is the emergent result.
+    pub fn compress(&self, kappa: f64, lambda: f64) -> Result<CompressResult> {
+        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let w: f64 = inner
+            .locations
+            .iter()
+            .map(|x| x.write_count)
+            .sum::<f64>()
+            .max(1.0);
+        let locations_before = inner.locations.len();
+        let dl_before =
+            (locations_before.max(1) as f64) * kappa + w * (locations_before.max(1) as f64).log2();
+
+        let mut removed_ids: Vec<u64> = Vec::new();
+        let mut parent: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+
+        loop {
+            let n = inner.locations.len();
+            if n <= 2 {
+                break;
+            }
+            // closest pair by cosine (addresses are unit norm)
+            let (mut bi, mut bj, mut bc) = (0usize, 1usize, -2.0f64);
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let c = vec_ops::dot(&inner.locations[i].address, &inner.locations[j].address);
+                    if c > bc {
+                        bc = c;
+                        bi = i;
+                        bj = j;
+                    }
+                }
+            }
+            let wi = inner.locations[bi].write_count.max(1e-9);
+            let wj = inner.locations[bj].write_count.max(1e-9);
+            let inertia = (wi * wj / (wi + wj)) * 2.0 * (1.0 - bc).max(0.0);
+            let model_saving = kappa + w * ((n as f64).log2() - ((n - 1) as f64).log2());
+            if model_saving <= inertia * lambda {
+                break; // MDL minimum reached — auto-calibrated location count
+            }
+            // merge bj into bi (bi survives), write-weighted
+            let removed_id = inner.locations[bj].id.0;
+            let survivor_id = inner.locations[bi].id.0;
+            let na: Vec<f64> = inner.locations[bi]
+                .address
+                .iter()
+                .zip(inner.locations[bj].address.iter())
+                .map(|(ai, aj)| wi * ai + wj * aj)
+                .collect();
+            let na = vec_ops::normalize(&na);
+            let cj = inner.locations[bj].counter.clone();
+            let nj = inner.locations[bj].neighbors.clone();
+            {
+                let li = &mut inner.locations[bi];
+                for (c, add) in li.counter.iter_mut().zip(cj.iter()) {
+                    *c += add;
+                }
+                li.address = na;
+                li.write_count = wi + wj;
+                li.neighbors.extend(nj);
+            }
+            inner.locations.remove(bj);
+            parent.insert(removed_id, survivor_id);
+            removed_ids.push(removed_id);
+        }
+
+        let locations_after = inner.locations.len();
+        let dl_after =
+            (locations_after.max(1) as f64) * kappa + w * (locations_after.max(1) as f64).log2();
+
+        if !removed_ids.is_empty() {
+            let mut txn = self.store.write_txn()?;
+            for &removed in &removed_ids {
+                let mut final_surv = removed; // resolve through the merge chain
+                while let Some(&s) = parent.get(&final_surv) {
+                    final_surv = s;
+                }
+                let removed_docs =
+                    self.store
+                        .get_doc_ids_for_location_txn(&txn, self.collection_id, removed)?;
+                if !removed_docs.is_empty() {
+                    let mut sd = self.store.get_doc_ids_for_location_txn(
+                        &txn,
+                        self.collection_id,
+                        final_surv,
+                    )?;
+                    sd.extend(removed_docs);
+                    self.store.put_doc_index_entry(
+                        &mut txn,
+                        self.collection_id,
+                        final_surv,
+                        &sd,
+                    )?;
+                }
+                self.store
+                    .delete_doc_index_entry(&mut txn, self.collection_id, removed)?;
+                self.store
+                    .delete_location(&mut txn, self.collection_id, LocationId(removed))?;
+            }
+            for loc in &inner.locations {
+                self.store.put_location(&mut txn, self.collection_id, loc)?;
+            }
+            txn.commit()?;
+            inner.rebuild_graph_cache();
+        }
+
+        Ok(CompressResult {
+            locations_before,
+            locations_after,
+            description_length_before: dl_before,
+            description_length_after: dl_after,
+            merges: removed_ids.len(),
+        })
     }
 
     /// Flush all locations to persistent storage.
@@ -1306,5 +1451,59 @@ mod tests {
         for h in handles {
             h.join().unwrap();
         }
+    }
+
+    /// Compression minimises description length and auto-calibrates the location
+    /// count to the data's true structure: near-duplicates merge, distinct
+    /// clusters survive, and reads still resolve.
+    #[test]
+    fn compress_recovers_true_structure() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let mut config = test_config();
+        config.l_0 = 0;
+        let d = config.d;
+        let col = Collection::new(col_id, "t".into(), store, &config).unwrap();
+
+        // 3 distinct clusters, 2 near-duplicate locations each (6 total)
+        let mut locs = Vec::new();
+        for k in 0..3 {
+            let mut proto = vec![0.0; d];
+            proto[k * 4] = 1.0;
+            for j in 0..2 {
+                let mut a = proto.clone();
+                a[1] += 0.01 * (j as f64); // tiny perturbation → near-duplicate
+                let a = vec_ops::normalize(&a);
+                let mut loc = HardLocation::new(LocationId((k * 2 + j) as u64), a.clone());
+                loc.counter = a;
+                loc.write_count = 1.0;
+                locs.push(loc);
+            }
+        }
+        col.load_snapshot(locs, config.clone()).unwrap();
+
+        let dl_before = col.description_length(d as f64).unwrap();
+        let r = col.compress(d as f64, 30.0).unwrap();
+
+        assert_eq!(r.locations_before, 6);
+        assert_eq!(
+            r.locations_after, 3,
+            "merges duplicates, keeps the 3 true clusters"
+        );
+        assert!(
+            r.description_length_after < dl_before,
+            "description length must drop"
+        );
+        assert_eq!(
+            col.num_locations().unwrap(),
+            3,
+            "persisted location count matches the compressed result"
+        );
+
+        // a query near cluster 0 still resolves there
+        let mut q = vec![0.0; d];
+        q[0] = 1.0;
+        let res = col.read(&q, ReadStrategy::HopfieldSS).unwrap();
+        assert!(vec_ops::dot(&vec_ops::normalize(&res), &q) > 0.5);
     }
 }

@@ -317,6 +317,46 @@ pub async fn stats(State(hive): State<AppState>, Path(name): Path<String>) -> Re
     }
 }
 
+/// `POST /collections/{name}/compress` — minimise the collection's description
+/// length by merging locations while it pays, stopping at the MDL minimum.
+pub async fn compress(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<CompressRequest>,
+) -> Response {
+    let col = match hive.get_collection(&name) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("collection '{name}' not found"),
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "Failed to get collection");
+            return error_response(StatusCode::INTERNAL_SERVER_ERROR, e);
+        }
+    };
+    let kappa = req
+        .kappa
+        .unwrap_or_else(|| col.config().map(|c| c.d as f64).unwrap_or(64.0));
+    let lambda = req.lambda.unwrap_or(1.0);
+    match col.compress(kappa, lambda) {
+        Ok(r) => Json(serde_json::json!({
+            "locations_before": r.locations_before,
+            "locations_after": r.locations_after,
+            "description_length_before": r.description_length_before,
+            "description_length_after": r.description_length_after,
+            "merges": r.merges,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "Compress failed");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, e)
+        }
+    }
+}
+
 pub async fn collection_config(State(hive): State<AppState>, Path(name): Path<String>) -> Response {
     let col = match hive.get_collection(&name) {
         Ok(Some(col)) => col,

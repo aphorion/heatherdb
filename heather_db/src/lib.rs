@@ -46,7 +46,7 @@ pub mod store;
 pub mod vec_ops;
 pub mod write;
 
-pub use collection::{Collection, EAMStats, LocationSummary, ReadStrategy};
+pub use collection::{Collection, CompressResult, EAMStats, LocationSummary, ReadStrategy};
 pub use config::EAMConfig;
 pub use db_config::{DEFAULT_MAP_SIZE_MB, DbConfig, DreamConfig, DreamMode, validate_db_name};
 pub use error::HeatherError;

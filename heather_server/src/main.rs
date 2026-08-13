@@ -256,6 +256,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/collections/{name}/bulk_load", post(routes::bulk_load))
         .route("/collections/{name}/read", post(routes::read))
         .route("/collections/{name}/stats", get(routes::stats))
+        .route("/collections/{name}/compress", post(routes::compress))
         .route("/collections/{name}/config", get(routes::collection_config))
         .route("/collections/{name}/locations", get(routes::locations))
         .route("/collections/{name}/analyze", post(routes::analyze))
@@ -308,6 +309,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
         )
         .route("/db/{db}/collections/{name}/read", post(routes_db::read))
         .route("/db/{db}/collections/{name}/stats", get(routes_db::stats))
+        .route(
+            "/db/{db}/collections/{name}/compress",
+            post(routes_db::compress),
+        )
         .route(
             "/db/{db}/collections/{name}/config",
             get(routes_db::collection_config),

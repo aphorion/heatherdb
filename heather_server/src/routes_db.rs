@@ -251,6 +251,18 @@ pub async fn stats(
     routes::stats(State(hive), Path(col)).await
 }
 
+pub async fn compress(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col)): Path<(String, String)>,
+    Json(req): Json<CompressRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::compress(State(hive), Path(col), Json(req)).await
+}
+
 pub async fn collection_config(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
