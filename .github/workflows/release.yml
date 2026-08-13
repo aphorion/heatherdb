@@ -3,19 +3,17 @@ name: Release
 # Triggered by tags shaped like v*.*.* (e.g. v0.1.0, v1.2.3-rc.1).
 #
 # Builds the `heather` binary (from the `heather_server` crate) for every
-# supported target, packages each as a
-# .tar.gz (Unix) or .zip (Windows), generates SHA-256 checksums, and
-# attaches everything to a GitHub Release.
+# supported target, packages each as a .tar.gz, generates SHA-256
+# checksums, and attaches everything to a GitHub Release.
+#
+# Linux only for now. The macOS, Windows and FreeBSD targets were removed
+# rather than left failing; re-add them to the matrix when they are wanted.
 #
 # Targets:
 #   linux-x86_64-gnu      Linux glibc 2.31+
 #   linux-x86_64-musl     Linux static (works on Alpine + everything)
 #   linux-aarch64-gnu     Linux glibc 2.31+, arm64
 #   linux-aarch64-musl    Linux static, arm64
-#   macos-x86_64          macOS Intel
-#   macos-aarch64         macOS Apple Silicon
-#   windows-x86_64        Windows MSVC
-#   freebsd-x86_64        FreeBSD 14, built inside a QEMU VM
 #
 # Manual trigger: workflow_dispatch with a version input lets you cut a
 # release without pushing a tag (useful for hotfix experiments).
@@ -58,7 +56,7 @@ jobs:
             echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
-  # ─── linux + macOS + windows: standard cross-compile matrix ────────────────
+  # ─── linux: cross-compile matrix ───────────────────────────────────────────
   build:
     name: ${{ matrix.label }}
     needs: prep
@@ -83,22 +81,9 @@ jobs:
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             cross: true
-          - label: macos-x86_64
-            os: macos-13                        # Intel runners (last available)
-            target: x86_64-apple-darwin
-            cross: false
-          - label: macos-aarch64
-            os: macos-14                        # Apple Silicon runners
-            target: aarch64-apple-darwin
-            cross: false
-          - label: windows-x86_64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cross: false
-            ext: ".exe"
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
 
       - name: Install Rust toolchain (stable, target ${{ matrix.target }})
         uses: dtolnay/rust-toolchain@stable
@@ -171,68 +156,9 @@ jobs:
           echo "checksum=dist/$ASSET.sha256" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
-          path: |
-            ${{ steps.package.outputs.asset }}
-            ${{ steps.package.outputs.checksum }}
-          if-no-files-found: error
-          retention-days: 7
-
-  # ─── FreeBSD: build inside a QEMU-driven FreeBSD 14 VM ──────────────────────
-  build-freebsd:
-    name: freebsd-x86_64
-    needs: prep
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Build inside FreeBSD VM
-        id: build
-        uses: vmactions/freebsd-vm@v1
-        with:
-          release: "14.1"
-          usesh: true
-          mem: 4096
-          cpu: 4
-          # Sync workspace into the VM read-write so the build artefact
-          # we need is reachable after the VM exits.
-          sync: rsync
-          copyback: true
-          prepare: |
-            pkg install -y curl bash gmake pkgconf openssl
-            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-              | sh -s -- -y --profile minimal --default-toolchain stable
-          run: |
-            . "$HOME/.cargo/env"
-            cargo --version
-            cargo build --release --locked -p ${{ env.CARGO_PACKAGE }}
-            strip target/release/${{ env.BINARY_NAME }} || true
-
-      - name: Package FreeBSD asset
-        id: package
-        env:
-          VERSION: ${{ needs.prep.outputs.version }}
-        run: |
-          set -euxo pipefail
-          LABEL=freebsd-x86_64
-          STAGE="${BINARY_NAME}-${VERSION}-${LABEL}"
-          mkdir -p "dist/$STAGE"
-          cp target/release/${BINARY_NAME} "dist/$STAGE/"
-          cp README.md "dist/$STAGE/" 2>/dev/null || true
-          cp LICENSE*  "dist/$STAGE/" 2>/dev/null || true
-
-          cd dist
-          tar -czf "${STAGE}.tar.gz" "$STAGE"
-          sha256sum "${STAGE}.tar.gz" > "${STAGE}.tar.gz.sha256"
-          echo "asset=dist/${STAGE}.tar.gz"        >> "$GITHUB_OUTPUT"
-          echo "checksum=dist/${STAGE}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: freebsd-x86_64
           path: |
             ${{ steps.package.outputs.asset }}
             ${{ steps.package.outputs.checksum }}
@@ -242,15 +168,15 @@ jobs:
   # ─── publish: collect artifacts, generate one combined SHA file, release ────
   release:
     name: Publish GitHub Release
-    needs: [prep, build, build-freebsd]
+    needs: [prep, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0           # need history for the changelog
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
@@ -306,7 +232,7 @@ jobs:
           echo "notes_path=RELEASE_NOTES.md" >> "$GITHUB_OUTPUT"
 
       - name: Publish GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@v2
         with:
           name: ${{ needs.prep.outputs.version }}
           tag_name: ${{ needs.prep.outputs.version }}
@@ -316,5 +242,4 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             dist/*.tar.gz
-            dist/*.zip
             dist/SHA256SUMS.txt
