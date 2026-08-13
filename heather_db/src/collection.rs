@@ -1,5 +1,7 @@
 use std::sync::{Arc, RwLock};
 
+use realfft::num_complex::Complex;
+
 use crate::config::EAMConfig;
 use crate::error::{HeatherError, Result};
 use crate::location::{HardLocation, LocationId};
@@ -75,6 +77,130 @@ fn select_beta_mdl(keys: &[Vec<f64>], d: usize, default_beta: f64) -> f64 {
         }
     }
     best_beta
+}
+
+/// Softest cleanup temperature [`Collection::query_documents_multi_role`] will
+/// run at; explicit overrides below it are raised to it.
+///
+/// See [`RoleCleanup::Beta`] for the measured curve this number comes from.
+pub const MIN_CLEANUP_BETA: f64 = 30.0;
+
+/// How the filler recovered at a role is cleaned up before it is scored.
+///
+/// Unbinding recovers the filler plus crosstalk from every other role in the
+/// bundle, so the raw recovered vector understates the match. Cleanup denoises
+/// it against the collection's codebook — a Hopfield/attention read at inverse
+/// temperature β — before the cosine is taken.
+///
+/// The default is [`Mdl`](RoleCleanup::Mdl): correctness is the default, speed
+/// is opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum RoleCleanup {
+    /// Clean up at the MDL-calibrated temperature the engine selects for
+    /// itself, the same `select_beta_mdl` bandwidth
+    /// [`Collection::read_attention_mdl`] reads at. The temperature then
+    /// tracks the codebook's own geometry instead of a hard-wired knob.
+    #[default]
+    Mdl,
+
+    /// Clean up at an explicit inverse temperature.
+    ///
+    /// # The sharpness cliff
+    ///
+    /// Cleanup quality is brutally sensitive to β, and the failure is quiet —
+    /// a soft β returns a plausible-looking ordering that is simply wrong.
+    /// Measured role score against a 0.095 ceiling:
+    ///
+    /// | β    | score |
+    /// |------|-------|
+    /// | 10   | 0.057 |
+    /// | 30   | 0.077 |
+    /// | ≥100 | 0.091 |
+    ///
+    /// β=10 recovers 60% of the available signal; β=30 recovers 81%; the curve
+    /// is flat from 100 up. **Values below [`MIN_CLEANUP_BETA`] are clamped to
+    /// it**, and the temperature actually used is reported back in
+    /// [`MultiRoleResults::cleanup_beta`] so the substitution is visible.
+    ///
+    /// Clamping rather than warning is deliberate. `heather_db` has no log
+    /// sink, so a warning would go nowhere, whereas the returned β is in front
+    /// of every caller. And β is a softmax temperature: it costs the same to
+    /// evaluate at any value, so a soft β buys nothing and only degrades the
+    /// ordering — unlike [`Off`](RoleCleanup::Off), which is a genuine
+    /// accuracy-for-speed trade and is therefore honoured exactly as asked.
+    Beta(f64),
+
+    /// Score the raw recovered filler, crosstalk and all.
+    ///
+    /// Fast — no inverse transform and no attention read per (document, pair)
+    /// — and it is the mode whose scores are identical to
+    /// [`Collection::query_documents_scoped`]. It is measurably worse at
+    /// ranking; choose it knowingly.
+    Off,
+}
+
+/// One recalled document, with its per-criterion breakdown.
+#[derive(Debug, Clone)]
+pub struct MultiRoleHit {
+    pub doc_id: u64,
+
+    /// Plain full-bundle cosine against the recall query. **This is the only
+    /// quantity the result ordering uses** — see
+    /// [`Collection::query_documents_multi_role`].
+    pub recall_score: f64,
+
+    pub metadata: Vec<u8>,
+
+    /// One similarity per requested `(role, filler)` pair, **in the caller's
+    /// pair order**. Never aggregated, never weighted.
+    pub role_scores: Vec<f64>,
+}
+
+/// The result of [`Collection::query_documents_multi_role`].
+#[derive(Debug, Clone)]
+pub struct MultiRoleResults {
+    /// Cleanup temperature actually used: the MDL-selected β, the caller's
+    /// override after clamping to [`MIN_CLEANUP_BETA`], or `None` when cleanup
+    /// was off.
+    pub cleanup_beta: Option<f64>,
+
+    /// Descending by [`MultiRoleHit::recall_score`], truncated to `n`.
+    pub hits: Vec<MultiRoleHit>,
+}
+
+/// Hopfield cleanup of `v` against the collection's codebook at inverse
+/// temperature `beta`: `Σ softmax(β·v·Kᵢ + ln write_countᵢ)·Vᵢ` over the
+/// top-k activated locations.
+///
+/// Same read rule as [`Collection::read_attention`] with `scale = beta`,
+/// written against a borrowed `EAMInner` because the caller already holds the
+/// read lock and re-entering it would risk deadlocking against a queued
+/// writer.
+fn cleanup_read(inner: &EAMInner, v: &[f64], beta: f64) -> Vec<f64> {
+    let k = inner.config.k.min(inner.locations.len());
+    let (indices, _sims) = read::activate_auto_full(
+        v,
+        &inner.locations,
+        k,
+        &inner.landmarks,
+        &inner.id_lookup,
+        &inner.address_matrix,
+        inner.config.d,
+    );
+    let logits: Vec<f64> = indices
+        .iter()
+        .map(|&i| {
+            beta * vec_ops::dot(v, &inner.locations[i].address)
+                + inner.locations[i].write_count.max(1e-12).ln()
+        })
+        .collect();
+    let alpha = vec_ops::softmax(&logits, 1.0);
+    let values: Vec<Vec<f64>> = indices
+        .iter()
+        .map(|&i| inner.locations[i].normalized_pattern())
+        .collect();
+    let value_refs: Vec<&[f64]> = values.iter().map(|x| x.as_slice()).collect();
+    vec_ops::weighted_sum(&value_refs, &alpha)
 }
 
 /// Statistics about the current state of an EAM collection.
@@ -1336,6 +1462,208 @@ impl Collection {
         Ok(scored)
     }
 
+    /// Score every recalled document against **several** `(role, filler)`
+    /// pairs at once, returning one similarity per pair per document.
+    ///
+    /// This is the batched form of [`query_documents_scoped`]. That call takes
+    /// one role and reuses `query` as the filler, so a consumer scoring a
+    /// document against six weighted criteria pays six full engine reads and
+    /// gets back only `(id, score, payload)` — no vector, nothing to rescore
+    /// locally. Here each criterion carries its own filler, the conflation of
+    /// query vector and filler is gone, and the per-criterion breakdown comes
+    /// back in one read. That breakdown is the point: it is both the terms the
+    /// consumer's weighted score is built from and the "why this matched"
+    /// explanation a UI can render.
+    ///
+    /// # Ranking is plain bundle similarity, and that is a real limitation
+    ///
+    /// Recall and ranking use `query` alone, by ordinary full-bundle cosine,
+    /// exactly as [`query_documents`] does. The pairs only *describe* the
+    /// documents that survived; they do not steer retrieval and they are not
+    /// combined into anything.
+    ///
+    /// This engine deliberately **does not accept per-criterion weights and
+    /// does not aggregate the per-role scores into a single number.**
+    /// Weighting and qualification are business rules owned by the consuming
+    /// service; an associative-memory similarity is not a business match
+    /// score, and folding one into the other here would bury a policy decision
+    /// inside the storage layer.
+    ///
+    /// The consequence is unavoidable and callers must plan for it: a document
+    /// that would score well *once weighted* can be missed entirely, because
+    /// nothing about the weighting reaches the recall stage — if its bundle is
+    /// far from `query`, it is never a candidate and never appears in these
+    /// results at all. **Over-fetch.** Ask for an `n` far larger than the
+    /// number of results you intend to display, and let the consumer re-rank
+    /// the wider set. There is no value of `n` that makes this exact.
+    ///
+    /// # Cleanup
+    ///
+    /// The filler recovered at a role carries crosstalk from every other role
+    /// in the bundle. `cleanup` controls whether it is denoised against the
+    /// collection's codebook before scoring; see [`RoleCleanup`], whose
+    /// default is on. Cleanup costs an inverse transform and an attention read
+    /// per (document, pair); with it off the score is computed entirely in the
+    /// frequency domain.
+    ///
+    /// # Errors
+    ///
+    /// Every role and filler must match the collection dimension. An empty
+    /// `pairs` slice is legal and degenerates to [`query_documents`] with an
+    /// empty `role_scores` on each hit.
+    ///
+    /// [`query_documents`]: Collection::query_documents
+    /// [`query_documents_scoped`]: Collection::query_documents_scoped
+    pub fn query_documents_multi_role(
+        &self,
+        query: &[f64],
+        n: usize,
+        pairs: &[(&[f64], &[f64])],
+        cleanup: RoleCleanup,
+    ) -> Result<MultiRoleResults> {
+        vec_ops::validate_vector(query)?;
+
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let d = inner.config.d;
+
+        if query.len() != d {
+            return Err(HeatherError::DimensionMismatch {
+                expected: d,
+                got: query.len(),
+            });
+        }
+        for (role, filler) in pairs {
+            vec_ops::validate_vector(role)?;
+            vec_ops::validate_vector(filler)?;
+            for v in [role, filler] {
+                if v.len() != d {
+                    return Err(HeatherError::DimensionMismatch {
+                        expected: d,
+                        got: v.len(),
+                    });
+                }
+            }
+        }
+
+        if inner.locations.is_empty() {
+            return Ok(MultiRoleResults {
+                cleanup_beta: None,
+                hits: Vec::new(),
+            });
+        }
+
+        // Recall is identical to `query_documents`: activate `query` against
+        // the hard locations and take the union of their posting lists. The
+        // pairs play no part in choosing candidates — see the doc comment.
+        let k = inner.config.k.min(inner.locations.len());
+        let (indices, _sims) = read::activate_auto_full(
+            query,
+            &inner.locations,
+            k,
+            &inner.landmarks,
+            &inner.id_lookup,
+            &inner.address_matrix,
+            d,
+        );
+
+        // The cleanup temperature is a property of the codebook's geometry,
+        // not of any one recovered filler, so it is selected once per query
+        // over the keys this query activated rather than per (document, pair).
+        let cleanup_beta = match cleanup {
+            RoleCleanup::Off => None,
+            RoleCleanup::Mdl => {
+                let keys: Vec<Vec<f64>> = indices
+                    .iter()
+                    .map(|&i| vec_ops::normalize(&inner.locations[i].address))
+                    .collect();
+                Some(select_beta_mdl(&keys, d, inner.config.beta))
+            }
+            RoleCleanup::Beta(beta) => Some(beta.max(MIN_CLEANUP_BETA)),
+        };
+
+        // Forward-transform each role and filler once for the whole query.
+        // Per candidate this leaves one forward transform and, per pair, an
+        // O(d) conjugate product — instead of two forward transforms per
+        // (document, pair).
+        let role_spectra: Vec<Vec<Complex<f64>>> = pairs
+            .iter()
+            .map(|(r, _)| vec_ops::rfft_forward(r))
+            .collect();
+        let filler_spectra: Vec<Vec<Complex<f64>>> = if cleanup_beta.is_some() {
+            // The cleanup path compares in the time domain, so the filler
+            // spectra would never be read.
+            Vec::new()
+        } else {
+            pairs
+                .iter()
+                .map(|(_, f)| vec_ops::rfft_forward(f))
+                .collect()
+        };
+        let filler_norms: Vec<f64> = pairs.iter().map(|(_, f)| vec_ops::l2_norm(f)).collect();
+
+        let mut candidate_ids = std::collections::HashSet::new();
+        let rtxn = self.store.read_txn()?;
+        for &idx in &indices {
+            let loc_id = inner.locations[idx].id.0;
+            let doc_ids =
+                self.store
+                    .get_doc_ids_for_location_txn(&rtxn, self.collection_id, loc_id)?;
+            candidate_ids.extend(doc_ids);
+        }
+
+        let mut hits: Vec<MultiRoleHit> = Vec::with_capacity(candidate_ids.len());
+        for doc_id in candidate_ids {
+            let Some(data) = self
+                .store
+                .get_document_txn(&rtxn, self.collection_id, doc_id)?
+            else {
+                continue;
+            };
+            let (vec, metadata): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+            if vec.len() != d {
+                continue;
+            }
+
+            let doc_spectrum = vec_ops::rfft_forward(&vec);
+            let role_scores: Vec<f64> = pairs
+                .iter()
+                .enumerate()
+                .map(|(i, (_, filler))| match cleanup_beta {
+                    // Cleanup needs the recovered filler as a vector, so the
+                    // inverse transform comes back.
+                    Some(beta) => {
+                        let recovered =
+                            vec_ops::unbind_by_spectra(&doc_spectrum, &role_spectra[i], d);
+                        let cleaned = cleanup_read(&inner, &recovered, beta);
+                        vec_ops::cosine_similarity(&cleaned, filler)
+                    }
+                    None => vec_ops::role_scoped_similarity_spectra(
+                        &doc_spectrum,
+                        &role_spectra[i],
+                        &filler_spectra[i],
+                        filler_norms[i],
+                        d,
+                    ),
+                })
+                .collect();
+
+            hits.push(MultiRoleHit {
+                doc_id,
+                recall_score: vec_ops::cosine_similarity(query, &vec),
+                metadata,
+                role_scores,
+            });
+        }
+
+        hits.sort_by(|a, b| {
+            b.recall_score
+                .partial_cmp(&a.recall_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        hits.truncate(n);
+        Ok(MultiRoleResults { cleanup_beta, hits })
+    }
+
     /// Get current collection statistics.
     pub fn stats(&self) -> Result<EAMStats> {
         let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
@@ -1777,6 +2105,437 @@ mod tests {
             ),
             "got {err:?}"
         );
+    }
+
+    // --- Multi-role scoped queries ---------------------------------------
+
+    /// Four documents over three roles, each taking a different filler at each
+    /// role from a shared pool, written through the real write path so recall
+    /// runs over real posting lists. `k` is set above the location count so
+    /// every document is a candidate — these tests are about the *scores*, and
+    /// letting recall drop documents would make them intermittent.
+    ///
+    struct MultiRoleCorpus {
+        col: Collection,
+        roles: Vec<Vec<f64>>,
+        fillers: Vec<Vec<f64>>,
+        /// The bundle a caller looking for `roles[i] ↦ fillers[i]` would send.
+        query: Vec<f64>,
+    }
+
+    fn multi_role_corpus(dir: &TempDir, d: usize) -> MultiRoleCorpus {
+        let store = Arc::new(Store::open(dir.path(), 256).unwrap());
+        let mut txn = store.write_txn().unwrap();
+        let col_id = store.create_collection(&mut txn, "bids").unwrap();
+        txn.commit().unwrap();
+
+        let mut config = EAMConfig::new(d).unwrap();
+        config.l_0 = 8;
+        config.k = 8;
+        let col = Collection::new(col_id, "bids".into(), store, &config).unwrap();
+
+        let mut rng = rand::thread_rng();
+        let roles: Vec<Vec<f64>> = (0..3)
+            .map(|_| vec_ops::random_unit_vector(d, &mut rng))
+            .collect();
+        let fillers: Vec<Vec<f64>> = (0..4)
+            .map(|_| vec_ops::random_unit_vector(d, &mut rng))
+            .collect();
+
+        for j in 0..4 {
+            let bundle = bundle_for(&roles, &fillers, j);
+            col.write_with_metadata(&bundle, b"{}").unwrap();
+        }
+
+        let query = bundle_for(&roles, &fillers, 0);
+        MultiRoleCorpus {
+            col,
+            roles,
+            fillers,
+            query,
+        }
+    }
+
+    /// Document `j`'s bundle: `roles[i]` bound to `fillers[(i + j) % 4]`.
+    /// Document 0 is the one the corpus query is built from.
+    fn bundle_for(roles: &[Vec<f64>], fillers: &[Vec<f64>], j: usize) -> Vec<f64> {
+        let mut bundle = vec![0.0; roles[0].len()];
+        for (i, role) in roles.iter().enumerate() {
+            vec_ops::add_scaled(&mut bundle, &convolve(role, &fillers[(i + j) % 4]), 1.0);
+        }
+        vec_ops::normalize(&bundle)
+    }
+
+    fn pairs_of<'a>(roles: &'a [Vec<f64>], fillers: &'a [Vec<f64>]) -> Vec<(&'a [f64], &'a [f64])> {
+        roles
+            .iter()
+            .zip(fillers.iter())
+            .map(|(r, f)| (r.as_slice(), f.as_slice()))
+            .collect()
+    }
+
+    /// **The load-bearing test.** The whole change is a batching optimisation,
+    /// so a multi-role call must be observationally identical to N separate
+    /// single-role calls: same documents, same scores, per pair.
+    ///
+    /// Compared with cleanup off, because that is the mode
+    /// `query_documents_scoped` implements — it has no cleanup to compare to.
+    /// Tolerance is 1e-12 rather than exact equality because the cleanup-off
+    /// path scores in the frequency domain; the measured worst deviation here
+    /// is well inside that (see `vec_ops::role_tests`).
+    ///
+    /// The test discriminates on every axis it is meant to: mis-ordering the
+    /// pairs, applying cleanup, or getting the Parseval packing wrong each move
+    /// the scores by ~1e-3 or more, a billion times the tolerance. The two
+    /// spread assertions rule out the degenerate way this could pass — all
+    /// scores collapsing to the same value would satisfy the comparison
+    /// vacuously.
+    #[test]
+    fn multi_role_scores_match_n_separate_single_role_calls() {
+        let d = 256;
+        let dir = TempDir::new().unwrap();
+        let MultiRoleCorpus {
+            col,
+            roles,
+            fillers,
+            query,
+        } = multi_role_corpus(&dir, d);
+        let pairs = pairs_of(&roles, &fillers);
+
+        let multi = col
+            .query_documents_multi_role(&query, 100, &pairs, RoleCleanup::Off)
+            .unwrap();
+        assert_eq!(multi.cleanup_beta, None, "cleanup was off");
+        assert_eq!(multi.hits.len(), 4, "every document must be a candidate");
+
+        for hit in &multi.hits {
+            assert_eq!(hit.role_scores.len(), pairs.len());
+        }
+        // Not vacuous: every pair must separate the documents. A batching bug
+        // that returned a constant — zeros, or the same score everywhere —
+        // would satisfy the equality below trivially, and this rules it out.
+        for i in 0..pairs.len() {
+            let per_doc: Vec<f64> = multi.hits.iter().map(|h| h.role_scores[i]).collect();
+            let spread = per_doc.iter().cloned().fold(f64::MIN, f64::max)
+                - per_doc.iter().cloned().fold(f64::MAX, f64::min);
+            assert!(
+                spread > 0.2,
+                "pair {i} must discriminate between documents: {per_doc:?}"
+            );
+        }
+
+        for (i, (role, filler)) in pairs.iter().enumerate() {
+            let single = col.query_documents_scoped(filler, 100, Some(role)).unwrap();
+            let mut compared = 0;
+            for hit in &multi.hits {
+                let (_, single_score, _) = single
+                    .iter()
+                    .find(|(id, _, _)| *id == hit.doc_id)
+                    .unwrap_or_else(|| panic!("doc {} missing from single-role call", hit.doc_id));
+                let delta = (hit.role_scores[i] - single_score).abs();
+                assert!(
+                    delta < 1e-12,
+                    "pair {i}, doc {}: batched {} vs single-role {single_score}, delta {delta:e}",
+                    hit.doc_id,
+                    hit.role_scores[i]
+                );
+                compared += 1;
+            }
+            assert_eq!(compared, 4, "pair {i}: nothing was actually compared");
+        }
+    }
+
+    /// `role_scores[i]` must belong to `pairs[i]`. Reversing the pair list must
+    /// reverse the breakdown and change nothing else — an implementation that
+    /// scored by hash order, or that sorted pairs, would fail this.
+    #[test]
+    fn multi_role_preserves_pair_order() {
+        let d = 256;
+        let dir = TempDir::new().unwrap();
+        let MultiRoleCorpus {
+            col,
+            roles,
+            fillers,
+            query,
+        } = multi_role_corpus(&dir, d);
+        let forward = pairs_of(&roles, &fillers);
+        let reversed: Vec<(&[f64], &[f64])> = forward.iter().rev().copied().collect();
+
+        let a = col
+            .query_documents_multi_role(&query, 100, &forward, RoleCleanup::Off)
+            .unwrap();
+        let b = col
+            .query_documents_multi_role(&query, 100, &reversed, RoleCleanup::Off)
+            .unwrap();
+
+        for (ha, hb) in a.hits.iter().zip(&b.hits) {
+            assert_eq!(
+                ha.doc_id, hb.doc_id,
+                "ordering must not depend on the pairs"
+            );
+            let flipped: Vec<f64> = hb.role_scores.iter().rev().copied().collect();
+            assert_eq!(ha.role_scores, flipped, "doc {}", ha.doc_id);
+            // The reversal is only observable if the entries differ.
+            assert_ne!(
+                ha.role_scores[0], ha.role_scores[2],
+                "doc {}: pairs are indistinguishable, the check is vacuous",
+                ha.doc_id
+            );
+        }
+    }
+
+    /// Ranking is plain bundle similarity and nothing else — the pairs must not
+    /// reach it. Same query with and without pairs must produce the same
+    /// documents in the same order with the same scores.
+    #[test]
+    fn multi_role_ranks_by_bundle_similarity_only() {
+        let d = 256;
+        let dir = TempDir::new().unwrap();
+        let MultiRoleCorpus {
+            col,
+            roles,
+            fillers,
+            ..
+        } = multi_role_corpus(&dir, d);
+        let pairs = pairs_of(&roles, &fillers);
+        // Recall a *different* document's bundle than the pairs describe, so
+        // the bundle ordering and the pair-0 ordering genuinely disagree — with
+        // both pointing the same way the assertion below proves nothing.
+        let query = bundle_for(&roles, &fillers, 3);
+
+        let plain = col.query_documents(&query, 100).unwrap();
+        let multi = col
+            .query_documents_multi_role(&query, 100, &pairs, RoleCleanup::Off)
+            .unwrap();
+
+        assert_eq!(plain.len(), multi.hits.len());
+        for ((id, sim, _), hit) in plain.iter().zip(&multi.hits) {
+            assert_eq!(*id, hit.doc_id);
+            assert_eq!(*sim, hit.recall_score);
+        }
+        // A pair whose score ordering contradicts the bundle ordering must not
+        // move anything: prove the two orderings really do disagree somewhere.
+        let by_pair_0: Vec<f64> = multi.hits.iter().map(|h| h.role_scores[0]).collect();
+        assert!(
+            by_pair_0.windows(2).any(|w| w[0] < w[1]),
+            "pair 0 already agrees with the bundle order; the check is vacuous: {by_pair_0:?}"
+        );
+    }
+
+    #[test]
+    fn multi_role_handles_an_empty_pair_list() {
+        let d = 256;
+        let dir = TempDir::new().unwrap();
+        let MultiRoleCorpus { col, query, .. } = multi_role_corpus(&dir, d);
+
+        let out = col
+            .query_documents_multi_role(&query, 100, &[], RoleCleanup::default())
+            .unwrap();
+        let plain = col.query_documents(&query, 100).unwrap();
+
+        assert_eq!(out.hits.len(), plain.len());
+        for (hit, (id, sim, _)) in out.hits.iter().zip(&plain) {
+            assert_eq!(hit.doc_id, *id);
+            assert_eq!(hit.recall_score, *sim);
+            assert!(hit.role_scores.is_empty());
+        }
+    }
+
+    #[test]
+    fn multi_role_with_a_single_pair_equals_the_single_role_call() {
+        let d = 256;
+        let dir = TempDir::new().unwrap();
+        let MultiRoleCorpus {
+            col,
+            roles,
+            fillers,
+            query,
+        } = multi_role_corpus(&dir, d);
+        let one: [(&[f64], &[f64]); 1] = [(roles[1].as_slice(), fillers[1].as_slice())];
+
+        let multi = col
+            .query_documents_multi_role(&query, 100, &one, RoleCleanup::Off)
+            .unwrap();
+        let single = col
+            .query_documents_scoped(&fillers[1], 100, Some(&roles[1]))
+            .unwrap();
+
+        assert_eq!(multi.hits.len(), 4);
+        for hit in &multi.hits {
+            assert_eq!(hit.role_scores.len(), 1);
+            let (_, expected, _) = single.iter().find(|(id, _, _)| *id == hit.doc_id).unwrap();
+            assert!((hit.role_scores[0] - expected).abs() < 1e-12);
+        }
+    }
+
+    /// Cleanup is on by default, off is an explicit choice, and the two do
+    /// materially different work. The reported `cleanup_beta` is what makes the
+    /// engine's choice of temperature visible to the caller.
+    #[test]
+    fn cleanup_is_on_by_default_and_reports_the_temperature_it_used() {
+        assert_eq!(RoleCleanup::default(), RoleCleanup::Mdl);
+
+        let d = 256;
+        let dir = TempDir::new().unwrap();
+        let MultiRoleCorpus {
+            col,
+            roles,
+            fillers,
+            query,
+        } = multi_role_corpus(&dir, d);
+        let pairs = pairs_of(&roles, &fillers);
+
+        let on = col
+            .query_documents_multi_role(&query, 100, &pairs, RoleCleanup::default())
+            .unwrap();
+        let off = col
+            .query_documents_multi_role(&query, 100, &pairs, RoleCleanup::Off)
+            .unwrap();
+
+        let beta = on.cleanup_beta.expect("the default must clean up");
+        assert!(beta > 0.0, "MDL must select a positive temperature: {beta}");
+        assert_eq!(off.cleanup_beta, None);
+
+        // Both modes must still be usable reads — same documents, same order.
+        let ids = |r: &MultiRoleResults| r.hits.iter().map(|h| h.doc_id).collect::<Vec<_>>();
+        assert_eq!(ids(&on), ids(&off));
+
+        let moved = on
+            .hits
+            .iter()
+            .zip(&off.hits)
+            .flat_map(|(a, b)| a.role_scores.iter().zip(&b.role_scores))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            moved > 1e-3,
+            "cleanup must actually change the scores, but the largest move was {moved:e}"
+        );
+    }
+
+    /// A too-soft explicit beta is clamped to [`MIN_CLEANUP_BETA`] rather than
+    /// silently degrading the ordering, and the clamp is reported.
+    ///
+    /// The second half is what stops this from being a test of nothing: if beta
+    /// never reached the scoring, `Beta(10)` would equal `Beta(30)` for the
+    /// wrong reason. A far sharper temperature must produce different scores.
+    #[test]
+    fn a_too_soft_cleanup_beta_is_clamped_and_the_clamp_is_reported() {
+        let d = 256;
+        let dir = TempDir::new().unwrap();
+        let MultiRoleCorpus {
+            col,
+            roles,
+            fillers,
+            query,
+        } = multi_role_corpus(&dir, d);
+        let pairs = pairs_of(&roles, &fillers);
+        let run = |c| {
+            col.query_documents_multi_role(&query, 100, &pairs, c)
+                .unwrap()
+        };
+
+        let soft = run(RoleCleanup::Beta(10.0));
+        let floor = run(RoleCleanup::Beta(MIN_CLEANUP_BETA));
+        let sharp = run(RoleCleanup::Beta(2000.0));
+
+        assert_eq!(soft.cleanup_beta, Some(MIN_CLEANUP_BETA));
+        assert_eq!(sharp.cleanup_beta, Some(2000.0));
+
+        let scores = |r: &MultiRoleResults| {
+            r.hits
+                .iter()
+                .flat_map(|h| h.role_scores.clone())
+                .collect::<Vec<f64>>()
+        };
+        assert_eq!(
+            scores(&soft),
+            scores(&floor),
+            "beta 10 must be run as beta {MIN_CLEANUP_BETA}"
+        );
+
+        let moved = scores(&floor)
+            .iter()
+            .zip(scores(&sharp))
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(
+            moved > 1e-6,
+            "the cleanup temperature must reach the scoring, but beta {MIN_CLEANUP_BETA} \
+             and beta 2000 agreed to {moved:e}"
+        );
+    }
+
+    /// The mechanism behind the documented sharpness cliff: cleanup is a
+    /// softmax over the codebook, so a sharper temperature resolves onto a
+    /// single stored pattern while a soft one returns a blend. A soft beta does
+    /// not fail loudly — it returns a plausible average — which is why the
+    /// public API clamps instead of trusting the caller.
+    #[test]
+    fn sharper_cleanup_resolves_the_codebook_harder() {
+        let d = 256;
+        let dir = TempDir::new().unwrap();
+        let MultiRoleCorpus {
+            col,
+            roles,
+            fillers,
+            ..
+        } = multi_role_corpus(&dir, d);
+
+        let inner = col.inner.read().unwrap();
+        let doc = col.list_documents().unwrap()[0].1.clone();
+        let recovered = vec_ops::unbind_by(&doc, &roles[0]);
+
+        let nearest = |v: &[f64]| {
+            inner
+                .locations
+                .iter()
+                .map(|l| vec_ops::cosine_similarity(v, &l.normalized_pattern()))
+                .fold(f64::MIN, f64::max)
+        };
+        let soft = nearest(&cleanup_read(&inner, &recovered, 1.0));
+        let sharp = nearest(&cleanup_read(&inner, &recovered, 5000.0));
+
+        assert!(
+            sharp > soft + 1e-6,
+            "a sharper cleanup must land closer to a stored pattern: \
+             sharp {sharp:.4} vs soft {soft:.4}"
+        );
+        // Guard against the corpus being degenerate: the fillers must not all
+        // be the same thing.
+        assert!(
+            vec_ops::cosine_similarity(&fillers[0], &fillers[1]).abs() < 0.5,
+            "corpus fillers are not independent"
+        );
+    }
+
+    #[test]
+    fn multi_role_rejects_a_pair_of_the_wrong_dimension() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let col = Collection::new(col_id, "test".into(), store, &test_config()).unwrap();
+        let mut rng = rand::thread_rng();
+        let query = vec_ops::random_unit_vector(16, &mut rng);
+        let good = vec_ops::random_unit_vector(16, &mut rng);
+
+        for pairs in [
+            vec![(&[0.5; 8][..], good.as_slice())],
+            vec![(good.as_slice(), &[0.5; 8][..])],
+        ] {
+            let err = col
+                .query_documents_multi_role(&query, 5, &pairs, RoleCleanup::Off)
+                .unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    HeatherError::DimensionMismatch {
+                        expected: 16,
+                        got: 8
+                    }
+                ),
+                "got {err:?}"
+            );
+        }
     }
 
     #[test]
