@@ -15,7 +15,39 @@ pub struct WriteResult {
     pub eta: f64,
 }
 
-/// Execute the three-phase adaptive write pipeline.
+/// Options for the two-field write. The legacy one-field write is the special
+/// case `gate = false` with `counter == address`.
+#[derive(Debug, Clone, Copy)]
+pub struct WriteOpts {
+    /// When true, route by `address` but pick the winner — and decide
+    /// join-vs-spawn — by how well the incoming `counter` (the lesson) coheres
+    /// with the candidate's accumulated counter. Incoherence spawns a new
+    /// location even when the address matches. Used for consolidation, where
+    /// same-context-different-law episodes must land in separate families.
+    pub gate: bool,
+    /// Minimum `cos(counter_so_far, counter_in)` to JOIN under the gate. Below
+    /// this, the write spawns. Ignored when `gate == false`.
+    pub tau_cohere: f64,
+    /// Minimum address similarity for a candidate to be "same context" under
+    /// the gate. Scopes the candidate set to one level of a consolidation
+    /// ladder — raising it stops a coarser level's structure from merging one
+    /// rung too early. Ignored when `gate == false`.
+    pub tau_split: f64,
+}
+
+impl Default for WriteOpts {
+    fn default() -> Self {
+        Self {
+            gate: false,
+            tau_cohere: 0.1,
+            tau_split: 0.3,
+        }
+    }
+}
+
+/// Legacy three-phase adaptive write. Unchanged behavior: delegates to the
+/// two-field rule with `address == counter` and the gate off, which reproduces
+/// the original pipeline exactly.
 ///
 /// Phase 1 — Select: k-NN activation, weight computation, conscience winner.
 /// Phase 2 — Update: counter accumulation + competitive address migration in one pass.
@@ -36,11 +68,47 @@ pub fn adaptive_write(
     landmarks: &[usize],
     id_lookup: &[u32],
 ) -> WriteResult {
+    adaptive_write_two(
+        input,
+        input,
+        locations,
+        config,
+        eta,
+        next_id,
+        rng,
+        landmarks,
+        id_lookup,
+        WriteOpts::default(),
+    )
+}
+
+/// Two-field adaptive write: route/migrate by `address`, accumulate `counter`.
+///
+/// With `opts.gate == false` and `address == counter` this is the legacy
+/// pipeline byte-for-byte. With the gate on it becomes the consolidation
+/// primitive: among address-activated candidates the winner is the one whose
+/// accumulated counter coheres with the incoming counter; if none cohere (or
+/// none are close in address) it spawns. Gated joins are winner-take-all
+/// (k = 1) and accumulate the counter at full weight, keeping each family's
+/// law pure.
+#[allow(clippy::too_many_arguments)]
+pub fn adaptive_write_two(
+    address: &[f64],
+    counter: &[f64],
+    locations: &mut [HardLocation],
+    config: &EAMConfig,
+    eta: f64,
+    next_id: &mut u64,
+    rng: &mut impl Rng,
+    landmarks: &[usize],
+    id_lookup: &[u32],
+    opts: WriteOpts,
+) -> WriteResult {
     let k = config.k.min(locations.len());
 
     // ── Phase 1: Select ─────────────────────────────────────────────
     // k-nearest via graph search (falls back to SoA/brute force when graph is young).
-    let (indices, sims) = read::activate_auto(input, locations, k, landmarks, id_lookup);
+    let (indices, sims) = read::activate_auto(address, locations, k, landmarks, id_lookup);
 
     if indices.is_empty() {
         // Cold start: the index is empty (data-seeded, l_0 == 0). Seed the first
@@ -49,8 +117,8 @@ pub fn adaptive_write(
         // activate against it and either consolidate or novelty-split.
         let id = LocationId(*next_id);
         *next_id += 1;
-        let mut new_loc = HardLocation::new(id, vec_ops::normalize(input));
-        new_loc.counter = input.to_vec();
+        let mut new_loc = HardLocation::new(id, vec_ops::normalize(address));
+        new_loc.counter = counter.to_vec();
         new_loc.write_count = 1.0;
         return WriteResult {
             modified_indices: vec![],
@@ -68,51 +136,97 @@ pub fn adaptive_write(
         vec![1.0 / k as f64; sims.len()]
     };
 
-    // Winner via conscience: S_eff = S(x, a_j) - γ · n_j / Σn_i
-    let total_writes: f64 = indices.iter().map(|&i| locations[i].write_count).sum();
-    let winner_local = if total_writes > 1e-12 {
-        indices
-            .iter()
-            .enumerate()
-            .map(|(local_idx, &global_idx)| {
-                let s_eff = sims[local_idx]
-                    - config.gamma * locations[global_idx].write_count / total_writes;
-                (local_idx, s_eff)
-            })
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(idx, _)| idx)
-            .unwrap_or(0)
+    // Winner selection. Legacy: conscience S_eff = S(x, a_j) - γ · n_j / Σn_i.
+    // Gated: among candidates close enough in ADDRESS to share a context
+    // (sim ≥ tau_split), the winner is the one whose accumulated COUNTER best
+    // coheres with the incoming counter; if the best coherence is below
+    // tau_cohere (or nothing is close in address) we force a novelty spawn.
+    let mut force_spawn = false;
+    let winner_local = if opts.gate {
+        let cn = vec_ops::normalize(counter);
+        let strong: Vec<usize> = (0..indices.len())
+            .filter(|&li| sims[li] >= opts.tau_split)
+            .collect();
+        if strong.is_empty() {
+            force_spawn = true;
+            0
+        } else {
+            let best = *strong
+                .iter()
+                .max_by(|&&a, &&b| {
+                    let ca = vec_ops::cosine_similarity(&locations[indices[a]].counter, &cn);
+                    let cb = vec_ops::cosine_similarity(&locations[indices[b]].counter, &cn);
+                    ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .unwrap();
+            let best_coh = vec_ops::cosine_similarity(&locations[indices[best]].counter, &cn);
+            if best_coh < opts.tau_cohere {
+                force_spawn = true;
+            }
+            best
+        }
     } else {
-        0
+        let total_writes: f64 = indices.iter().map(|&i| locations[i].write_count).sum();
+        if total_writes > 1e-12 {
+            indices
+                .iter()
+                .enumerate()
+                .map(|(local_idx, &global_idx)| {
+                    let s_eff = sims[local_idx]
+                        - config.gamma * locations[global_idx].write_count / total_writes;
+                    (local_idx, s_eff)
+                })
+                .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
+                .map(|(idx, _)| idx)
+                .unwrap_or(0)
+        } else {
+            0
+        }
     };
     let winner_global = indices[winner_local];
 
     // ── Phase 2: Update ─────────────────────────────────────────────
     // Single pass over activated set: counter accumulation + address migration.
+    // Under the gate a join is winner-take-all (k = 1) and accumulates the
+    // counter at full weight; a forced spawn touches no existing location.
     let eta_winner = eta / (1.0 + locations[winner_global].write_count / config.tau_damp);
     let eta_neighbor = eta_winner * 0.1;
 
-    for (local_idx, &global_idx) in indices.iter().enumerate() {
-        let loc = &mut locations[global_idx];
+    if !force_spawn {
+        for (local_idx, &global_idx) in indices.iter().enumerate() {
+            let is_winner = local_idx == winner_local;
+            if opts.gate && !is_winner {
+                continue; // gated join is winner-only — keep each family's law pure
+            }
+            let loc = &mut locations[global_idx];
 
-        // Counter accumulation: c_j += w_j · x, n_j += w_j
-        let w = weights[local_idx];
-        vec_ops::add_scaled(&mut loc.counter, input, w);
-        loc.write_count += w;
+            // Counter accumulation: c_j += w_j · counter, n_j += w_j
+            // (gated winner accumulates at full weight, not address-weighted).
+            let w = if opts.gate { 1.0 } else { weights[local_idx] };
+            vec_ops::add_scaled(&mut loc.counter, counter, w);
+            loc.write_count += w;
 
-        // Address migration: winner at η_eff, neighbors at 10%
-        let lr = if local_idx == winner_local {
-            eta_winner
-        } else {
-            eta_neighbor
-        };
-        let diff: Vec<f64> = input
-            .iter()
-            .zip(loc.address.iter())
-            .map(|(x, a)| x - a)
-            .collect();
-        vec_ops::add_scaled(&mut loc.address, &diff, lr);
-        loc.address = vec_ops::normalize(&loc.address);
+            // Address migration. Legacy: winner at η_eff, neighbors at 10%.
+            // Gated: a running MEAN of the routing vectors (lr = 1/n) so a
+            // family's address converges to its context prototype with the
+            // per-member content averaged out — without that, the prototype
+            // stays stuck near the first member and higher rungs can't group
+            // same-law families.
+            let lr = if opts.gate {
+                1.0 / loc.write_count
+            } else if is_winner {
+                eta_winner
+            } else {
+                eta_neighbor
+            };
+            let diff: Vec<f64> = address
+                .iter()
+                .zip(loc.address.iter())
+                .map(|(x, a)| x - a)
+                .collect();
+            vec_ops::add_scaled(&mut loc.address, &diff, lr);
+            loc.address = vec_ops::normalize(&loc.address);
+        }
     }
 
     // ── Neighbor graph update ─────────────────────────────────────
@@ -153,13 +267,21 @@ pub fn adaptive_write(
     // Topology maintenance: novelty split OR overload split, then local dedup.
     let mut new_locations = Vec::new();
 
-    if max_sim < config.tau_split {
-        // Novelty split: no location is close enough — spawn at input
+    // Novelty spawn. Legacy: no location is close enough in address
+    // (max_sim < tau_split). Gated: the address matched but the counter didn't
+    // cohere with any candidate's law (force_spawn) — a same-context-different-
+    // law episode gets its own family.
+    let spawn_novelty = if opts.gate {
+        force_spawn
+    } else {
+        max_sim < config.tau_split
+    };
+    if spawn_novelty {
         let id = LocationId(*next_id);
         *next_id += 1;
-        let addr = vec_ops::normalize(input);
+        let addr = vec_ops::normalize(address);
         let mut new_loc = HardLocation::new(id, addr);
-        new_loc.counter = input.to_vec();
+        new_loc.counter = counter.to_vec();
         new_loc.write_count = 1.0;
         // Novelty child: seed neighbors from the activated set
         if nb_cap > 0 {
@@ -172,7 +294,9 @@ pub fn adaptive_write(
         new_locations.push(new_loc);
     }
 
-    if locations[winner_global].write_count > config.tau_overload {
+    // Overload split only applies when we actually joined a winner (a forced
+    // spawn touched no existing location).
+    if !force_spawn && locations[winner_global].write_count > config.tau_overload {
         // Overload split: winner is saturated — spawn perturbed neighbor
         let id = LocationId(*next_id);
         *next_id += 1;

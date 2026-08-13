@@ -56,6 +56,14 @@ fn default_map_size() -> usize {
 /// locations rather than single locations), growing higher-order structure
 /// alongside the fine attractors. Pass 0 (replay + merge) is the proven,
 /// safe default; coarser passes are the experimental frontier.
+///
+/// `mode = ladder` switches from in-place reorganization to the consolidation
+/// ladder: each named collection of `(situation, procedure)` episodes is
+/// consolidated — via the gated two-field write — into a `<name>__L1`
+/// collection of `(context prototype, law)`, then `__L1` into `__L2`, and so
+/// on for `passes` levels. This is what derives schemas (and laws-about-laws)
+/// from raw episodes; it writes new collections rather than reorganizing in
+/// place.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DreamConfig {
     /// Opt-in switch. Off by default.
@@ -67,10 +75,32 @@ pub struct DreamConfig {
     /// Seconds of inactivity before a consolidation pass may run.
     #[serde(default = "default_idle_secs")]
     pub idle_secs: u64,
-    /// Granularity passes per dream. 1 = replay + merge only. >1 adds coarser
-    /// novelty-organization passes (experimental).
+    /// Replay mode: granularity passes per dream. Ladder mode: levels to climb.
     #[serde(default = "default_passes")]
     pub passes: usize,
+    /// `replay` (in-place reorganization, default) or `ladder` (consolidate
+    /// episodes into a stack of derived collections).
+    #[serde(default)]
+    pub mode: DreamMode,
+    /// Ladder mode only: minimum counter-coherence to join an existing family
+    /// rather than spawn a new one (the gate threshold).
+    #[serde(default = "default_tau_cohere")]
+    pub tau_cohere: f64,
+    /// Ladder mode only: minimum address similarity for a candidate family
+    /// (scopes each rung to its own level of the hierarchy).
+    #[serde(default = "default_dream_tau_split")]
+    pub tau_split: f64,
+}
+
+/// What a dream pass does to a collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum DreamMode {
+    /// Reorganize the collection in place (replay + merge). Default.
+    #[default]
+    Replay,
+    /// Consolidate episodes into a stack of derived collections (the ladder).
+    Ladder,
 }
 
 fn default_idle_secs() -> u64 {
@@ -81,6 +111,14 @@ fn default_passes() -> usize {
     1
 }
 
+fn default_tau_cohere() -> f64 {
+    0.0
+}
+
+fn default_dream_tau_split() -> f64 {
+    0.0
+}
+
 impl Default for DreamConfig {
     fn default() -> Self {
         Self {
@@ -88,6 +126,9 @@ impl Default for DreamConfig {
             collections: Vec::new(),
             idle_secs: default_idle_secs(),
             passes: default_passes(),
+            mode: DreamMode::Replay,
+            tau_cohere: default_tau_cohere(),
+            tau_split: default_dream_tau_split(),
         }
     }
 }

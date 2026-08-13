@@ -319,6 +319,86 @@ impl Collection {
         Ok(())
     }
 
+    /// Two-field write: route/migrate by `address`, accumulate `counter`.
+    /// `Collection::write(x)` is the special case `write_two(x, x, default)`.
+    /// With `opts.gate` set this is the consolidation primitive (route by
+    /// context, learn a different vector, spawn on incoherence).
+    pub fn write_two(
+        &self,
+        address: &[f64],
+        counter: &[f64],
+        opts: write::WriteOpts,
+    ) -> Result<()> {
+        vec_ops::validate_vector(address)?;
+        vec_ops::validate_vector(counter)?;
+
+        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+
+        if address.len() != inner.config.d || counter.len() != inner.config.d {
+            return Err(HeatherError::DimensionMismatch {
+                expected: inner.config.d,
+                got: if address.len() != inner.config.d {
+                    address.len()
+                } else {
+                    counter.len()
+                },
+            });
+        }
+
+        let mut rng = rand::thread_rng();
+        let result = {
+            let EAMInner {
+                ref config,
+                ref mut locations,
+                ref mut next_id,
+                ref mut eta,
+                ref landmarks,
+                ref id_lookup,
+                ..
+            } = *inner;
+            let r = write::adaptive_write_two(
+                address, counter, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                opts,
+            );
+            *eta = r.eta;
+            r
+        };
+
+        let new_locs = result.new_locations;
+
+        let mut txn = self.store.write_txn()?;
+        for &idx in &result.modified_indices {
+            self.store
+                .put_location(&mut txn, self.collection_id, &inner.locations[idx])?;
+        }
+        for loc in &new_locs {
+            self.store.put_location(&mut txn, self.collection_id, loc)?;
+        }
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "next_id",
+            &bincode::serialize(&inner.next_id)?,
+        )?;
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "eta",
+            &bincode::serialize(&inner.eta)?,
+        )?;
+        txn.commit()?;
+
+        inner.sync_addresses(&result.modified_indices);
+        if !new_locs.is_empty() {
+            let start = inner.locations.len();
+            inner.locations.extend(new_locs);
+            inner.extend_id_lookup(start);
+            inner.append_addresses(start);
+        }
+
+        Ok(())
+    }
+
     /// Batch write multiple patterns under a single lock + transaction.
     pub fn write_batch(&self, inputs: &[impl AsRef<[f64]>]) -> Result<()> {
         for input in inputs {
@@ -1053,6 +1133,78 @@ mod tests {
 
         let stats = col.stats().unwrap();
         assert!(stats.total_writes > 0.0);
+    }
+
+    fn empty_seeded_collection(dir: &TempDir) -> Collection {
+        let (store, col_id) = setup_store(dir);
+        let mut config = test_config();
+        config.l_0 = 0; // data-seeded: start empty so written families are the only locations
+        Collection::new(col_id, "test".into(), store, &config).unwrap()
+    }
+
+    /// The gate's defining behavior: same context (address), different law
+    /// (counter) must land in separate families — the grid case that defeats
+    /// address-only routing.
+    #[test]
+    fn write_two_gate_separates_by_counter() {
+        let dir = TempDir::new().unwrap();
+        let col = empty_seeded_collection(&dir);
+        let d = 16;
+        let context = vec_ops::normalize(&vec![1.0; d]); // shared address
+        let mut law_x = vec![0.0; d];
+        law_x[0] = 1.0;
+        let mut law_y = vec![0.0; d];
+        law_y[8] = 1.0; // orthogonal law
+        let opts = crate::write::WriteOpts {
+            gate: true,
+            tau_cohere: 0.2,
+            ..Default::default()
+        };
+
+        col.write_two(&context, &law_x, opts).unwrap();
+        col.write_two(&context, &law_y, opts).unwrap();
+        col.write_two(&context, &law_x, opts).unwrap();
+        col.write_two(&context, &law_y, opts).unwrap();
+
+        let (locs, _) = col.snapshot().unwrap();
+        assert_eq!(
+            locs.len(),
+            2,
+            "gate should split same-context different-law into two families"
+        );
+        let got_x = locs
+            .iter()
+            .any(|l| vec_ops::cosine_similarity(&l.counter, &law_x) > 0.9);
+        let got_y = locs
+            .iter()
+            .any(|l| vec_ops::cosine_similarity(&l.counter, &law_y) > 0.9);
+        assert!(got_x && got_y, "each family's counter holds its own law");
+    }
+
+    /// Without the gate, the shared address collapses everything into one
+    /// location — the contrast that makes the gate necessary for consolidation.
+    #[test]
+    fn write_two_no_gate_collapses_shared_context() {
+        let dir = TempDir::new().unwrap();
+        let col = empty_seeded_collection(&dir);
+        let d = 16;
+        let context = vec_ops::normalize(&vec![1.0; d]);
+        let mut law_x = vec![0.0; d];
+        law_x[0] = 1.0;
+        let mut law_y = vec![0.0; d];
+        law_y[8] = 1.0;
+        let opts = crate::write::WriteOpts {
+            gate: false,
+            tau_cohere: 0.2,
+            ..Default::default()
+        };
+
+        col.write_two(&context, &law_x, opts).unwrap();
+        col.write_two(&context, &law_y, opts).unwrap();
+        col.write_two(&context, &law_x, opts).unwrap();
+
+        let (locs, _) = col.snapshot().unwrap();
+        assert_eq!(locs.len(), 1, "no gate: shared address keeps one location");
     }
 
     #[test]

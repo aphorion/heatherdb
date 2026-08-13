@@ -281,6 +281,8 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/algebra/permute", post(routes::algebra_permute))
         .route("/algebra/unbind", post(routes::algebra_unbind))
         .route("/compose/read", post(routes::compose_read))
+        .route("/vec/bind", post(routes::vec_bind))
+        .route("/vec/unbind", post(routes::vec_unbind))
         .with_state(default_hive);
 
     // /db management routes.
