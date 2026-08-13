@@ -24,7 +24,7 @@
 # ─── builder ──────────────────────────────────────────────────────────────────
 # Rust 1.85+ required: heather_db/Cargo.toml uses `edition = "2024"`
 # (also workspace uses `resolver = "3"`).
-FROM rust:1.85-bookworm AS builder
+FROM rust:1.97-bookworm AS builder
 
 WORKDIR /src
 
