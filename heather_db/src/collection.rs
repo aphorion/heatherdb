@@ -672,18 +672,19 @@ impl Collection {
             // merge bj into bi (bi survives), write-weighted
             let removed_id = inner.locations[bj].id.0;
             let survivor_id = inner.locations[bi].id.0;
-            let d = inner.locations[bi].address.len();
-            let mut na = vec![0.0; d];
-            for k in 0..d {
-                na[k] = wi * inner.locations[bi].address[k] + wj * inner.locations[bj].address[k];
-            }
+            let na: Vec<f64> = inner.locations[bi]
+                .address
+                .iter()
+                .zip(inner.locations[bj].address.iter())
+                .map(|(ai, aj)| wi * ai + wj * aj)
+                .collect();
             let na = vec_ops::normalize(&na);
             let cj = inner.locations[bj].counter.clone();
             let nj = inner.locations[bj].neighbors.clone();
             {
                 let li = &mut inner.locations[bi];
-                for k in 0..li.counter.len() {
-                    li.counter[k] += cj[k];
+                for (c, add) in li.counter.iter_mut().zip(cj.iter()) {
+                    *c += add;
                 }
                 li.address = na;
                 li.write_count = wi + wj;
