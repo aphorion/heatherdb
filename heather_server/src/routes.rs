@@ -874,7 +874,10 @@ pub async fn query_documents(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
-    let result = tokio::task::spawn_blocking(move || col.query_documents(&req.query, req.n)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        col.query_documents_scoped(&req.query, req.n, req.unbind_role.as_deref())
+    })
+    .await;
 
     match result {
         Ok(Ok(results)) => {

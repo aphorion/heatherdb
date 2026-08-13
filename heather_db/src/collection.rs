@@ -1229,7 +1229,51 @@ impl Collection {
     /// gathers candidate doc IDs from posting lists, then does exact cosine on candidates.
     /// Returns `(doc_id, similarity, metadata_bytes)` sorted descending by similarity.
     pub fn query_documents(&self, query: &[f64], n: usize) -> Result<Vec<(u64, f64, Vec<u8>)>> {
+        self.query_documents_scoped(query, n, None)
+    }
+
+    /// [`Self::query_documents`] with the scoring rule made explicit.
+    ///
+    /// `unbind_role`, when supplied, switches to **role-scoped scoring**: each
+    /// candidate is unbound by that role vector and the recovered filler
+    /// compared to `query` by cosine, instead of the stored superposition
+    /// being compared whole. This removes a confound in the plain path — a
+    /// document's score for one role is otherwise divided by its own norm,
+    /// which grows with every other role it carries, so richly structured
+    /// documents rank lower for no reason related to the query (measured
+    /// correlation between filled-slot count and score: −0.35 to −0.42).
+    ///
+    /// The recovered filler carries crosstalk from the other roles. Callers
+    /// wanting that removed should follow with a cleanup read (`attention`, or
+    /// `attention/mdl` to let the engine pick the temperature); a sharp
+    /// cleanup recovers most of the loss, a soft one destroys ranking.
+    ///
+    /// Candidate *retrieval* is unchanged — the posting-list activation still
+    /// uses `query` directly, so the role only re-scores the set the index
+    /// already produced. A document whose role-A filler matches but whose
+    /// bundle is far from `query` may therefore not be a candidate at all.
+    pub fn query_documents_scoped(
+        &self,
+        query: &[f64],
+        n: usize,
+        unbind_role: Option<&[f64]>,
+    ) -> Result<Vec<(u64, f64, Vec<u8>)>> {
         vec_ops::validate_vector(query)?;
+        if let Some(role) = unbind_role {
+            vec_ops::validate_vector(role)?;
+            let d = self
+                .inner
+                .read()
+                .map_err(|_| HeatherError::LockPoisoned)?
+                .config
+                .d;
+            if role.len() != d {
+                return Err(HeatherError::DimensionMismatch {
+                    expected: d,
+                    got: role.len(),
+                });
+            }
+        }
 
         let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
 
@@ -1275,7 +1319,14 @@ impl Collection {
                 .get_document_txn(&rtxn, self.collection_id, doc_id)?
             {
                 let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
-                let sim = vec_ops::cosine_similarity(query, &vec);
+                // Role-scoped when a role is supplied: unbind the stored
+                // superposition by it first, so the score reflects only the
+                // role the query constrained rather than being diluted by
+                // every other role the document carries.
+                let sim = match unbind_role {
+                    Some(role) => vec_ops::role_scoped_similarity(&vec, role, query),
+                    None => vec_ops::cosine_similarity(query, &vec),
+                };
                 scored.push((doc_id, sim, meta));
             }
         }
@@ -1627,6 +1678,105 @@ mod tests {
         let id = store.create_collection(&mut txn, "test").unwrap();
         txn.commit().unwrap();
         (store, id)
+    }
+
+    /// Naive circular convolution — the bind the test corpus is built with.
+    /// Deliberately not the FFT path, so the read is checked against an
+    /// independent definition of binding rather than against itself.
+    fn convolve(a: &[f64], b: &[f64]) -> Vec<f64> {
+        let d = a.len();
+        let mut out = vec![0.0; d];
+        for (k, o) in out.iter_mut().enumerate() {
+            *o = (0..d).map(|i| a[i] * b[(k + d - i) % d]).sum();
+        }
+        vec_ops::normalize(&out)
+    }
+
+    /// End-to-end analogue of the `vec_ops` unit test: two documents agree on
+    /// role A, one carries two further roles the query never mentions. Through
+    /// the real posting-list read path, full-bundle scoring must penalise the
+    /// richer document and role-scoped scoring must penalise it less.
+    #[test]
+    fn query_documents_scoped_reduces_the_richness_penalty() {
+        let d = 256;
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(Store::open(dir.path(), 256).unwrap());
+        let mut txn = store.write_txn().unwrap();
+        let col_id = store.create_collection(&mut txn, "bids").unwrap();
+        txn.commit().unwrap();
+
+        let mut config = EAMConfig::new(d).unwrap();
+        config.l_0 = 8;
+        config.k = 8; // every location activates, so both docs are candidates
+        let col = Collection::new(col_id, "bids".into(), store, &config).unwrap();
+
+        let mut rng = rand::thread_rng();
+        let role_a = vec_ops::random_unit_vector(d, &mut rng);
+        let role_b = vec_ops::random_unit_vector(d, &mut rng);
+        let role_c = vec_ops::random_unit_vector(d, &mut rng);
+        let filler = vec_ops::random_unit_vector(d, &mut rng);
+
+        let sparse = convolve(&role_a, &filler);
+        let bound_b = convolve(&role_b, &vec_ops::random_unit_vector(d, &mut rng));
+        let bound_c = convolve(&role_c, &vec_ops::random_unit_vector(d, &mut rng));
+        let rich = vec_ops::normalize(
+            &sparse
+                .iter()
+                .zip(&bound_b)
+                .zip(&bound_c)
+                .map(|((x, y), z)| x + y + z)
+                .collect::<Vec<f64>>(),
+        );
+
+        let sparse_id = col.write_with_metadata(&sparse, b"{}").unwrap();
+        let rich_id = col.write_with_metadata(&rich, b"{}").unwrap();
+
+        let score_of = |rs: &[(u64, f64, Vec<u8>)], id: u64| {
+            rs.iter()
+                .find(|(i, _, _)| *i == id)
+                .unwrap_or_else(|| panic!("document {id} was not a candidate"))
+                .1
+        };
+
+        // Full-bundle: the query is the whole bound pair.
+        let bundle_query = convolve(&role_a, &filler);
+        let plain = col.query_documents(&bundle_query, 10).unwrap();
+        let plain_penalty = score_of(&plain, rich_id) / score_of(&plain, sparse_id);
+
+        // Role-scoped: the query is the bare filler, plus the role to unbind by.
+        let scoped = col
+            .query_documents_scoped(&filler, 10, Some(&role_a))
+            .unwrap();
+        let scoped_penalty = score_of(&scoped, rich_id) / score_of(&scoped, sparse_id);
+
+        assert!(
+            scoped_penalty > plain_penalty,
+            "role-scoped must penalise the richer document less: \
+             scoped {scoped_penalty:.3} vs full-bundle {plain_penalty:.3}"
+        );
+    }
+
+    #[test]
+    fn query_documents_scoped_rejects_a_role_of_the_wrong_dimension() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let col = Collection::new(col_id, "test".into(), store, &test_config()).unwrap();
+        let mut rng = rand::thread_rng();
+        let query = vec_ops::random_unit_vector(16, &mut rng);
+
+        let err = col
+            .query_documents_scoped(&query, 5, Some(&[0.5; 8]))
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                HeatherError::DimensionMismatch {
+                    expected: 16,
+                    got: 8
+                }
+            ),
+            "got {err:?}"
+        );
     }
 
     #[test]

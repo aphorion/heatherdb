@@ -283,6 +283,13 @@ pub struct QueryDocumentsRequest {
     pub query: Vec<f64>,
     #[serde(default = "default_n")]
     pub n: usize,
+    /// When present, `query` is read as the filler expected at this role: each
+    /// candidate is unbound by `unbind_role` and the recovered filler compared
+    /// to `query`, instead of the stored superposition being compared whole.
+    /// Absent keeps full-bundle scoring, so existing clients are unaffected.
+    /// See `Collection::query_documents_scoped` for why this exists.
+    #[serde(default)]
+    pub unbind_role: Option<Vec<f64>>,
 }
 
 fn default_n() -> usize {
