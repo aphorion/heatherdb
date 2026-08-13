@@ -25,6 +25,11 @@ the marketing surface; everything below is for people running it.
 - [RFC 0001 — Multi-tenancy (the database layer)](./0001-multi-tenancy.md) —
   the design that drove the v0.2 refactor. Useful to understand *why*
   things look the way they do.
+- [**A physicist's guide to HeatherDB**](./physicist-guide.md) — the
+  substrate as a computational physics engine: binding as the
+  propagator, PDEs as clocks, learning laws from data, symbolic
+  extraction, the singularity observatory. Every claim live-verified;
+  requires the `feat/spiral-plane-algebra` endpoints.
 
 ## Contributing
 
