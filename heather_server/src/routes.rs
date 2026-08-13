@@ -108,6 +108,9 @@ fn algebra_error_response(e: heather_algebra::AlgebraError) -> Response {
 /// Pre-flight guard for pairwise algebra ops (add/sub/bind): refuse before
 /// allocating when the estimated cross product exceeds the server cap.
 /// `Ok(())` means proceed; `Err(resp)` is the ready-made refusal.
+// Same reasoning as `resolve_db`: the `Err` is axum's own `Response`, which
+// callers return directly, so boxing it would only be unwrapped a frame up.
+#[allow(clippy::result_large_err)]
 fn check_cross_product_cap(
     op: &str,
     col_a: &heather_db::Collection,
@@ -124,7 +127,7 @@ fn check_cross_product_cap(
             return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "failed to size source collections",
-            ))
+            ));
         }
     };
     let est = limits::estimated_cross_locations(n_a, n_b, max_cross_k);
@@ -934,7 +937,9 @@ pub async fn algebra_add(
 
     let target_name = req.target.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
+        let target_version = col_target
+            .version()
+            .map_err(heather_algebra::AlgebraError::Db)?;
         let snap_a = EAMSnapshot::from_collection(&col_a)?;
         let snap_b = EAMSnapshot::from_collection(&col_b)?;
         let combined = ops::add_with_limit(&snap_a, &snap_b, max_cross_k)?;
@@ -996,7 +1001,9 @@ pub async fn algebra_sub(
 
     let target_name = req.target.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
+        let target_version = col_target
+            .version()
+            .map_err(heather_algebra::AlgebraError::Db)?;
         let snap_a = EAMSnapshot::from_collection(&col_a)?;
         let snap_b = EAMSnapshot::from_collection(&col_b)?;
         let diff = ops::sub_with_limit(&snap_a, &snap_b, max_cross_k)?;
@@ -1058,7 +1065,9 @@ pub async fn algebra_bind(
 
     let target_name = req.target.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
+        let target_version = col_target
+            .version()
+            .map_err(heather_algebra::AlgebraError::Db)?;
         let snap_a = EAMSnapshot::from_collection(&col_a)?;
         let snap_b = EAMSnapshot::from_collection(&col_b)?;
         let bound = heather_algebra::bind::bind_with_limit(&snap_a, &snap_b, max_cross_k)?;
@@ -1105,7 +1114,9 @@ pub async fn algebra_unbind(
     let target_name = req.target.clone();
     let key_vector = req.key_vector.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
+        let target_version = col_target
+            .version()
+            .map_err(heather_algebra::AlgebraError::Db)?;
         let snap_source = EAMSnapshot::from_collection(&col_source)?;
         // Build a single-location key snapshot from the raw vector.
         if key_vector.len() != snap_source.dim() {
@@ -1165,7 +1176,9 @@ pub async fn algebra_scale(
     let target_name = req.target.clone();
     let alpha = req.alpha;
     let result = tokio::task::spawn_blocking(move || {
-        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
+        let target_version = col_target
+            .version()
+            .map_err(heather_algebra::AlgebraError::Db)?;
         let snap = EAMSnapshot::from_collection(&col_source)?;
         let scaled = ops::scale(&snap, alpha)?;
         let num = scaled.num_locations();
@@ -1286,16 +1299,18 @@ pub async fn algebra_intersect(
 
     // Intersect's allocation is threshold-dependent: a non-positive
     // threshold admits every cross pair, so bound it like add/sub then.
-    if req.threshold <= 0.0 {
-        if let Err(resp) = check_cross_product_cap("intersect", &col_a, &col_b, 0) {
-            return resp;
-        }
+    if req.threshold <= 0.0
+        && let Err(resp) = check_cross_product_cap("intersect", &col_a, &col_b, 0)
+    {
+        return resp;
     }
 
     let target_name = req.target.clone();
     let threshold = req.threshold;
     let result = tokio::task::spawn_blocking(move || {
-        let target_version = col_target.version().map_err(heather_algebra::AlgebraError::Db)?;
+        let target_version = col_target
+            .version()
+            .map_err(heather_algebra::AlgebraError::Db)?;
         let snap_a = EAMSnapshot::from_collection(&col_a)?;
         let snap_b = EAMSnapshot::from_collection(&col_b)?;
         let inter = ops::intersect(&snap_a, &snap_b, threshold)?;

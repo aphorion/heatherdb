@@ -209,7 +209,10 @@ pub fn bootstrap_admin_if_needed(
     if was_generated {
         let pw_file = data_dir.join("initial-admin-password");
         match write_password_file(&pw_file, user_name, &password) {
-            Ok(()) => eprintln!("first-boot admin password also written to {}", pw_file.display()),
+            Ok(()) => eprintln!(
+                "first-boot admin password also written to {}",
+                pw_file.display()
+            ),
             Err(e) => tracing::warn!(error = %e, "could not persist first-boot password file"),
         }
         eprintln!();
@@ -237,11 +240,7 @@ pub fn bootstrap_admin_if_needed(
 }
 
 /// Write the first-boot password file, owner-readable only on unix.
-fn write_password_file(
-    path: &std::path::Path,
-    user: &str,
-    password: &str,
-) -> Result<(), String> {
+fn write_password_file(path: &std::path::Path, user: &str, password: &str) -> Result<(), String> {
     use std::io::Write;
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create_new(true);

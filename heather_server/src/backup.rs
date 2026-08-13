@@ -592,7 +592,15 @@ mod tests {
 
         let err = do_restore(data.path(), snap.path(), None).unwrap_err();
         assert!(err.contains("invalid database name"), "got: {err}");
-        assert!(!data.path().join("db").join("..").join("..").join("evil").exists());
+        assert!(
+            !data
+                .path()
+                .join("db")
+                .join("..")
+                .join("..")
+                .join("evil")
+                .exists()
+        );
     }
 
     #[test]
