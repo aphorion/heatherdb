@@ -277,7 +277,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
         )
         .route(
             "/collections/{name}/documents/{doc_id}",
-            get(routes::get_document),
+            get(routes::get_document).delete(routes::delete_document),
         )
         .route("/algebra/add", post(routes::algebra_add))
         .route("/algebra/sub", post(routes::algebra_sub))
@@ -357,7 +357,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
         )
         .route(
             "/db/{db}/collections/{name}/documents/{doc_id}",
-            get(routes_db::get_document),
+            get(routes_db::get_document).delete(routes_db::delete_document),
         )
         .route("/db/{db}/algebra/add", post(routes_db::algebra_add))
         .route("/db/{db}/algebra/sub", post(routes_db::algebra_sub))

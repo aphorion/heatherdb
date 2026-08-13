@@ -368,6 +368,17 @@ pub async fn get_document(
     routes::get_document(State(hive), Path((col, doc_id))).await
 }
 
+pub async fn delete_document(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col, doc_id)): Path<(String, String, u64)>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::delete_document(State(hive), Path((col, doc_id))).await
+}
+
 pub async fn query_documents(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,

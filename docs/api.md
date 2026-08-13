@@ -99,6 +99,7 @@ existing clients.
 | `GET`  | `/db/{db}/collections/{name}/documents`               | `/collections/{name}/documents`             | Root or scope==`db` |
 | `POST` | `/db/{db}/collections/{name}/documents/query`         | `/collections/{name}/documents/query`       | Root or scope==`db` |
 | `GET`  | `/db/{db}/collections/{name}/documents/{doc_id}`      | `/collections/{name}/documents/{doc_id}`    | Root or scope==`db` |
+| `DELETE` | `/db/{db}/collections/{name}/documents/{doc_id}`    | `/collections/{name}/documents/{doc_id}`    | Root or scope==`db` |
 
 The legacy alias is allowed only for `Root` and `Database("default")`
 scopes. New code should use the explicit form.
@@ -142,6 +143,38 @@ type ReadResponse = { result: number[] };
 `iterative` runs the Hopfield read until convergence (up to
 `config.t_max` iterations). `fast` is one shot — use for latency-bounded
 paths where good-enough recall is fine.
+
+### `DELETE /db/{db}/collections/{name}/documents/{doc_id}`
+
+```ts
+type DeleteDocumentResponse = { deleted: boolean };
+```
+
+Removes the document from the document store and from **every posting list**
+that references it, so it can no longer be returned by `documents/query`,
+fetched by id, or named as a contributor.
+
+**This is a retrieval and citation tombstone, not an erasure.** A write
+accumulates its pattern into one or more hard locations, and superposition
+cannot cleanly subtract one term from a merged engram — the arithmetic that
+added it is not invertible once other writes have landed on the same location.
+The document's residual contribution to a location's address and counter
+decays only through subsequent writes and consolidation.
+
+If you have a legal erasure obligation, treat that distinction as
+load-bearing: keep such material in its own collection or database, so the
+unit of erasure is one the substrate can actually drop.
+
+| Status | When |
+|--------|------|
+| 200 `{"deleted": true}`  | The document existed and was removed. |
+| 200 `{"deleted": false}` | No such document id. Deletion is idempotent — a tombstone replayed after a crash must not fail — so this is **not** a 404. |
+| 404    | The database or collection doesn't exist. |
+
+Cost: there is no reverse document→locations index, so this scans the
+collection's posting lists. Linear in location count, which is the right
+trade — deletions are driven by source-repository changes, not by queries,
+and a reverse index would tax every write to speed up a rare operation.
 
 ### `POST /db/{db}/collections/{name}/analyze`
 

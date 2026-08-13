@@ -719,6 +719,36 @@ pub async fn get_documents(State(hive): State<AppState>, Path(name): Path<String
     }
 }
 
+/// Delete a document. See `Collection::delete_document`: this removes the
+/// document and every posting-list reference to it, so it can no longer be
+/// retrieved or cited — it does NOT subtract its contribution from merged
+/// engrams, which superposition cannot do.
+pub async fn delete_document(
+    State(hive): State<AppState>,
+    Path((name, doc_id)): Path<(String, u64)>,
+) -> Response {
+    let col = match hive.get_collection(&name) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("collection '{name}' not found"),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+
+    let result = tokio::task::spawn_blocking(move || col.delete_document(doc_id)).await;
+
+    match result {
+        // A missing document is 200 { deleted: false }, not 404: deletion is
+        // idempotent, and a tombstone replayed after a crash must not fail.
+        Ok(Ok(deleted)) => Json(DeleteDocumentResponse { deleted }).into_response(),
+        Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
 pub async fn get_document(
     State(hive): State<AppState>,
     Path((name, doc_id)): Path<(String, u64)>,
