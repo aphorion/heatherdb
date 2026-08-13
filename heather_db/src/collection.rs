@@ -1232,7 +1232,7 @@ impl Collection {
         self.query_documents_scoped(query, n, None)
     }
 
-    /// [`query_documents`] with the scoring rule made explicit.
+    /// [`Self::query_documents`] with the scoring rule made explicit.
     ///
     /// `unbind_role`, when supplied, switches to **role-scoped scoring**: each
     /// candidate is unbound by that role vector and the recovered filler
