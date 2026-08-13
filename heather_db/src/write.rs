@@ -1,6 +1,6 @@
 use rand::Rng;
 
-use crate::config::{engram_bits, surprise_bits, EAMConfig};
+use crate::config::{EAMConfig, engram_bits, surprise_bits};
 use crate::location::{HardLocation, LocationId};
 use crate::read;
 use crate::vec_ops;
@@ -479,7 +479,14 @@ mod tests {
         let n = (config.tau_overload as usize) + 20;
         for _ in 0..n {
             let r = adaptive_write(
-                &input, &mut locations, &config, 0.01, &mut next_id, &mut rng, &[], &[],
+                &input,
+                &mut locations,
+                &config,
+                0.01,
+                &mut next_id,
+                &mut rng,
+                &[],
+                &[],
             );
             for loc in r.new_locations {
                 locations.push(loc);
@@ -487,7 +494,11 @@ mod tests {
         }
         assert!(locations[0].write_count > config.tau_overload);
         assert!(locations[0].surprise_mass < 1.0); // ~0 debt: every write matched
-        assert_eq!(locations.len(), 1, "coherent traffic must not split under MDL");
+        assert_eq!(
+            locations.len(),
+            1,
+            "coherent traffic must not split under MDL"
+        );
     }
 
     // MDL gate: a location that absorbs INCOHERENT traffic accrues surprise debt
@@ -515,14 +526,24 @@ mod tests {
             v[2 + (i % 40)] = 0.9;
             let x = vec_ops::normalize(&v);
             let r = adaptive_write(
-                &x, &mut locations, &config, 0.01, &mut next_id, &mut rng, &[], &[],
+                &x,
+                &mut locations,
+                &config,
+                0.01,
+                &mut next_id,
+                &mut rng,
+                &[],
+                &[],
             );
             if !r.new_locations.is_empty() {
                 split = true;
                 break;
             }
         }
-        assert!(split, "incoherent traffic must accrue surprise debt and split under MDL");
+        assert!(
+            split,
+            "incoherent traffic must accrue surprise debt and split under MDL"
+        );
     }
 
     #[test]
