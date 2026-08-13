@@ -104,6 +104,25 @@ pub fn adaptive_write_two(
     id_lookup: &[u32],
     opts: WriteOpts,
 ) -> WriteResult {
+    // Non-competitive mode: verbatim streaming append. Store the address
+    // as-is (NO normalization) as a fresh location — no activation, no
+    // merge, no migration. Makes the collection an exact growing key→value
+    // store, so a raw dot read (`read_attention`) reproduces trained
+    // attention bit-exactly. Memory is bounded elsewhere (an explicit
+    // `merge()` pass), not by the write competing online.
+    if !config.competitive {
+        let id = LocationId(*next_id);
+        *next_id += 1;
+        let mut new_loc = HardLocation::new(id, address.to_vec());
+        new_loc.counter = counter.to_vec();
+        new_loc.write_count = 1.0;
+        return WriteResult {
+            modified_indices: vec![],
+            new_locations: vec![new_loc],
+            eta,
+        };
+    }
+
     let k = config.k.min(locations.len());
 
     // ── Phase 1: Select ─────────────────────────────────────────────

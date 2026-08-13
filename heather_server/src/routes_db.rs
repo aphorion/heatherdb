@@ -229,6 +229,30 @@ pub async fn read(
     routes::read(State(hive), Path(col), Json(req)).await
 }
 
+pub async fn attention(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col)): Path<(String, String)>,
+    Json(req): Json<AttentionRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::attention(State(hive), Path(col), Json(req)).await
+}
+
+pub async fn calibrate(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col)): Path<(String, String)>,
+    Json(req): Json<CalibrateRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::calibrate(State(hive), Path(col), Json(req)).await
+}
+
 pub async fn bulk_load(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,

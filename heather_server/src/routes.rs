@@ -320,6 +320,55 @@ pub async fn read(
     }
 }
 
+pub async fn attention(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<AttentionRequest>,
+) -> Response {
+    let col = match hive.get_or_create_collection(&name) {
+        Ok(col) => col,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let scale = req.scale;
+    let result = tokio::task::spawn_blocking(move || {
+        col.read_attention_ex(&req.query, req.scale, req.exclude_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(vec)) => Json(AttentionResponse {
+            result: vec,
+            beta: scale,
+        })
+        .into_response(),
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+pub async fn calibrate(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<CalibrateRequest>,
+) -> Response {
+    let col = match hive.get_or_create_collection(&name) {
+        Ok(col) => col,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    // default sweep: 80 log-spaced points in [0.5, 200]
+    let betas = req.betas.unwrap_or_else(|| {
+        let (lo, hi, steps) = (0.5_f64.ln(), 200.0_f64.ln(), 80usize);
+        (0..=steps)
+            .map(|s| (lo + (hi - lo) * s as f64 / steps as f64).exp())
+            .collect()
+    });
+    let result = tokio::task::spawn_blocking(move || col.calibrate_beta(&betas)).await;
+    match result {
+        Ok(Ok((beta, dl))) => Json(CalibrateResponse { beta, dl }).into_response(),
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
 pub async fn stats(State(hive): State<AppState>, Path(name): Path<String>) -> Response {
     let col = match hive.get_collection(&name) {
         Ok(Some(col)) => col,

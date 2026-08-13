@@ -53,6 +53,34 @@ pub struct CreateCollectionRequest {
     pub name: String,
 }
 
+/// Raw dot-product attention read at a fixed inverse-temperature `scale`.
+/// `exclude_id` drops one stored location from the activated set (leave-one-out).
+#[derive(Debug, Deserialize)]
+pub struct AttentionRequest {
+    pub query: Vec<f64>,
+    pub scale: f64,
+    pub exclude_id: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttentionResponse {
+    pub result: Vec<f64>,
+    pub beta: f64,
+}
+
+/// Calibrate the attention temperature by leave-one-out value-reconstruction
+/// description length. `betas` overrides the default log-spaced sweep.
+#[derive(Debug, Deserialize)]
+pub struct CalibrateRequest {
+    pub betas: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CalibrateResponse {
+    pub beta: f64,
+    pub dl: f64,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AnalyzeRequest {
     pub query: Vec<f64>,
