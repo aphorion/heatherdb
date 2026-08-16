@@ -328,6 +328,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/vec/unbind", post(routes::vec_unbind))
         .route("/vec/bundle", post(routes::vec_bundle))
         .route("/vec/pow", post(routes::vec_pow))
+        .route("/vec/rotate", post(routes::vec_rotate))
         .with_state(default_hive);
 
     // /db management routes.

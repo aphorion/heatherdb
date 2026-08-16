@@ -107,6 +107,50 @@ pub async fn vec_pow(Json(req): Json<VecPowRequest>) -> Response {
         .into_response()
 }
 
+/// `POST /vec/rotate` — continuous permutation-cycle rotation: `ρ^t` for
+/// real `t`, the "dimmer dial" generalisation of `/algebra/permute`'s
+/// integer `power`. `t=0` is the identity, `t=1` exactly reproduces the
+/// discrete permutation, integer `t` exactly reproduces `permute_pow`, and
+/// fractional `t` is a smooth in-between state (exact isometry on
+/// odd-length permutation cycles; see [`heather_algebra::Permutation`]'s
+/// `apply_rotate` doc for the even-length-cycle boundary condition).
+pub async fn vec_rotate(Json(req): Json<VecRotateRequest>) -> Response {
+    if req.a.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": "a must be non-empty" })),
+        )
+            .into_response();
+    }
+    let permutation_key = match (req.seed, req.name.as_ref()) {
+        (Some(seed), None) => Ok(PermKey::Seed(seed)),
+        (None, Some(name)) => Ok(PermKey::Name(name.clone())),
+        _ => Err("provide exactly one of `seed` or `name`".to_string()),
+    };
+    let permutation_key = match permutation_key {
+        Ok(k) => k,
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": msg })),
+            )
+                .into_response();
+        }
+    };
+    let rho = match permutation_key {
+        PermKey::Seed(seed) => heather_algebra::Permutation::from_seed(req.a.len(), seed),
+        PermKey::Name(name) => heather_algebra::Permutation::from_name(req.a.len(), &name),
+    };
+    match rho.apply_rotate(&req.a, req.t) {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "result": result })),
+        )
+            .into_response(),
+        Err(e) => algebra_error_response(e),
+    }
+}
+
 pub type AppState = Arc<Hive>;
 
 fn error_response(status: StatusCode, msg: impl ToString) -> Response {
@@ -1750,6 +1794,93 @@ mod bundle_tests {
                 {"vector": [1.0, 0.0]},
                 {"vector": [1.0]},
             ],
+        }))))
+        .await;
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].is_string());
+    }
+}
+
+#[cfg(test)]
+mod rotate_tests {
+    use super::*;
+
+    async fn body_json(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn rotate_body(v: serde_json::Value) -> VecRotateRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// t=1.0 must exactly reproduce the discrete permutation for the same
+    /// seed — the ground-truth check this route exists to expose over HTTP.
+    #[tokio::test]
+    async fn vec_rotate_at_t1_matches_seeded_permutation() {
+        let a: Vec<f64> = (0..16).map(|i| i as f64).collect();
+        let rho = heather_algebra::Permutation::from_seed(a.len(), 42);
+        let expected = rho.apply(&a).unwrap();
+
+        let resp = vec_rotate(Json(rotate_body(serde_json::json!({
+            "a": a,
+            "seed": 42,
+            "t": 1.0,
+        }))))
+        .await;
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        let result: Vec<f64> = serde_json::from_value(body["result"].clone()).unwrap();
+        for (x, y) in result.iter().zip(expected.iter()) {
+            assert!((x - y).abs() < 1e-9, "{x} vs {y}");
+        }
+    }
+
+    /// t=0.0 is the identity.
+    #[tokio::test]
+    async fn vec_rotate_at_t0_is_identity() {
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let resp = vec_rotate(Json(rotate_body(serde_json::json!({
+            "a": a,
+            "name": "pos",
+            "t": 0.0,
+        }))))
+        .await;
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"], serde_json::json!(a));
+    }
+
+    /// Supplying both `seed` and `name`, or neither, is a 400.
+    #[tokio::test]
+    async fn vec_rotate_requires_exactly_one_permutation_key() {
+        let a = vec![1.0, 2.0, 3.0];
+
+        let resp = vec_rotate(Json(rotate_body(serde_json::json!({
+            "a": a, "seed": 1, "name": "pos", "t": 0.5,
+        }))))
+        .await;
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].is_string());
+
+        let resp = vec_rotate(Json(rotate_body(serde_json::json!({
+            "a": a, "t": 0.5,
+        }))))
+        .await;
+        let (status, _) = body_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// An empty vector is rejected, matching `/vec/pow`'s guard.
+    #[tokio::test]
+    async fn vec_rotate_rejects_empty_vector() {
+        let resp = vec_rotate(Json(rotate_body(serde_json::json!({
+            "a": [], "seed": 1, "t": 0.5,
         }))))
         .await;
         let (status, body) = body_json(resp).await;
