@@ -24,16 +24,19 @@
 #
 #  What it does (idempotent — safe to re-run):
 #    · ensures git + rust + curl are installed
-#    · creates the 'heatherdb' user, /opt/heatherdb tree, /etc/heatherdb/env
+#    · creates the 'heatherdb' user, /var/lib/heatherdb, /etc/heatherdb/env
 #    · clones (or pulls) heather-db at $HEATHER_VERSION
-#    · cargo build --release -p heather_server, installs the binary
-#    · drops the systemd unit, enables + restarts the service
+#    · cargo build --release -p heather_server, installs the binary to
+#      /usr/bin/heather — same layout the .deb package uses (see
+#      packaging/deb/), so both install paths agree on where things live
+#    · drops the systemd unit (packaging/deb/heatherdb.service), enables +
+#      restarts the service
 #    · smoke-tests /health on :6380 before declaring victory
 #
 #  Env overrides (all optional):
 #    HEATHER_VERSION   git ref to check out (default: main)
 #    HEATHER_DIM       vector dimension (default: 128)
-#    INSTALL_DIR       install root (default: /opt/heatherdb)
+#    DATA_DIR          data directory (default: /var/lib/heatherdb)
 #    SERVICE_USER      systemd user (default: heatherdb)
 #    SRC_DIR           where to clone heather-db (default: /usr/local/src/heather-db)
 #    SKIP_SMOKE_TEST   set to 1 to skip /health
@@ -95,7 +98,7 @@ fi
 # ─── settings ─────────────────────────────────────────────────────────────────
 HEATHER_VERSION="${HEATHER_VERSION:-main}"
 HEATHER_DIM="${HEATHER_DIM:-128}"
-INSTALL_DIR="${INSTALL_DIR:-/opt/heatherdb}"
+DATA_DIR="${DATA_DIR:-/var/lib/heatherdb}"
 SERVICE_USER="${SERVICE_USER:-heatherdb}"
 SRC_DIR="${SRC_DIR:-/usr/local/src/heather-db}"
 SKIP_SMOKE_TEST="${SKIP_SMOKE_TEST:-0}"
@@ -116,7 +119,7 @@ fi
 banner
 
 step "Preflight"
-say "Install dir   ${B}$INSTALL_DIR${X}"
+say "Data dir      ${B}$DATA_DIR${X}"
 say "Service user  ${B}$SERVICE_USER${X}"
 say "Source dir    ${B}${LOCAL_REPO:-$SRC_DIR}${X}"
 say "Engine        ${B}heather_server${X}  (dim=$HEATHER_DIM, port=6380)"
@@ -181,14 +184,15 @@ ok "cargo: $($CARGO_BIN --version)"
 step "Carving out a home for HeatherDB"
 
 if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
-  useradd --system --shell /usr/sbin/nologin --home-dir "$INSTALL_DIR" "$SERVICE_USER"
+  useradd --system --shell /usr/sbin/nologin --home-dir "$DATA_DIR" \
+    --no-create-home "$SERVICE_USER"
   ok "created user ${B}$SERVICE_USER${X}"
 else
   ok "user ${B}$SERVICE_USER${X} already exists"
 fi
 
-mkdir -p "$INSTALL_DIR/data" /etc/heatherdb
-chown -R "$SERVICE_USER:$SERVICE_USER" "$INSTALL_DIR"
+mkdir -p "$DATA_DIR" /etc/heatherdb
+chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
 
 if [ ! -f /etc/heatherdb/env ]; then
   # Generate a one-time admin password unless the operator already
@@ -200,7 +204,7 @@ if [ ! -f /etc/heatherdb/env ]; then
   : "${HEATHER_ADMIN_USER:=admin}"
 
   cat > /etc/heatherdb/env <<ENV
-HEATHER_DATA_DIR=$INSTALL_DIR/data
+HEATHER_DATA_DIR=$DATA_DIR
 HEATHER_DIMENSION=$HEATHER_DIM
 HEATHER_PORT=6380
 # 0.0.0.0 is fine when the engine is firewalled off and only a TLS
@@ -256,20 +260,22 @@ if [ ! -x "$BIN_SRC" ]; then
   err "Build appeared to succeed but $BIN_SRC is missing. Re-run with RUST_LOG=debug for verbose output."
   exit 1
 fi
-install -m 0755 -o "$SERVICE_USER" -g "$SERVICE_USER" "$BIN_SRC" "$INSTALL_DIR/heather"
-# Convenience symlink so operators can run `heather user create …` and
-# `heather backup create --output …` without the install-dir prefix.
-ln -sf "$INSTALL_DIR/heather" /usr/local/bin/heather
-ok "binary installed: ${B}$INSTALL_DIR/heather${X}  (symlinked to /usr/local/bin/heather)"
+# Same location the .deb package installs to (packaging/deb/) — one
+# binary path regardless of install method, already on root's PATH.
+install -m 0755 -o root -g root "$BIN_SRC" /usr/bin/heather
+ok "binary installed: ${B}/usr/bin/heather${X}"
 
 # ─── systemd unit ─────────────────────────────────────────────────────────────
 step "Wiring up the systemd unit"
 
+# Sourced from packaging/deb/ — the same unit the .deb package installs,
+# so source-install and package-install end up running an identical
+# service definition.
 UNIT_SRC=""
-if [ -f "$BUILD_DIR/deploy/systemd/heatherdb.service" ]; then
-  UNIT_SRC="$BUILD_DIR/deploy/systemd/heatherdb.service"
-elif [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/systemd/heatherdb.service" ]; then
-  UNIT_SRC="$SCRIPT_DIR/systemd/heatherdb.service"
+if [ -f "$BUILD_DIR/packaging/deb/heatherdb.service" ]; then
+  UNIT_SRC="$BUILD_DIR/packaging/deb/heatherdb.service"
+elif [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/../packaging/deb/heatherdb.service" ]; then
+  UNIT_SRC="$SCRIPT_DIR/../packaging/deb/heatherdb.service"
 fi
 
 if [ -z "$UNIT_SRC" ]; then
@@ -284,8 +290,8 @@ Wants=network-online.target
 Type=simple
 User=$SERVICE_USER
 Group=$SERVICE_USER
-WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/heather_server
+WorkingDirectory=$DATA_DIR
+ExecStart=/usr/bin/heather
 Restart=always
 RestartSec=2
 LimitNOFILE=65536
@@ -293,7 +299,7 @@ EnvironmentFile=-/etc/heatherdb/env
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ReadWritePaths=$INSTALL_DIR/data
+ReadWritePaths=$DATA_DIR
 ProtectHome=true
 
 [Install]
@@ -368,15 +374,15 @@ echo "      ${D}curl http://127.0.0.1:6380/health${X}"
 echo "      ${D}curl -u ${HEATHER_ADMIN_USER:-admin}:'<password>' http://127.0.0.1:6380/db${X}"
 echo
 note "User management (the binary is just ${B}heather${X}):"
-echo "      ${D}heather --data-dir $INSTALL_DIR/data user list${X}"
-echo "      ${D}heather --data-dir $INSTALL_DIR/data user create alice --password '...' --scope root${X}"
-echo "      ${D}heather --data-dir $INSTALL_DIR/data user passwd ${HEATHER_ADMIN_USER:-admin} --password '...'${X}"
+echo "      ${D}heather --data-dir $DATA_DIR user list${X}"
+echo "      ${D}heather --data-dir $DATA_DIR user create alice --password '...' --scope root${X}"
+echo "      ${D}heather --data-dir $DATA_DIR user passwd ${HEATHER_ADMIN_USER:-admin} --password '...'${X}"
 echo "      ${D}(LMDB-backed user store — changes are visible to the live engine immediately)${X}"
 echo
 note "Backup / restore / live snapshot:"
-echo "      ${D}heather --data-dir $INSTALL_DIR/data backup create --output /backups/h-\$(date +%F).tar.gz${X}"
-echo "      ${D}heather --data-dir $INSTALL_DIR/data snapshot create --db default${X}"
-echo "      ${D}heather --data-dir $INSTALL_DIR/data restore restore --input /backups/h-2026-05-11.tar.gz${X}"
+echo "      ${D}heather --data-dir $DATA_DIR backup create --output /backups/h-\$(date +%F).tar.gz${X}"
+echo "      ${D}heather --data-dir $DATA_DIR snapshot create --db default${X}"
+echo "      ${D}heather --data-dir $DATA_DIR restore restore --input /backups/h-2026-05-11.tar.gz${X}"
 echo
 note "Logs:"
 echo "      ${D}journalctl -u heatherdb -f${X}"
