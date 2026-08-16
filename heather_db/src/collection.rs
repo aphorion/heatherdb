@@ -780,7 +780,7 @@ impl Collection {
         Ok(self.read_attention_traced(query, scale, exclude)?.result)
     }
 
-    /// [`read_attention_ex`] returning the contributors alongside the value.
+    /// [`read_attention_ex`](Self::read_attention_ex) returning the contributors alongside the value.
     ///
     /// The value vector is a single weighted sum, so on its own it cannot say
     /// which stored locations produced it. The trace names them: each
@@ -803,7 +803,7 @@ impl Collection {
         Self::attention_locked(&inner, query, scale, exclude, None)
     }
 
-    /// [`read_attention`] with a *set* of locations barred from answering.
+    /// [`read_attention`](Self::read_attention) with a *set* of locations barred from answering.
     ///
     /// The single-`exclude` form withholds one engram — a row's own — for
     /// leave-one-out reads. This withholds a family of them, for the case where
@@ -1129,7 +1129,7 @@ impl Collection {
         Ok((trace.result, beta))
     }
 
-    /// [`read_attention_mdl`] returning the contributors alongside the value
+    /// [`read_attention_mdl`](Self::read_attention_mdl) returning the contributors alongside the value
     /// and the self-selected β.
     ///
     /// Same trace as [`read_attention_traced`](Self::read_attention_traced) —
