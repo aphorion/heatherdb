@@ -1,0 +1,13 @@
+apiVersion: v2
+name: heatherdb
+description: HeatherDB — memory that learns. Associative-memory database, single HTTP API binary backed by embedded LMDB storage.
+type: application
+version: 0.1.0
+appVersion: "0.2.1"
+home: https://github.com/aphorion/heatherdb_poc
+keywords:
+  - database
+  - associative-memory
+  - vector
+maintainers:
+  - name: Aphorion Labs
