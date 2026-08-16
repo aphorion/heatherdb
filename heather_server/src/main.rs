@@ -321,6 +321,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/compose/read", post(routes::compose_read))
         .route("/vec/bind", post(routes::vec_bind))
         .route("/vec/unbind", post(routes::vec_unbind))
+        .route("/vec/bundle", post(routes::vec_bundle))
         .route("/vec/pow", post(routes::vec_pow))
         .with_state(default_hive);
 
