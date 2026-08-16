@@ -47,10 +47,7 @@ pub mod store;
 pub mod vec_ops;
 pub mod write;
 
-pub use audit::{
-    AuditConfig, AuditLog, AuditQuery, AuditRecord, DocumentUsage, NameCount, UsageSummary,
-    query_hash,
-};
+pub use audit::{AuditConfig, AuditLog, AuditQuery, AuditRecord, AuditVisibility, query_hash};
 pub use collection::{
     Collection, CompressResult, EAMStats, LocationSummary, MIN_CLEANUP_BETA, MultiRoleHit,
     MultiRoleResults, ReadStrategy, RoleCleanup,

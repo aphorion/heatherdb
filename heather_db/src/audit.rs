@@ -1,4 +1,15 @@
-//! Persisted access log — who read what, when.
+//! Persisted operation log — who did what, when.
+//!
+//! This is a generic access-log primitive, comparable in scope to Postgres's
+//! `pgaudit` extension or MongoDB's audit log: it records raw events (who,
+//! what route, against which object, when, with what outcome) and stays
+//! agnostic about what those events *mean*. It does not decide what counts
+//! as "trending" or "relevant" or build any rollup aimed at a particular UI
+//! panel — a consumer that wants that queries the raw log (`GET
+//! /db/{db}/audit`, with its user/collection/route/time filters) and
+//! aggregates it for its own purposes. Keeping that logic out of the engine
+//! is what keeps this primitive usable by any application built on top of
+//! HeatherDB, not just the one that motivated it.
 //!
 //! One `_audit` sub-DB per database env, alongside `_registry`, `_locations`,
 //! `_metadata`, `_documents` and `_doc_index`. Records are keyed
@@ -8,10 +19,10 @@
 //! read. `seq` breaks ties between events that land in the same millisecond
 //! and keeps keys unique.
 //!
-//! # What is *not* stored: the query vector
+//! # What is stored for the query vector: a hash, by default
 //!
-//! An audit record carries a 64-bit hash of the query vector, never the
-//! vector. Two reasons, both load-bearing:
+//! By default an audit record carries only a 64-bit hash of the query
+//! vector, never the vector itself. Two reasons, both load-bearing:
 //!
 //!   1. **Size.** At D=4096 a query is ~32 KB of `f64`. A repository doing a
 //!      million reads would spend 32 GB auditing reads against data that is
@@ -23,6 +34,10 @@
 //!      personnel, legal and financial material. The hash keeps the property
 //!      the log actually needs — repeated identical queries correlate — while
 //!      being one-way.
+//!
+//! That is a default, not a mandate: `AuditConfig::store_raw_query` lets an
+//! operator who wants the raw vectors for their own analysis opt in
+//! per-database. The engine picks the safe default and gets out of the way.
 //!
 //! # Write-path design: buffer in memory, flush in batches
 //!
@@ -52,7 +67,6 @@
 //! past the cap are dropped and counted in [`AuditLog::dropped`] rather than
 //! growing the heap without limit.
 
-use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -91,9 +105,12 @@ pub struct AuditRecord {
     pub location_ids: Vec<u64>,
     /// Document ids returned.
     pub document_ids: Vec<u64>,
-    /// Stable 64-bit hash of the query vector, hex. Never the vector itself —
-    /// see the module docs.
+    /// Stable 64-bit hash of the query vector, hex. See the module docs —
+    /// this is populated whether or not the raw vector is also stored.
     pub query_hash: Option<String>,
+    /// The raw query vector, only when `AuditConfig::store_raw_query` is set
+    /// for this database. `None` in the safe default configuration.
+    pub query_raw: Option<Vec<f64>>,
 }
 
 /// Per-database audit settings, persisted in `db.toml` under `[audit]`.
@@ -118,6 +135,36 @@ pub struct AuditConfig {
     /// Hard memory cap on the buffer. Records past it are dropped and counted.
     #[serde(default = "default_max_buffer")]
     pub max_buffer: usize,
+    /// When `true`, store the raw query vector on every record in addition
+    /// to its hash. Off by default — hashing is the safe default described
+    /// in the module docs; this lets an operator who wants raw vectors for
+    /// their own analysis opt in explicitly, rather than the engine deciding
+    /// unilaterally for every deployment.
+    #[serde(default)]
+    pub store_raw_query: bool,
+    /// Who may read this database's audit log via `GET /db/{db}/audit`.
+    /// Defaults to [`AuditVisibility::Root`] — the safest option, and the
+    /// only behavior this log had before the policy became configurable.
+    #[serde(default)]
+    pub visibility: AuditVisibility,
+}
+
+/// Read-access policy for a database's audit log.
+///
+/// The log is a record of what *every* user of a database searched for, so
+/// the default is deliberately conservative. This is one binary policy
+/// decision, not a role system: there is no per-user or per-route dimension,
+/// just "root only" vs. "a database's own users may read their database's
+/// log".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum AuditVisibility {
+    /// Only a `Root`-scoped user may read this database's audit log. Matches
+    /// the original, non-configurable behavior.
+    #[default]
+    Root,
+    /// A `Database(name)`-scoped user may read their own database's audit
+    /// log (still never another database's). `Root` can always read it.
+    DbUsers,
 }
 
 fn default_true() -> bool {
@@ -148,6 +195,8 @@ impl Default for AuditConfig {
             flush_threshold: default_flush_threshold(),
             flush_interval_secs: default_flush_interval_secs(),
             max_buffer: default_max_buffer(),
+            store_raw_query: false,
+            visibility: AuditVisibility::Root,
         }
     }
 }
@@ -197,35 +246,6 @@ impl AuditQuery {
                 .is_none_or(|c| &rec.collection == c)
             && self.route.as_ref().is_none_or(|r| &rec.route == r)
     }
-}
-
-/// A `(name, count)` pair in a usage aggregate.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NameCount {
-    pub name: String,
-    pub count: u64,
-}
-
-/// A document's access count within the usage window.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DocumentUsage {
-    pub collection: String,
-    pub document_id: u64,
-    pub accesses: u64,
-}
-
-/// What the "Trending in your team" / "Relevant to you" panels need: the
-/// access log rolled up over a time window.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UsageSummary {
-    pub window_secs: u64,
-    pub since_ms: u64,
-    /// Audit events considered.
-    pub events: u64,
-    pub top_documents: Vec<DocumentUsage>,
-    pub top_collections: Vec<NameCount>,
-    /// Per-user activity counts within the window.
-    pub users: Vec<NameCount>,
 }
 
 /// In-memory staging buffer in front of the `_audit` sub-DB.
@@ -362,65 +382,6 @@ impl AuditLog {
         })?;
         Ok(out)
     }
-
-    /// Roll the log up over `window_secs` for the UI panels.
-    pub fn usage(&self, store: &Store, window_secs: u64, limit: usize) -> Result<UsageSummary> {
-        let now = now_ms();
-        let since_ms = now.saturating_sub(window_secs.saturating_mul(1000));
-
-        let mut events: u64 = 0;
-        let mut docs: HashMap<(String, u64), u64> = HashMap::new();
-        let mut collections: HashMap<String, u64> = HashMap::new();
-        let mut users: HashMap<String, u64> = HashMap::new();
-
-        store.scan_audit_desc(Some(since_ms), None, DEFAULT_MAX_SCAN, |bytes| {
-            if let Ok(rec) = bincode::deserialize::<AuditRecord>(bytes) {
-                events += 1;
-                *collections.entry(rec.collection.clone()).or_insert(0) += 1;
-                *users.entry(rec.user.clone()).or_insert(0) += 1;
-                for id in &rec.document_ids {
-                    *docs.entry((rec.collection.clone(), *id)).or_insert(0) += 1;
-                }
-            }
-            true
-        })?;
-
-        let mut top_documents: Vec<DocumentUsage> = docs
-            .into_iter()
-            .map(|((collection, document_id), accesses)| DocumentUsage {
-                collection,
-                document_id,
-                accesses,
-            })
-            .collect();
-        // Ties broken by name/id so the panel order is stable across calls.
-        top_documents.sort_by(|a, b| {
-            b.accesses
-                .cmp(&a.accesses)
-                .then_with(|| a.collection.cmp(&b.collection))
-                .then_with(|| a.document_id.cmp(&b.document_id))
-        });
-        top_documents.truncate(limit);
-
-        Ok(UsageSummary {
-            window_secs,
-            since_ms,
-            events,
-            top_documents,
-            top_collections: rank(collections, limit),
-            users: rank(users, limit),
-        })
-    }
-}
-
-fn rank(counts: HashMap<String, u64>, limit: usize) -> Vec<NameCount> {
-    let mut v: Vec<NameCount> = counts
-        .into_iter()
-        .map(|(name, count)| NameCount { name, count })
-        .collect();
-    v.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.name.cmp(&b.name)));
-    v.truncate(limit);
-    v
 }
 
 /// `[timestamp_ms: 8B BE | seq: 8B BE]` — time-ordered by construction.
@@ -546,6 +507,7 @@ mod tests {
             location_ids: vec![],
             document_ids: docs,
             query_hash: Some(query_hash(&[1.0, 2.0])),
+            query_raw: None,
         }
     }
 
@@ -666,51 +628,6 @@ mod tests {
     }
 
     #[test]
-    fn usage_aggregates_documents_collections_and_users() {
-        let (_d, hive) = hive_with(AuditConfig::default());
-        hive.record_audit(rec("alice", "bids", "documents/query", vec![7, 9]));
-        hive.record_audit(rec("alice", "bids", "documents/query", vec![7]));
-        hive.record_audit(rec("bob", "hr", "documents/query", vec![9]));
-        hive.flush_audit().unwrap();
-
-        let u = hive.usage_summary(3600, 10).unwrap();
-        assert_eq!(u.events, 3);
-        assert_eq!(u.window_secs, 3600);
-
-        // doc 7 in `bids` twice, doc 9 in `bids` once, doc 9 in `hr` once.
-        assert_eq!(u.top_documents[0].document_id, 7);
-        assert_eq!(u.top_documents[0].collection, "bids");
-        assert_eq!(u.top_documents[0].accesses, 2);
-        assert_eq!(u.top_documents.len(), 3);
-
-        assert_eq!(u.top_collections[0].name, "bids");
-        assert_eq!(u.top_collections[0].count, 2);
-        assert_eq!(u.users[0].name, "alice");
-        assert_eq!(u.users[0].count, 2);
-
-        // A window that predates every record sees nothing.
-        assert_eq!(hive.usage_summary(0, 10).unwrap().events, 0);
-    }
-
-    #[test]
-    fn usage_limit_truncates_every_ranking() {
-        let (_d, hive) = hive_with(AuditConfig::default());
-        for i in 0..5u64 {
-            hive.record_audit(rec(
-                &format!("u{i}"),
-                &format!("c{i}"),
-                "documents/query",
-                vec![i],
-            ));
-        }
-        hive.flush_audit().unwrap();
-        let u = hive.usage_summary(3600, 2).unwrap();
-        assert_eq!(u.top_documents.len(), 2);
-        assert_eq!(u.top_collections.len(), 2);
-        assert_eq!(u.users.len(), 2);
-    }
-
-    #[test]
     fn retention_bound_caps_the_log() {
         let cfg = AuditConfig {
             max_entries: 3,
@@ -757,7 +674,6 @@ mod tests {
         assert_eq!(hive.audit().pending(), 0);
         assert_eq!(hive.flush_audit().unwrap(), 0);
         assert!(hive.query_audit(&AuditQuery::new(100)).unwrap().is_empty());
-        assert_eq!(hive.usage_summary(3600, 10).unwrap().events, 0);
     }
 
     #[test]

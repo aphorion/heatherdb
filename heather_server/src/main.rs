@@ -257,7 +257,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
              this port has full read+write access. Drop the env var or the \
              flag to re-enable."
         );
-        auth::AuthState::disabled(user_store.clone())
+        auth::AuthState::disabled(user_store.clone(), server.clone())
     } else {
         // First-boot bootstrap: mint an admin user. If the operator gave
         // us HEATHER_ADMIN_USER + HEATHER_ADMIN_PASSWORD use those;
@@ -276,7 +276,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
             store = %user_store.path().display(),
             "Auth: HTTP Basic enabled"
         );
-        auth::AuthState::enabled(user_store.clone(), tokens.clone())
+        auth::AuthState::enabled(user_store.clone(), tokens.clone(), server.clone())
     };
 
     // Legacy default-DB router — every existing /collections/... and
@@ -332,10 +332,12 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/db/{db}", get(routes_db::get_database))
         .route("/db/{db}", delete(routes_db::drop_database))
         .route("/db/{db}/dream", post(dream::trigger))
-        // Access log. Root-only — enforced in `users::is_authorized`, not
-        // here, because the middleware is the only place that sees the scope.
-        .route("/db/{db}/audit", get(audit::query_audit))
-        .route("/db/{db}/usage", get(audit::usage));
+        // Access log. Visibility policy (Root-only by default, or a
+        // database's own users per `AuditConfig::visibility`) is enforced
+        // in `users::is_authorized` / `auth::middleware`, not here, because
+        // the middleware is the only place that sees both the scope and
+        // the per-database config.
+        .route("/db/{db}/audit", get(audit::query_audit));
 
     // Scoped /db/{db}/collections/... and /db/{db}/algebra/...
     let db_scoped_router = Router::new()

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-use crate::audit::{AuditConfig, AuditLog, AuditQuery, AuditRecord, UsageSummary};
+use crate::audit::{AuditConfig, AuditLog, AuditQuery, AuditRecord};
 use crate::collection::{Collection, EAMStats};
 use crate::config::EAMConfig;
 use crate::error::{HeatherError, Result};
@@ -269,12 +269,6 @@ impl Hive {
         let n = self.store.prune_audit(&mut txn, u64::MAX, cutoff_ms)?;
         txn.commit()?;
         Ok(n)
-    }
-
-    /// Roll the access log up over a time window for the usage panels.
-    pub fn usage_summary(&self, window_secs: u64, limit: usize) -> Result<UsageSummary> {
-        self.audit.flush(&self.store)?;
-        self.audit.usage(&self.store, window_secs, limit)
     }
 
     /// Close the underlying environment, blocking until it is released.

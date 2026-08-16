@@ -345,6 +345,31 @@ pub async fn bulk_load(
     }
 }
 
+/// The query vector, in audit terms: always a hash, plus the raw vector when
+/// the caller decided to offer one.
+struct AuditQueryInfo {
+    hash: Option<String>,
+    raw: Option<Vec<f64>>,
+}
+
+impl AuditQueryInfo {
+    /// Hash always; clone the raw vector only when this database is
+    /// configured to store it (`AuditConfig::store_raw_query`) — the policy
+    /// decision itself lives in `heather_db::audit` / `crate::audit::record`,
+    /// but the clone has to happen here, before the request's query vector
+    /// is moved into the read closure.
+    fn of(hive: &AppState, query: &[f64]) -> Self {
+        Self {
+            hash: Some(query_hash(query)),
+            raw: hive
+                .audit()
+                .config()
+                .store_raw_query
+                .then(|| query.to_vec()),
+        }
+    }
+}
+
 /// Instrument one read. Single call shape for every audited route — the
 /// `/db/{db}/...` wrappers in `routes_db.rs` delegate here, so a route is
 /// instrumented once, not once per router shape.
@@ -355,7 +380,7 @@ fn audit_read(
     route: &str,
     status: StatusCode,
     ids: AuditIds,
-    query_hash: Option<String>,
+    q: AuditQueryInfo,
 ) {
     audit::record(
         hive,
@@ -367,7 +392,8 @@ fn audit_read(
             result_count: ids.result_count,
             location_ids: ids.location_ids,
             document_ids: ids.document_ids,
-            query_hash,
+            query_hash: q.hash,
+            query_raw: q.raw,
         },
     );
 }
@@ -430,7 +456,7 @@ pub async fn read(
     };
 
     let dims = req.query.len();
-    let qhash = Some(query_hash(&req.query));
+    let qinfo = AuditQueryInfo::of(&hive, &req.query);
     let result = tokio::task::spawn_blocking(move || col.read(&req.query, strategy)).await;
 
     let (status, ids) = match &result {
@@ -438,7 +464,7 @@ pub async fn read(
         Ok(Err(_)) => (StatusCode::BAD_REQUEST, AuditIds::count(0)),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::count(0)),
     };
-    audit_read(&hive, &ctx, &name, "read", status, ids, qhash);
+    audit_read(&hive, &ctx, &name, "read", status, ids, qinfo);
 
     match result {
         Ok(Ok(vec)) => {
@@ -467,7 +493,7 @@ pub async fn attention(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
     let scale = req.scale;
-    let qhash = Some(query_hash(&req.query));
+    let qinfo = AuditQueryInfo::of(&hive, &req.query);
     let result = tokio::task::spawn_blocking(move || {
         col.read_attention_ex(&req.query, req.scale, req.exclude_id)
     })
@@ -478,7 +504,7 @@ pub async fn attention(
         Ok(Err(_)) => (StatusCode::BAD_REQUEST, AuditIds::default()),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::default()),
     };
-    audit_read(&hive, &ctx, &name, "attention", status, ids, qhash);
+    audit_read(&hive, &ctx, &name, "attention", status, ids, qinfo);
 
     match result {
         Ok(Ok(vec)) => Json(AttentionResponse {
@@ -728,7 +754,7 @@ pub async fn analyze(
         }
     };
 
-    let qhash = Some(query_hash(&req.query));
+    let qinfo = AuditQueryInfo::of(&hive, &req.query);
     let result = tokio::task::spawn_blocking(move || col.analyze_read(&req.query, strategy)).await;
 
     let (status, ids) = match &result {
@@ -739,7 +765,7 @@ pub async fn analyze(
         Ok(Err(_)) => (StatusCode::BAD_REQUEST, AuditIds::default()),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::default()),
     };
-    audit_read(&hive, &ctx, &name, "analyze", status, ids, qhash);
+    audit_read(&hive, &ctx, &name, "analyze", status, ids, qinfo);
 
     match result {
         Ok(Ok(trace)) => {
@@ -977,7 +1003,7 @@ pub async fn query_documents(
         return multi_role_query(hive, col, name, ctx, req).await;
     }
 
-    let qhash = Some(query_hash(&req.query));
+    let qinfo = AuditQueryInfo::of(&hive, &req.query);
     let result = tokio::task::spawn_blocking(move || {
         col.query_documents_scoped(&req.query, req.n, req.unbind_role.as_deref())
     })
@@ -991,7 +1017,7 @@ pub async fn query_documents(
         Ok(Err(_)) => (StatusCode::BAD_REQUEST, AuditIds::default()),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::default()),
     };
-    audit_read(&hive, &ctx, &name, "documents/query", status, ids, qhash);
+    audit_read(&hive, &ctx, &name, "documents/query", status, ids, qinfo);
 
     match result {
         Ok(Ok(results)) => {
@@ -1030,7 +1056,7 @@ async fn multi_role_query(
     req: QueryDocumentsRequest,
 ) -> Response {
     let cleanup: RoleCleanup = req.cleanup.into();
-    let qhash = Some(query_hash(&req.query));
+    let qinfo = AuditQueryInfo::of(&hive, &req.query);
     let result = tokio::task::spawn_blocking(move || {
         let pairs: Vec<(&[f64], &[f64])> = req
             .role_pairs
@@ -1049,7 +1075,7 @@ async fn multi_role_query(
         Ok(Err(_)) => (StatusCode::BAD_REQUEST, AuditIds::default()),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::default()),
     };
-    audit_read(&hive, &ctx, &name, "documents/query", status, ids, qhash);
+    audit_read(&hive, &ctx, &name, "documents/query", status, ids, qinfo);
 
     match result {
         Ok(Ok(out)) => {

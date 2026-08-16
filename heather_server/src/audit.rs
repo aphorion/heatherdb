@@ -1,5 +1,5 @@
 //! HTTP surface of the access log: instrumentation of the read routes, plus
-//! the two operator/UI endpoints that read it back.
+//! the operator endpoint that reads it back.
 //!
 //! The storage design, the buffering trade-off, and the reason the query
 //! vector is hashed rather than stored all live in `heather_db::audit`. This
@@ -13,9 +13,12 @@
 //!     shapes inherit it — same rule as every other handler in the dual
 //!     router.
 //!   - [`record`] — the single call site shape for "this read happened".
-//!   - [`query_audit`] / [`usage`] — `GET /db/{db}/audit` and
-//!     `GET /db/{db}/usage`. **Both are Root-only**, enforced in
-//!     `users::is_authorized`; see `docs/api.md` for the reasoning.
+//!   - [`query_audit`] — `GET /db/{db}/audit`, the raw paginated log. Its
+//!     visibility policy (`AuditConfig::visibility`, Root-only by default) is
+//!     enforced in `auth::middleware` / `users::is_authorized`; see
+//!     `docs/api.md` for the reasoning. This endpoint hands back raw events
+//!     only — any rollup or "what does this mean" computation belongs in a
+//!     consumer built on top, not in the engine.
 //!   - [`run_flush_loop`] — the periodic half of the flush policy.
 
 use std::collections::HashMap;
@@ -41,13 +44,6 @@ pub const DEFAULT_AUDIT_LIMIT: usize = 100;
 /// paging over a million-row log would materialise the whole thing in memory
 /// and in one JSON body — page with `until` instead.
 pub const MAX_AUDIT_LIMIT: usize = 1_000;
-/// Default usage window: one day.
-pub const DEFAULT_USAGE_WINDOW_SECS: u64 = 86_400;
-/// Longest usage window accepted (matches the default 90-day retention).
-pub const MAX_USAGE_WINDOW_SECS: u64 = 90 * 86_400;
-/// Entries per ranking in `GET /db/{db}/usage`.
-pub const DEFAULT_USAGE_LIMIT: usize = 20;
-pub const MAX_USAGE_LIMIT: usize = 200;
 
 /// How often the background flusher wakes. The per-database
 /// `audit.flush_interval_secs` decides whether that database is actually due.
@@ -108,6 +104,10 @@ pub struct ReadEvent<'a> {
     pub location_ids: Vec<u64>,
     pub document_ids: Vec<u64>,
     pub query_hash: Option<String>,
+    /// The raw query vector, if the caller has one to offer. Only actually
+    /// persisted when the database's `AuditConfig::store_raw_query` is set —
+    /// [`record`] is the single place that decision is made.
+    pub query_raw: Option<Vec<f64>>,
 }
 
 /// Stage one access record. Cheap: a mutex, a push, and (rarely) a spawned
@@ -116,6 +116,14 @@ pub fn record(hive: &Arc<Hive>, ctx: &AuditCtx, ev: ReadEvent<'_>) {
     if !hive.audit().enabled() {
         return;
     }
+    // Single point of truth for the raw-vs-hashed decision: even if a caller
+    // passed a raw vector along, it's only actually persisted when this
+    // database's `store_raw_query` knob says so.
+    let query_raw = if hive.audit().config().store_raw_query {
+        ev.query_raw
+    } else {
+        None
+    };
     let due = hive.record_audit(AuditRecord {
         seq: 0,          // assigned by the log
         timestamp_ms: 0, // assigned by the log
@@ -129,6 +137,7 @@ pub fn record(hive: &Arc<Hive>, ctx: &AuditCtx, ev: ReadEvent<'_>) {
         location_ids: ev.location_ids,
         document_ids: ev.document_ids,
         query_hash: ev.query_hash,
+        query_raw,
     });
     if due {
         // Threshold reached — drain on a blocking thread so the response path
@@ -253,49 +262,6 @@ pub async fn query_audit(
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
-pub struct UsageParams {
-    pub window_secs: Option<u64>,
-    pub limit: Option<usize>,
-}
-
-/// `GET /db/{db}/usage` — the access log rolled up for the "Trending in your
-/// team" / "Relevant to you" panels. **Root-only**, for the same reason
-/// `/audit` is: per-user activity counts and top documents are still a record
-/// of what individuals searched for.
-pub async fn usage(
-    Extension(server): Extension<Arc<Server>>,
-    Path(db_name): Path<String>,
-    Query(p): Query<UsageParams>,
-) -> Response {
-    let Some(hive) = server.database(&db_name) else {
-        return err(
-            StatusCode::NOT_FOUND,
-            format!("database not found: {db_name}"),
-        );
-    };
-    if !hive.audit().enabled() {
-        return err(
-            StatusCode::CONFLICT,
-            format!("audit logging is disabled for database '{db_name}' (see [audit] in db.toml)"),
-        );
-    }
-    let window = p
-        .window_secs
-        .unwrap_or(DEFAULT_USAGE_WINDOW_SECS)
-        .clamp(1, MAX_USAGE_WINDOW_SECS);
-    let limit = p
-        .limit
-        .unwrap_or(DEFAULT_USAGE_LIMIT)
-        .clamp(1, MAX_USAGE_LIMIT);
-
-    match tokio::task::spawn_blocking(move || hive.usage_summary(window, limit)).await {
-        Ok(Ok(summary)) => Json(summary).into_response(),
-        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
-    }
-}
-
 fn err(status: StatusCode, msg: impl ToString) -> Response {
     (
         status,
@@ -345,6 +311,7 @@ mod tests {
             location_ids: vec![],
             document_ids: docs,
             query_hash: Some(heather_db::query_hash(&[1.0, 2.0])),
+            query_raw: Some(vec![1.0, 2.0]),
         }
     }
 
@@ -377,9 +344,9 @@ mod tests {
         assert_eq!(body["entries"][1]["database"], "garden");
         assert_eq!(body["entries"][1]["user"], "alice");
         assert_eq!(body["entries"][1]["document_ids"][0], 3);
-        // The vector itself is never in the record — only its hash.
+        // The vector itself is never in the record by default — only its hash.
         assert!(body["entries"][1]["query_hash"].is_string());
-        assert!(body["entries"][1].get("query").is_none());
+        assert!(body["entries"][1]["query_raw"].is_null());
 
         // Filter by collection.
         let resp = query_audit(
@@ -413,35 +380,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usage_endpoint_aggregates_for_the_panels() {
-        let (_d, server) = server_with(AuditConfig::default());
+    async fn store_raw_query_opts_in_the_raw_vector() {
+        let (_d, server) = server_with(AuditConfig {
+            store_raw_query: true,
+            ..Default::default()
+        });
         let hive = server.database("garden").unwrap();
         let c = ctx().for_db("garden");
-        record(&hive, &c, event("bids", "documents/query", vec![7, 9]));
-        record(&hive, &c, event("bids", "documents/query", vec![7]));
-        record(
-            &hive,
-            &AuditCtx {
-                user: "bob".into(),
-                ..c.clone()
-            },
-            event("hr", "documents/query", vec![9]),
-        );
+        record(&hive, &c, event("bids", "attention", vec![3]));
 
-        let resp = usage(
+        let resp = query_audit(
             Extension(server),
             Path("garden".into()),
-            Query(UsageParams::default()),
+            Query(AuditParams::default()),
         )
         .await;
-        let (status, body) = body_json(resp).await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["events"], 3);
-        assert_eq!(body["top_documents"][0]["document_id"], 7);
-        assert_eq!(body["top_documents"][0]["accesses"], 2);
-        assert_eq!(body["top_collections"][0]["name"], "bids");
-        assert_eq!(body["users"][0]["name"], "alice");
-        assert_eq!(body["users"][0]["count"], 2);
+        let (_, body) = body_json(resp).await;
+        assert_eq!(
+            body["entries"][0]["query_raw"],
+            serde_json::json!([1.0, 2.0])
+        );
     }
 
     #[tokio::test]
@@ -469,37 +427,16 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(body["error"].as_str().unwrap().contains("disabled"));
-
-        let (status, _) = body_json(
-            usage(
-                Extension(server),
-                Path("garden".into()),
-                Query(UsageParams::default()),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::CONFLICT);
     }
 
     #[tokio::test]
-    async fn unknown_database_is_404_on_both_routes() {
+    async fn unknown_database_is_404() {
         let (_d, server) = server_with(AuditConfig::default());
         let (status, _) = body_json(
             query_audit(
                 Extension(server.clone()),
                 Path("nope".into()),
                 Query(AuditParams::default()),
-            )
-            .await,
-        )
-        .await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-        let (status, _) = body_json(
-            usage(
-                Extension(server),
-                Path("nope".into()),
-                Query(UsageParams::default()),
             )
             .await,
         )
