@@ -12,6 +12,13 @@ name: Docker
 #
 # Architectures: linux/amd64 + linux/arm64 (covers VPS + Pi 5 + most clouds).
 #
+# The `heather` binary is cross-compiled natively for each arch via `cross`
+# (mirroring release.yml — real cross-compilers, no emulation) in the
+# build-binaries job below, then Dockerfile.slim just COPYs the matching
+# pre-built binary into the runtime image. No `cargo build` happens inside
+# the Docker build, so the arm64 leg never QEMU-emulates a Rust compile —
+# QEMU is only exercised for a couple of `apt-get install` calls.
+#
 # GHCR uses the workflow's auto-generated GITHUB_TOKEN — no extra secret
 # needed. Docker Hub needs two repo secrets:
 #   DOCKERHUB_USERNAME   the pushing account/org
@@ -50,13 +57,82 @@ env:
   DOCKERHUB_IMAGE: aphorion/heatherdb
 
 jobs:
+  # ─── cross-compile the `heather` binary natively per arch ──────────────────
+  # No QEMU here: `cross` uses real cross-compilers, same as release.yml.
+  build-binaries:
+    name: cross-build (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain (target ${{ matrix.target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-rs
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docker-${{ matrix.target }}
+
+      - name: Cross-build heather (release)
+        run: cross build --release --locked --target ${{ matrix.target }} -p heather_server
+
+      # Same caveat as release.yml: the amd64 runner's `strip` can't touch
+      # an aarch64 binary, so that one ships unstripped.
+      - name: Strip binary (amd64 only)
+        if: matrix.arch == 'amd64'
+        run: strip target/${{ matrix.target }}/release/heather
+
+      - name: Stage binary
+        run: |
+          set -euxo pipefail
+          mkdir -p dist/linux-${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/heather dist/linux-${{ matrix.arch }}/heather
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/linux-${{ matrix.arch }}/heather
+          retention-days: 1
+          if-no-files-found: error
+
   build:
     name: Build & publish image
+    needs: build-binaries
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      # Native qemu emulators so buildx can target arm64 from an amd64 runner.
+      - name: Download cross-compiled binaries
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-amd64
+          path: dist/linux-amd64
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: linux-arm64
+          path: dist/linux-arm64
+
+      - name: Mark binaries executable
+        run: chmod +x dist/linux-amd64/heather dist/linux-arm64/heather
+
+      # Buildx still needs QEMU: Dockerfile.slim's `apt-get install` for the
+      # arm64 leg runs emulated (seconds), even though the Rust binary
+      # itself was cross-compiled natively above.
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
@@ -124,7 +200,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ./Dockerfile.slim
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
