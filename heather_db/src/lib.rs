@@ -57,6 +57,6 @@ pub use db_config::{DEFAULT_MAP_SIZE_MB, DbConfig, DreamConfig, DreamMode, valid
 pub use error::HeatherError;
 pub use hive::Hive;
 pub use location::{HardLocation, LocationId};
-pub use read::{ActivatedLocation, ReadTrace};
+pub use read::{ActivatedLocation, AttentionContributor, AttentionTrace, ReadTrace};
 pub use server::{DEFAULT_DB, Server, default_db_config, try_acquire_engine_lock};
 pub use write::WriteOpts;

@@ -520,7 +520,7 @@ pub async fn attention(
     let scale = req.scale;
     let qinfo = AuditQueryInfo::of(&hive, &req.query);
     let result = tokio::task::spawn_blocking(move || {
-        col.read_attention_ex(&req.query, req.scale, req.exclude_id)
+        col.read_attention_traced(&req.query, req.scale, req.exclude_id)
     })
     .await;
 
@@ -532,11 +532,82 @@ pub async fn attention(
     audit_read(&hive, &ctx, &name, "attention", status, ids, qinfo);
 
     match result {
-        Ok(Ok(vec)) => Json(AttentionResponse {
-            result: vec,
+        Ok(Ok(trace)) => Json(AttentionResponse {
+            result: trace.result,
             beta: scale,
+            contributors: trace
+                .contributors
+                .into_iter()
+                .map(|c| AttentionContributorItem {
+                    id: c.id,
+                    similarity: c.similarity,
+                    weight: c.weight,
+                })
+                .collect(),
         })
         .into_response(),
+        Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// Normalised Shannon entropy of an attention weight distribution:
+/// `-Σ w·ln w / ln n`, which is 1 for the uniform distribution over `n`
+/// contributors and 0 when one of them takes everything. Zero for fewer
+/// than two contributors, where there is no spread to measure.
+///
+/// This is a *reported* scalar, not a decision. Attention entropy is a weak
+/// abstention signal on its own (a study measured AUC 0.61–0.76, against
+/// 0.997 for the top-1 match margin), so the endpoint hands back the number
+/// and leaves the threshold — if any — to the caller.
+fn normalized_entropy(weights: &[f64]) -> f64 {
+    let n = weights.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let h: f64 = -weights
+        .iter()
+        .filter(|&&w| w > 0.0)
+        .map(|&w| w * w.ln())
+        .sum::<f64>();
+    h / (n as f64).ln()
+}
+
+/// `POST /collections/{name}/attention/mdl` — the self-calibrating attention
+/// read. Same read as `attention`, except β is not supplied: it is selected
+/// per query by minimising the description length of the activated key set,
+/// so confidence tracks the codebook's own geometry. Returns the value, the
+/// β it chose, the contributors, and the weights' normalised entropy.
+pub async fn attention_mdl(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<AttentionMdlRequest>,
+) -> Response {
+    let col = match hive.get_or_create_collection(&name) {
+        Ok(col) => col,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let result =
+        tokio::task::spawn_blocking(move || col.read_attention_mdl_traced(&req.query)).await;
+    match result {
+        Ok(Ok((trace, beta))) => {
+            let weights: Vec<f64> = trace.contributors.iter().map(|c| c.weight).collect();
+            Json(AttentionMdlResponse {
+                result: trace.result,
+                beta,
+                entropy: normalized_entropy(&weights),
+                contributors: trace
+                    .contributors
+                    .into_iter()
+                    .map(|c| AttentionContributorItem {
+                        id: c.id,
+                        similarity: c.similarity,
+                        weight: c.weight,
+                    })
+                    .collect(),
+            })
+            .into_response()
+        }
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }

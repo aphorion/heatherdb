@@ -137,6 +137,54 @@ pub fn activate_soa(
     (indices, similarities)
 }
 
+/// Activation restricted to an explicit candidate set.
+///
+/// `allowed` holds indices into `locations`; only those compete for the
+/// top-k, and the returned indices are still indices into `locations` so
+/// callers need no remapping. Sorted descending by similarity, same as
+/// [`activate`].
+///
+/// Always brute-force over the candidates: the neighbour graph and the SoA
+/// address matrix are built over the *whole* collection, and a greedy descent
+/// through them cannot honour an arbitrary subset without walking off it. The
+/// cost is O(|allowed| · d), which is bounded by the unrestricted scan.
+pub fn activate_subset(
+    query: &[f64],
+    locations: &[HardLocation],
+    allowed: &[usize],
+    k: usize,
+) -> (Vec<usize>, Vec<f64>) {
+    let q = vec_ops::normalize(query);
+
+    let mut heap: BinaryHeap<MinEntry> = BinaryHeap::with_capacity(k + 1);
+    for &i in allowed {
+        if i >= locations.len() {
+            continue;
+        }
+        let sim = vec_ops::dot(&q, &locations[i].address);
+        if heap.len() < k {
+            heap.push(MinEntry {
+                index: i,
+                similarity: sim,
+            });
+        } else if heap.peek().is_some_and(|min| sim > min.similarity) {
+            heap.pop();
+            heap.push(MinEntry {
+                index: i,
+                similarity: sim,
+            });
+        }
+    }
+
+    let mut entries: Vec<(usize, f64)> =
+        heap.into_iter().map(|e| (e.index, e.similarity)).collect();
+    entries.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+    let indices = entries.iter().map(|(i, _)| *i).collect();
+    let similarities = entries.iter().map(|(_, s)| *s).collect();
+    (indices, similarities)
+}
+
 /// Auto-select best activation method: graph → SoA brute-force → scattered brute-force.
 pub fn activate_auto_full(
     query: &[f64],
@@ -468,6 +516,33 @@ pub struct ActivatedLocation {
     pub id: usize,
     pub similarity: f64,
     pub weight: f64,
+}
+
+/// One location's contribution to an attention read.
+///
+/// Field names mirror [`ActivatedLocation`] so the `attention` and `analyze`
+/// responses read the same way, but the quantities differ: `similarity` is the
+/// **raw dot product** `Q·Kᵢ` (not a cosine, not scaled by β), and `weight` is
+/// the post-softmax attention weight actually applied to `Vᵢ`.
+#[derive(Debug, Clone)]
+pub struct AttentionContributor {
+    /// Index of the location within the collection — the same id space as
+    /// `analyze`'s `activated_locations` and the `locations` listing.
+    pub id: usize,
+    /// Raw dot product of the query against this location's address (key).
+    pub similarity: f64,
+    /// Post-softmax weight applied to this location's value. Weights over
+    /// the returned set sum to 1.
+    pub weight: f64,
+}
+
+/// Result of an attention read: the value vector plus the contributors that
+/// produced it, sorted descending by weight. The mirror of [`ReadTrace`] for
+/// the raw dot-product read.
+#[derive(Debug, Clone)]
+pub struct AttentionTrace {
+    pub result: Vec<f64>,
+    pub contributors: Vec<AttentionContributor>,
 }
 
 /// Result of a traced Hopfield iterative read.

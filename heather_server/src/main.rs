@@ -290,6 +290,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/collections/{name}/read", post(routes::read))
         .route("/collections/{name}/attention", post(routes::attention))
         .route(
+            "/collections/{name}/attention/mdl",
+            post(routes::attention_mdl),
+        )
+        .route(
             "/collections/{name}/attention/calibrate",
             post(routes::calibrate),
         )
@@ -357,6 +361,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route(
             "/db/{db}/collections/{name}/attention",
             post(routes_db::attention),
+        )
+        .route(
+            "/db/{db}/collections/{name}/attention/mdl",
+            post(routes_db::attention_mdl),
         )
         .route(
             "/db/{db}/collections/{name}/attention/calibrate",

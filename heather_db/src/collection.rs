@@ -1,5 +1,6 @@
 use std::sync::{Arc, RwLock};
 
+use rayon::prelude::*;
 use realfft::num_complex::Complex;
 
 use crate::config::EAMConfig;
@@ -7,7 +8,7 @@ use crate::error::{HeatherError, Result};
 use crate::location::{HardLocation, LocationId};
 use crate::merge;
 use crate::read;
-pub use crate::read::{ActivatedLocation, ReadTrace};
+pub use crate::read::{ActivatedLocation, AttentionContributor, AttentionTrace, ReadTrace};
 use crate::store::Store;
 use crate::vec_ops;
 use crate::write;
@@ -776,10 +777,67 @@ impl Collection {
         scale: f64,
         exclude: Option<usize>,
     ) -> Result<Vec<f64>> {
+        Ok(self.read_attention_traced(query, scale, exclude)?.result)
+    }
+
+    /// [`read_attention_ex`](Self::read_attention_ex) returning the contributors alongside the value.
+    ///
+    /// The value vector is a single weighted sum, so on its own it cannot say
+    /// which stored locations produced it. The trace names them: each
+    /// contributor carries the raw dot product `Q·Kᵢ` and the post-softmax
+    /// weight actually applied to `Vᵢ`, sorted descending by weight. This is
+    /// location-level provenance — mapping a location back to the documents
+    /// indexed under it is the caller's job.
+    pub fn read_attention_traced(
+        &self,
+        query: &[f64],
+        scale: f64,
+        exclude: Option<usize>,
+    ) -> Result<AttentionTrace> {
         vec_ops::validate_vector(query)?;
 
         let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
 
+        Self::check_query(&inner, query)?;
+
+        Self::attention_locked(&inner, query, scale, exclude, None)
+    }
+
+    /// [`read_attention`](Self::read_attention) with a *set* of locations barred from answering.
+    ///
+    /// The single-`exclude` form withholds one engram — a row's own — for
+    /// leave-one-out reads. This withholds a family of them, for the case where
+    /// rows come in groups of near-duplicates (a doping series, repeated
+    /// measurements of one subject): asking what a row resembles is only
+    /// honest when its own cousins are not allowed to answer for it.
+    ///
+    /// Routes through the same activation and attention as every other read —
+    /// the barred set is expressed as the allowed complement, so results are
+    /// bit-identical to a read over a memory that never held those locations'
+    /// competitors.
+    pub fn read_attention_excluding(
+        &self,
+        query: &[f64],
+        scale: f64,
+        barred: &[usize],
+    ) -> Result<AttentionTrace> {
+        vec_ops::validate_vector(query)?;
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        Self::check_query(&inner, query)?;
+
+        let barred: std::collections::HashSet<usize> = barred.iter().copied().collect();
+        let allowed: Vec<usize> = (0..inner.locations.len())
+            .filter(|i| !barred.contains(i))
+            .collect();
+        if allowed.is_empty() {
+            return Err(HeatherError::EmptyMemory);
+        }
+        Self::attention_locked(&inner, query, scale, None, Some(&allowed))
+    }
+
+    /// Per-query dimension / non-empty checks, factored out so the single-query
+    /// and batched entry points make exactly the same checks in the same order.
+    fn check_query(inner: &EAMInner, query: &[f64]) -> Result<()> {
         if query.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
                 expected: inner.config.d,
@@ -789,22 +847,55 @@ impl Collection {
         if inner.locations.is_empty() {
             return Err(HeatherError::EmptyMemory);
         }
+        Ok(())
+    }
 
+    /// Activated top-k indices for one query under an already-held read lock.
+    /// `allowed`, when supplied, restricts activation to that candidate set
+    /// (`None` = unrestricted). Sorted descending by similarity; `exclude` is
+    /// dropped and the list re-truncated to `config.k`, so an excluded
+    /// location costs nothing.
+    fn activate_locked(
+        inner: &EAMInner,
+        query: &[f64],
+        exclude: Option<usize>,
+        allowed: Option<&[usize]>,
+    ) -> Vec<usize> {
         let want = inner.config.k + exclude.is_some() as usize;
         let k = want.min(inner.locations.len());
-        let (mut indices, _sims) = read::activate_auto_full(
-            query,
-            &inner.locations,
-            k,
-            &inner.landmarks,
-            &inner.id_lookup,
-            &inner.address_matrix,
-            inner.config.d,
-        );
+
+        let (mut indices, _sims) = match allowed {
+            Some(allowed) => read::activate_subset(query, &inner.locations, allowed, k),
+            None => read::activate_auto_full(
+                query,
+                &inner.locations,
+                k,
+                &inner.landmarks,
+                &inner.id_lookup,
+                &inner.address_matrix,
+                inner.config.d,
+            ),
+        };
         if let Some(ex) = exclude {
             indices.retain(|&i| i != ex);
             indices.truncate(inner.config.k);
         }
+        indices
+    }
+
+    /// The whole attention read for one query, under an already-held read
+    /// lock. This is the single definition of the read: both
+    /// [`read_attention_traced`](Self::read_attention_traced) and
+    /// [`read_attention_excluding`](Self::read_attention_excluding) call it,
+    /// so neither can drift from the single-query numbers.
+    fn attention_locked(
+        inner: &EAMInner,
+        query: &[f64],
+        scale: f64,
+        exclude: Option<usize>,
+        allowed: Option<&[usize]>,
+    ) -> Result<AttentionTrace> {
+        let indices = Self::activate_locked(inner, query, exclude, allowed);
 
         // Count-weighted raw-dot scores: a merged engram represents
         // write_count tokens, so it enters the softmax with that multiplicity
@@ -812,12 +903,14 @@ impl Collection {
         // scale·Q·Kᵢ + ln(write_countᵢ). With write_count == 1 everywhere this
         // is exactly softmax(Q·Kᵢ · scale); with merged engrams it reconstructs
         // the attention the un-merged tokens would have produced.
+        let dots: Vec<f64> = indices
+            .iter()
+            .map(|&i| vec_ops::dot(query, &inner.locations[i].address))
+            .collect();
         let logits: Vec<f64> = indices
             .iter()
-            .map(|&i| {
-                scale * vec_ops::dot(query, &inner.locations[i].address)
-                    + inner.locations[i].write_count.max(0.0).ln()
-            })
+            .zip(&dots)
+            .map(|(&i, &dot)| scale * dot + inner.locations[i].write_count.max(0.0).ln())
             .collect();
         let alpha = vec_ops::softmax(&logits, 1.0);
         // raw values (V = counter / write_count), NO output normalization
@@ -826,7 +919,132 @@ impl Collection {
             .map(|&i| inner.locations[i].normalized_pattern())
             .collect();
         let value_refs: Vec<&[f64]> = values.iter().map(|v| v.as_slice()).collect();
-        Ok(vec_ops::weighted_sum(&value_refs, &alpha))
+        let result = vec_ops::weighted_sum(&value_refs, &alpha);
+
+        let mut contributors: Vec<AttentionContributor> = indices
+            .iter()
+            .zip(&dots)
+            .zip(&alpha)
+            .map(|((&id, &similarity), &weight)| AttentionContributor {
+                id,
+                similarity,
+                weight,
+            })
+            .collect();
+        contributors.sort_by(|a, b| b.weight.total_cmp(&a.weight));
+
+        Ok(AttentionTrace {
+            result,
+            contributors,
+        })
+    }
+
+    /// Batched [`read_attention_ex`](Self::read_attention_ex): one read lock
+    /// for the whole sweep, queries fanned out across rayon's pool.
+    ///
+    /// The per-query work is unchanged — the same activation, the same
+    /// count-weighted softmax, the same weighted sum, all through
+    /// `attention_locked`. What disappears is the per-query overhead paid
+    /// outside it: re-acquiring the collection lock and re-reaching for the
+    /// landmark / id-lookup / address-matrix caches once per query instead of
+    /// once per sweep. Results are element-for-element identical to calling
+    /// the single-query form in a loop, in input order.
+    ///
+    /// `excludes`, when given, must have one entry per query — the location to
+    /// withhold from that query's activated set (`None` = withhold nothing).
+    /// An empty batch returns an empty vec without touching the lock.
+    pub fn read_attention_batch(
+        &self,
+        queries: &[Vec<f64>],
+        scale: f64,
+        excludes: Option<&[Option<usize>]>,
+    ) -> Result<Vec<Vec<f64>>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        if excludes.is_some_and(|ex| ex.len() != queries.len()) {
+            return Err(HeatherError::InvalidInput(format!(
+                "excludes length {} does not match queries length {}",
+                excludes.map_or(0, <[Option<usize>]>::len),
+                queries.len()
+            )));
+        }
+
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+
+        queries
+            .par_iter()
+            .enumerate()
+            .map(|(qi, query)| {
+                vec_ops::validate_vector(query)?;
+                Self::check_query(&inner, query)?;
+                let exclude = excludes.and_then(|ex| ex[qi]);
+                Ok(Self::attention_locked(&inner, query, scale, exclude, None)?.result)
+            })
+            .collect()
+    }
+
+    /// The stored location that answers for this query: the index of the
+    /// highest-similarity activated location, the same one that heads
+    /// [`read_attention_traced`](Self::read_attention_traced)'s activation.
+    pub fn top_location(&self, query: &[f64]) -> Result<usize> {
+        vec_ops::validate_vector(query)?;
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        Self::check_query(&inner, query)?;
+        Self::top_location_locked(&inner, query)
+    }
+
+    /// Batched [`top_location`](Self::top_location) — one lock, one fan-out.
+    /// Same indices, same order, as calling the single-query form per query.
+    pub fn top_locations_batch(&self, queries: &[Vec<f64>]) -> Result<Vec<usize>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        queries
+            .par_iter()
+            .map(|query| {
+                vec_ops::validate_vector(query)?;
+                Self::check_query(&inner, query)?;
+                Self::top_location_locked(&inner, query)
+            })
+            .collect()
+    }
+
+    fn top_location_locked(inner: &EAMInner, query: &[f64]) -> Result<usize> {
+        let indices = Self::activate_locked(inner, query, None, None);
+        indices.first().copied().ok_or(HeatherError::EmptyMemory)
+    }
+
+    /// Leave-one-out attention sweep: for each query, find the location that
+    /// answers for it and read again with that location withheld.
+    ///
+    /// This is the engine half of held-out scoring — "what does the codebook
+    /// say about this row when the row's own engram is not allowed to answer?"
+    /// It is exactly `top_location` followed by
+    /// [`read_attention_ex`](Self::read_attention_ex) with that index excluded,
+    /// which is two lock acquisitions and two activations per row when done
+    /// from outside; here it is one lock for the sweep. Comparing the returned
+    /// value against the caller's own target — whatever "score" means to it —
+    /// stays with the caller.
+    pub fn read_attention_loo_batch(
+        &self,
+        queries: &[Vec<f64>],
+        scale: f64,
+    ) -> Result<Vec<Vec<f64>>> {
+        if queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        queries
+            .par_iter()
+            .map(|query| {
+                vec_ops::validate_vector(query)?;
+                Self::check_query(&inner, query)?;
+                let own = Self::top_location_locked(&inner, query)?;
+                Ok(Self::attention_locked(&inner, query, scale, Some(own), None)?.result)
+            })
+            .collect()
     }
 
     /// Calibrate the attention temperature by minimizing the leave-one-out
@@ -907,6 +1125,21 @@ impl Collection {
     /// equidistant to well-separated keys reads soft (MaxEnt abstention), a
     /// query inside a tight cluster reads sharp. Returns `(value, β*)`.
     pub fn read_attention_mdl(&self, query: &[f64]) -> Result<(Vec<f64>, f64)> {
+        let (trace, beta) = self.read_attention_mdl_traced(query)?;
+        Ok((trace.result, beta))
+    }
+
+    /// [`read_attention_mdl`](Self::read_attention_mdl) returning the contributors alongside the value
+    /// and the self-selected β.
+    ///
+    /// Same trace as [`read_attention_traced`](Self::read_attention_traced) —
+    /// each contributor carries the raw dot product `Q·Kᵢ` and the post-softmax
+    /// weight applied to `Vᵢ`, sorted descending by weight — except that the
+    /// softmax runs at the MDL-selected temperature rather than a caller's.
+    /// The weights are what an abstention gate reads: a codebook that cannot
+    /// resolve the query spreads them, and the spread is visible here without
+    /// any threshold being imposed on the caller.
+    pub fn read_attention_mdl_traced(&self, query: &[f64]) -> Result<(AttentionTrace, f64)> {
         vec_ops::validate_vector(query)?;
 
         let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
@@ -941,12 +1174,14 @@ impl Collection {
 
         // Read at β*: count-weighted raw-dot attention, identical form to
         // `read_attention` but with the self-selected temperature.
+        let dots: Vec<f64> = indices
+            .iter()
+            .map(|&i| vec_ops::dot(query, &inner.locations[i].address))
+            .collect();
         let logits: Vec<f64> = indices
             .iter()
-            .map(|&i| {
-                beta * vec_ops::dot(query, &inner.locations[i].address)
-                    + inner.locations[i].write_count.max(0.0).ln()
-            })
+            .zip(&dots)
+            .map(|(&i, &dot)| beta * dot + inner.locations[i].write_count.max(0.0).ln())
             .collect();
         let alpha = vec_ops::softmax(&logits, 1.0);
         let values: Vec<Vec<f64>> = indices
@@ -954,7 +1189,27 @@ impl Collection {
             .map(|&i| inner.locations[i].normalized_pattern())
             .collect();
         let value_refs: Vec<&[f64]> = values.iter().map(|v| v.as_slice()).collect();
-        Ok((vec_ops::weighted_sum(&value_refs, &alpha), beta))
+        let result = vec_ops::weighted_sum(&value_refs, &alpha);
+
+        let mut contributors: Vec<AttentionContributor> = indices
+            .iter()
+            .zip(&dots)
+            .zip(&alpha)
+            .map(|((&id, &similarity), &weight)| AttentionContributor {
+                id,
+                similarity,
+                weight,
+            })
+            .collect();
+        contributors.sort_by(|a, b| b.weight.total_cmp(&a.weight));
+
+        Ok((
+            AttentionTrace {
+                result,
+                contributors,
+            },
+            beta,
+        ))
     }
 
     /// Run KNN merge to consolidate similar locations.
@@ -2551,6 +2806,331 @@ mod tests {
 
         let stats = col.stats().unwrap();
         assert!(stats.total_writes > 0.0);
+    }
+
+    /// A collection with `n` written locations at dimension `d`, plus `m`
+    /// random queries — enough locations that graph/SoA activation paths and
+    /// the sequential/parallel split in `activate` both get exercised.
+    fn batch_fixture(dir: &TempDir, d: usize, n: usize, m: usize) -> (Collection, Vec<Vec<f64>>) {
+        let store = Arc::new(Store::open(dir.path(), 256).unwrap());
+        let mut txn = store.write_txn().unwrap();
+        let id = store.create_collection(&mut txn, "batch").unwrap();
+        txn.commit().unwrap();
+
+        let mut config = EAMConfig::new(d).unwrap();
+        config.l_0 = 64;
+        config.k = 5;
+        let col = Collection::new(id, "batch".into(), store, &config).unwrap();
+
+        let mut rng = rand::thread_rng();
+        for _ in 0..n {
+            col.write(&vec_ops::random_unit_vector(d, &mut rng))
+                .unwrap();
+        }
+        let queries = (0..m)
+            .map(|_| vec_ops::random_unit_vector(d, &mut rng))
+            .collect();
+        (col, queries)
+    }
+
+    /// The batch form is not "close to" the loop form, it *is* the loop form:
+    /// every returned coordinate must compare bit-equal, with and without
+    /// exclusions.
+    #[test]
+    fn read_attention_batch_matches_single_query_loop_exactly() {
+        let dir = TempDir::new().unwrap();
+        let (col, queries) = batch_fixture(&dir, 32, 120, 40);
+        let scale = 1.0 / (32f64).sqrt();
+
+        let batched = col.read_attention_batch(&queries, scale, None).unwrap();
+        assert_eq!(batched.len(), queries.len());
+        for (q, got) in queries.iter().zip(&batched) {
+            let want = col.read_attention_ex(q, scale, None).unwrap();
+            assert_eq!(*got, want, "batched read diverged from single-query read");
+        }
+
+        // Exclusion path: withhold each query's own top location, plus a
+        // location that is (almost certainly) not in the activated set, plus
+        // no exclusion at all — all in one batch.
+        let n = col.num_locations().unwrap();
+        let excludes: Vec<Option<usize>> = queries
+            .iter()
+            .enumerate()
+            .map(|(i, q)| match i % 3 {
+                0 => None,
+                1 => Some(col.top_location(q).unwrap()),
+                _ => Some(n - 1 - (i % n)),
+            })
+            .collect();
+
+        let batched = col
+            .read_attention_batch(&queries, scale, Some(&excludes))
+            .unwrap();
+        for ((q, ex), got) in queries.iter().zip(&excludes).zip(&batched) {
+            let want = col.read_attention_ex(q, scale, *ex).unwrap();
+            assert_eq!(*got, want, "batched exclude read diverged");
+        }
+    }
+
+    /// Excluding a location the query never activated must leave the read
+    /// untouched — the same vector the unexcluded read returns.
+    #[test]
+    fn excluding_an_unactivated_location_changes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let (col, queries) = batch_fixture(&dir, 32, 120, 8);
+        let scale = 0.7;
+
+        for q in &queries {
+            let activated = {
+                let inner = col.inner.read().unwrap();
+                Collection::activate_locked(&inner, q, None, None)
+            };
+            let n = col.num_locations().unwrap();
+            let outsider = (0..n).find(|i| !activated.contains(i)).unwrap();
+
+            let plain = col.read_attention_ex(q, scale, None).unwrap();
+            let excluded = col.read_attention_ex(q, scale, Some(outsider)).unwrap();
+            assert_eq!(plain, excluded);
+
+            let batched = col
+                .read_attention_batch(std::slice::from_ref(q), scale, Some(&[Some(outsider)]))
+                .unwrap();
+            assert_eq!(batched[0], plain);
+        }
+    }
+
+    #[test]
+    fn batch_edge_cases() {
+        let dir = TempDir::new().unwrap();
+        let (col, queries) = batch_fixture(&dir, 32, 120, 4);
+        let scale = 0.5;
+
+        // Empty batch — no lock, no work, empty answer.
+        assert!(
+            col.read_attention_batch(&[], scale, None)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(col.top_locations_batch(&[]).unwrap().is_empty());
+        assert!(col.read_attention_loo_batch(&[], scale).unwrap().is_empty());
+
+        // Single query — same as the single-query call.
+        let one = std::slice::from_ref(&queries[0]);
+        assert_eq!(
+            col.read_attention_batch(one, scale, None).unwrap()[0],
+            col.read_attention_ex(&queries[0], scale, None).unwrap()
+        );
+        assert_eq!(
+            col.top_locations_batch(one).unwrap()[0],
+            col.top_location(&queries[0]).unwrap()
+        );
+
+        // Mismatched excludes length is rejected, not silently zipped.
+        assert!(matches!(
+            col.read_attention_batch(&queries, scale, Some(&[None])),
+            Err(HeatherError::InvalidInput(_))
+        ));
+
+        // Wrong dimension anywhere in the batch fails the batch.
+        let bad = vec![vec![0.0; 8]];
+        assert!(matches!(
+            col.read_attention_batch(&bad, scale, None),
+            Err(HeatherError::DimensionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn top_locations_batch_matches_single_query_loop_exactly() {
+        let dir = TempDir::new().unwrap();
+        let (col, queries) = batch_fixture(&dir, 32, 120, 40);
+
+        let batched = col.top_locations_batch(&queries).unwrap();
+        for (q, &got) in queries.iter().zip(&batched) {
+            assert_eq!(got, col.top_location(q).unwrap());
+        }
+    }
+
+    /// The leave-one-out sweep must equal the two-call sequence the caller
+    /// would otherwise write by hand.
+    #[test]
+    fn loo_batch_matches_manual_two_call_sequence() {
+        let dir = TempDir::new().unwrap();
+        let (col, queries) = batch_fixture(&dir, 32, 120, 24);
+        let scale = 1.0 / (32f64).sqrt();
+
+        let batched = col.read_attention_loo_batch(&queries, scale).unwrap();
+        for (q, got) in queries.iter().zip(&batched) {
+            let own = col.top_location(q).unwrap();
+            let want = col.read_attention_ex(q, scale, Some(own)).unwrap();
+            assert_eq!(*got, want);
+        }
+    }
+
+    /// The trace must name the locations the value came from: the weights are
+    /// the ones actually applied (they reproduce the value exactly), the
+    /// similarities are raw dot products against the stored keys, and the list
+    /// is ordered by weight so the top contributor is the first citation.
+    #[test]
+    fn attention_trace_names_its_contributors() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let mut config = test_config();
+        config.l_0 = 0;
+        config.k = 64; // every key participates
+        config.competitive = false; // verbatim K→V store: one location per write
+        let col = Collection::new(col_id, "test".into(), store, &config).unwrap();
+        let d = 16;
+        let mut rng = rand::thread_rng();
+        let opts = crate::write::WriteOpts::default();
+        for _ in 0..5 {
+            let key = vec_ops::random_unit_vector(d, &mut rng);
+            let val = vec_ops::random_unit_vector(d, &mut rng);
+            col.write_two(&key, &val, opts).unwrap();
+        }
+        let query = vec_ops::random_unit_vector(d, &mut rng);
+        let scale = 1.0 / (d as f64).sqrt();
+
+        let trace = col.read_attention_traced(&query, scale, None).unwrap();
+
+        // The thin wrapper and the traced read agree on the value.
+        let plain = col.read_attention(&query, scale).unwrap();
+        assert_eq!(trace.result, plain);
+
+        assert_eq!(trace.contributors.len(), 5, "every location participated");
+
+        // Descending by weight, and the weights are a distribution.
+        for w in trace.contributors.windows(2) {
+            assert!(
+                w[0].weight >= w[1].weight,
+                "contributors must sort by weight"
+            );
+        }
+        let total: f64 = trace.contributors.iter().map(|c| c.weight).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-12,
+            "weights must sum to 1, got {total}"
+        );
+
+        let inner = col.inner.read().unwrap();
+        for c in &trace.contributors {
+            // `similarity` is the RAW dot product Q·Kᵢ — not a cosine, not βQ·Kᵢ.
+            let raw = vec_ops::dot(&query, &inner.locations[c.id].address);
+            assert!(
+                (c.similarity - raw).abs() < 1e-12,
+                "similarity {} != raw dot {raw}",
+                c.similarity
+            );
+        }
+
+        // The contributors fully account for the value: Σ weightᵢ · Vᵢ == result.
+        let mut recon = vec![0.0; d];
+        for c in &trace.contributors {
+            let v = inner.locations[c.id].normalized_pattern();
+            for (r, x) in recon.iter_mut().zip(&v) {
+                *r += c.weight * x;
+            }
+        }
+        for (a, b) in trace.result.iter().zip(&recon) {
+            assert!((a - b).abs() < 1e-12, "result {a} != Σ weight·V {b}");
+        }
+    }
+
+    /// `read_attention_excluding` over a barred set must equal the same read
+    /// with the barred locations removed from the candidate pool entirely —
+    /// not merely dropped post-hoc from an unrestricted top-k.
+    #[test]
+    fn read_attention_excluding_matches_a_memory_without_the_barred_set() {
+        let dir = TempDir::new().unwrap();
+        let (col, queries) = batch_fixture(&dir, 32, 120, 8);
+        let scale = 0.6;
+
+        for q in &queries {
+            let n = col.num_locations().unwrap();
+            // Bar a handful of locations, including at least one likely
+            // activated (the query's own top match).
+            let top = col.top_location(q).unwrap();
+            let barred: Vec<usize> = std::iter::once(top).chain([1usize, 2, 3]).collect();
+
+            let trace = col.read_attention_excluding(q, scale, &barred).unwrap();
+            for c in &trace.contributors {
+                assert!(
+                    !barred.contains(&c.id),
+                    "barred location {} answered anyway",
+                    c.id
+                );
+            }
+            assert!((n) > barred.len(), "sanity: barred is a strict subset");
+        }
+
+        // Barring everything is an empty memory, not a panic.
+        let all: Vec<usize> = (0..col.num_locations().unwrap()).collect();
+        assert!(matches!(
+            col.read_attention_excluding(&queries[0], scale, &all),
+            Err(HeatherError::EmptyMemory)
+        ));
+    }
+
+    /// [`read_attention_mdl_traced`] must name its contributors the same way
+    /// [`attention_trace_names_its_contributors`] checks for the fixed-β read:
+    /// weights sum to 1, sorted descending, similarities are raw dot products,
+    /// and the contributors fully reconstruct the returned value — all at the
+    /// self-selected β rather than a caller-supplied one.
+    #[test]
+    fn mdl_attention_trace_names_its_contributors() {
+        let d = 16;
+        let dir = TempDir::new().unwrap();
+        let (col, keys) = separated_collection(&dir, d);
+        // Ambiguous query: nearly equidistant to both keys, so several
+        // locations carry real weight and the sum has something to check.
+        let query = vec_ops::normalize(
+            &keys[0]
+                .iter()
+                .zip(&keys[1])
+                .map(|(a, b)| 0.51 * a + 0.49 * b)
+                .collect::<Vec<_>>(),
+        );
+
+        let (trace, beta) = col.read_attention_mdl_traced(&query).unwrap();
+        let (plain, plain_beta) = col.read_attention_mdl(&query).unwrap();
+        assert_eq!(trace.result, plain, "wrapper and traced read agree");
+        assert_eq!(beta, plain_beta);
+        assert!(beta.is_finite() && beta > 0.0, "β* must be usable: {beta}");
+
+        assert_eq!(trace.contributors.len(), keys.len());
+        for w in trace.contributors.windows(2) {
+            assert!(
+                w[0].weight >= w[1].weight,
+                "contributors must sort by weight"
+            );
+        }
+        let total: f64 = trace.contributors.iter().map(|c| c.weight).sum();
+        assert!(
+            (total - 1.0).abs() < 1e-12,
+            "weights must sum to 1, got {total}"
+        );
+
+        let inner = col.inner.read().unwrap();
+        for c in &trace.contributors {
+            // `similarity` is the RAW dot product Q·Kᵢ — not scaled by β*.
+            let raw = vec_ops::dot(&query, &inner.locations[c.id].address);
+            assert!(
+                (c.similarity - raw).abs() < 1e-12,
+                "similarity {} != raw dot {raw}",
+                c.similarity
+            );
+        }
+
+        // Σ weightᵢ · Vᵢ == result, at the self-selected temperature.
+        let mut recon = vec![0.0; d];
+        for c in &trace.contributors {
+            let v = inner.locations[c.id].normalized_pattern();
+            for (r, x) in recon.iter_mut().zip(&v) {
+                *r += c.weight * x;
+            }
+        }
+        for (a, b) in trace.result.iter().zip(&recon) {
+            assert!((a - b).abs() < 1e-12, "result {a} != Σ weight·V {b}");
+        }
     }
 
     /// read_attention must equal a hand-computed softmax(Q·Kᵢ·scale)·Vᵢ over
