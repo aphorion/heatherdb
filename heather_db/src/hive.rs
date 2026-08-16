@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
+use crate::audit::{AuditConfig, AuditLog, AuditQuery, AuditRecord};
 use crate::collection::{Collection, EAMStats};
 use crate::config::EAMConfig;
 use crate::error::{HeatherError, Result};
@@ -24,18 +25,33 @@ pub struct CollectionInfo {
 pub struct Hive {
     store: Arc<Store>,
     config: EAMConfig,
+    audit: AuditLog,
     collections: RwLock<HashMap<String, Arc<Collection>>>,
 }
 
 impl Hive {
-    /// Open (or create) a Hive at the given path.
+    /// Open (or create) a Hive at the given path, with default audit settings
+    /// (access logging **on** — see [`crate::audit`]).
     pub fn open(path: &Path, config: EAMConfig, map_size_mb: usize) -> Result<Self> {
+        Self::open_with_audit(path, config, map_size_mb, AuditConfig::default())
+    }
+
+    /// Open (or create) a Hive with explicit audit settings. `Server` passes
+    /// the `[audit]` section of the database's `db.toml` here.
+    pub fn open_with_audit(
+        path: &Path,
+        config: EAMConfig,
+        map_size_mb: usize,
+        audit: AuditConfig,
+    ) -> Result<Self> {
         config.validate()?;
         let store = Arc::new(Store::open(path, map_size_mb)?);
+        let audit = AuditLog::open(&store, audit)?;
 
         Ok(Hive {
             store,
             config,
+            audit,
             collections: RwLock::new(HashMap::new()),
         })
     }
@@ -211,6 +227,48 @@ impl Hive {
     /// Get a reference to the shared config.
     pub fn config(&self) -> &EAMConfig {
         &self.config
+    }
+
+    /* ─── access log ──────────────────────────────────────────────────────
+     *
+     * The audit log is database-scoped, not collection-scoped: dropping a
+     * collection deliberately does NOT erase the record of who read it.
+     */
+
+    /// The database's access log.
+    pub fn audit(&self) -> &AuditLog {
+        &self.audit
+    }
+
+    /// Stage one audit record. Returns `true` when the caller should schedule
+    /// a flush (the buffer hit its threshold). Never touches disk — see the
+    /// [`crate::audit`] module docs for the write-path design.
+    pub fn record_audit(&self, rec: AuditRecord) -> bool {
+        self.audit.record(rec)
+    }
+
+    /// Persist staged audit records and enforce the retention bound.
+    /// Blocking: call from a blocking context, not an async reactor thread.
+    pub fn flush_audit(&self) -> Result<usize> {
+        self.audit.flush(&self.store)
+    }
+
+    /// Query the access log, newest-first. Flushes first so records staged in
+    /// memory are visible — an audit query that can't see the last second of
+    /// activity is worse than a slightly slower audit query.
+    pub fn query_audit(&self, q: &AuditQuery) -> Result<Vec<AuditRecord>> {
+        self.audit.flush(&self.store)?;
+        self.audit.query(&self.store, q)
+    }
+
+    /// Drop every audit record older than `cutoff_ms`. The periodic flush
+    /// already applies the configured `retention_days`; this is the manual
+    /// lever for an operator honouring a shorter erasure request.
+    pub fn prune_audit_before(&self, cutoff_ms: u64) -> Result<usize> {
+        let mut txn = self.store.write_txn()?;
+        let n = self.store.prune_audit(&mut txn, u64::MAX, cutoff_ms)?;
+        txn.commit()?;
+        Ok(n)
     }
 
     /// Close the underlying environment, blocking until it is released.

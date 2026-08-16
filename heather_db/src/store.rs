@@ -45,6 +45,7 @@ pub struct Store {
     metadata_db: Database<Bytes, Bytes>,
     documents_db: Database<Bytes, Bytes>,
     doc_index_db: Database<Bytes, Bytes>,
+    audit_db: Database<Bytes, Bytes>,
 }
 
 impl Store {
@@ -55,7 +56,7 @@ impl Store {
         let env = unsafe {
             EnvOpenOptions::new()
                 .map_size(1024 * 1024 * map_size_mb)
-                .max_dbs(5)
+                .max_dbs(6)
                 .open(path)?
         };
 
@@ -65,6 +66,7 @@ impl Store {
         let metadata_db = env.create_database(&mut wtxn, Some("_metadata"))?;
         let documents_db = env.create_database(&mut wtxn, Some("_documents"))?;
         let doc_index_db = env.create_database(&mut wtxn, Some("_doc_index"))?;
+        let audit_db = env.create_database(&mut wtxn, Some("_audit"))?;
         wtxn.commit()?;
 
         Ok(Store {
@@ -74,6 +76,7 @@ impl Store {
             metadata_db,
             documents_db,
             doc_index_db,
+            audit_db,
         })
     }
 
@@ -414,6 +417,107 @@ impl Store {
         let data = bincode::serialize(&doc_ids.to_vec())?;
         self.doc_index_db.put(txn, &key, &data)?;
         Ok(())
+    }
+
+    // --- Audit log (database-scoped, not collection-scoped) ---
+    //
+    // Keys are `[timestamp_ms: 8B BE | seq: 8B BE]` (see `crate::audit`), so
+    // the sub-DB's own key order is time order and paging newest-first is a
+    // reverse cursor walk rather than a sort.
+
+    /// Append one audit record. Callers batch these into a single txn —
+    /// see `crate::audit::AuditLog::flush`.
+    pub fn append_audit(&self, txn: &mut RwTxn, key: &[u8], value: &[u8]) -> Result<()> {
+        self.audit_db.put(txn, key, value)?;
+        Ok(())
+    }
+
+    /// Highest sequence number on disk, used to resume the counter at boot.
+    pub fn last_audit_seq(&self) -> Result<Option<u64>> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self
+            .audit_db
+            .last(&rtxn)?
+            .map(|(key, _)| crate::audit::key_seq(key)))
+    }
+
+    /// Number of stored audit records.
+    pub fn audit_len(&self) -> Result<u64> {
+        let rtxn = self.env.read_txn()?;
+        Ok(self.audit_db.len(&rtxn)?)
+    }
+
+    /// Walk audit records newest-first, calling `visit` with each raw value.
+    /// `visit` returns `false` to stop the scan.
+    ///
+    /// `since_ms` terminates the walk (keys are time-ordered, so everything
+    /// past it is older); `until_ms` skips newer rows. `max_scan` bounds the
+    /// rows examined so a filter that matches nothing can't read the whole log.
+    pub fn scan_audit_desc<F>(
+        &self,
+        since_ms: Option<u64>,
+        until_ms: Option<u64>,
+        max_scan: usize,
+        mut visit: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&[u8]) -> bool,
+    {
+        let rtxn = self.env.read_txn()?;
+        let mut scanned = 0usize;
+        for result in self.audit_db.rev_iter(&rtxn)? {
+            let (key, value) = result?;
+            scanned += 1;
+            if scanned > max_scan {
+                break;
+            }
+            // `is_some_and` rather than nested `if let` — the collapsed form
+            // is a let-chain, which the 1.84 MSRV job doesn't accept.
+            let ts = crate::audit::key_timestamp(key);
+            if until_ms.is_some_and(|until| ts > until) {
+                continue;
+            }
+            if since_ms.is_some_and(|since| ts < since) {
+                break;
+            }
+            if !visit(value) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Enforce the retention bound: drop the oldest records until at most
+    /// `max_entries` remain, then drop anything older than `min_ts_ms`
+    /// (`0` disables the age bound). Returns how many were removed.
+    pub fn prune_audit(&self, txn: &mut RwTxn, max_entries: u64, min_ts_ms: u64) -> Result<usize> {
+        let total = self.audit_db.len(txn)?;
+        let mut excess = total.saturating_sub(max_entries);
+        if excess == 0 && min_ts_ms == 0 {
+            return Ok(0);
+        }
+
+        let mut doomed: Vec<Vec<u8>> = Vec::new();
+        {
+            for result in self.audit_db.iter(txn)? {
+                let (key, _) = result?;
+                if excess > 0 {
+                    doomed.push(key.to_vec());
+                    excess -= 1;
+                    continue;
+                }
+                if min_ts_ms > 0 && crate::audit::key_timestamp(key) < min_ts_ms {
+                    doomed.push(key.to_vec());
+                    continue;
+                }
+                // Keys ascend by timestamp — the first survivor ends the walk.
+                break;
+            }
+        }
+        for key in &doomed {
+            self.audit_db.delete(txn, key)?;
+        }
+        Ok(doomed.len())
     }
 
     /// Close the LMDB environment and block until the OS has released it.

@@ -14,6 +14,7 @@ use axum::response::{IntoResponse, Response};
 
 use heather_db::{DEFAULT_MAP_SIZE_MB, DbConfig, Hive, Server};
 
+use crate::audit::AuditCtx;
 use crate::models::*;
 use crate::routes;
 
@@ -271,25 +272,27 @@ pub async fn write(
 pub async fn read(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
+    ctx: AuditCtx,
     Json(req): Json<ReadRequest>,
 ) -> Response {
     let hive = match resolve_db(&server, &db_name) {
         Ok(h) => h,
         Err(r) => return r,
     };
-    routes::read(State(hive), Path(col), Json(req)).await
+    routes::read(State(hive), Path(col), ctx.for_db(&db_name), Json(req)).await
 }
 
 pub async fn attention(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
+    ctx: AuditCtx,
     Json(req): Json<AttentionRequest>,
 ) -> Response {
     let hive = match resolve_db(&server, &db_name) {
         Ok(h) => h,
         Err(r) => return r,
     };
-    routes::attention(State(hive), Path(col), Json(req)).await
+    routes::attention(State(hive), Path(col), ctx.for_db(&db_name), Json(req)).await
 }
 
 pub async fn calibrate(
@@ -376,13 +379,14 @@ pub async fn fingerprint(
 pub async fn analyze(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
+    ctx: AuditCtx,
     Json(req): Json<AnalyzeRequest>,
 ) -> Response {
     let hive = match resolve_db(&server, &db_name) {
         Ok(h) => h,
         Err(r) => return r,
     };
-    routes::analyze(State(hive), Path(col), Json(req)).await
+    routes::analyze(State(hive), Path(col), ctx.for_db(&db_name), Json(req)).await
 }
 
 pub async fn batch_analyze(
@@ -433,13 +437,14 @@ pub async fn delete_document(
 pub async fn query_documents(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
+    ctx: AuditCtx,
     Json(req): Json<QueryDocumentsRequest>,
 ) -> Response {
     let hive = match resolve_db(&server, &db_name) {
         Ok(h) => h,
         Err(r) => return r,
     };
-    routes::query_documents(State(hive), Path(col), Json(req)).await
+    routes::query_documents(State(hive), Path(col), ctx.for_db(&db_name), Json(req)).await
 }
 
 /* ─── /db/{db}/algebra/... ────────────────────────────────────────────────── */
@@ -538,4 +543,119 @@ pub async fn compose_read(
         Err(r) => return r,
     };
     routes::compose_read(State(hive), Json(req)).await
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    use heather_db::AuditQuery;
+
+    fn ctx() -> AuditCtx {
+        AuditCtx {
+            user: "alice".into(),
+            scope: "root".into(),
+            db: "default".into(),
+        }
+    }
+
+    /// The scoped wrapper is the only place that knows which database the
+    /// request targets, so this is the assertion that the `for_db` hand-off
+    /// works end to end: a read through `/db/garden/...` must be recorded
+    /// against `garden`, not against the legacy `default`.
+    #[tokio::test]
+    async fn scoped_reads_are_audited_against_the_path_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Server::open(dir.path(), 8).unwrap());
+        server
+            .create_database(DbConfig::new("garden", 8).unwrap())
+            .unwrap();
+
+        // Seed documents so the query has something to return.
+        let vectors: Vec<Vec<f64>> = (0..5)
+            .map(|i| {
+                let mut v = vec![0.0; 8];
+                v[i] = 1.0;
+                v
+            })
+            .collect();
+        let resp = write(
+            Extension(server.clone()),
+            Path(("garden".into(), "bids".into())),
+            Json(WriteRequest {
+                metadata: Some(
+                    (0..5)
+                        .map(|i| serde_json::json!({ "title": format!("tender-{i}") }))
+                        .collect(),
+                ),
+                vectors,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let query = vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let req: QueryDocumentsRequest = serde_json::from_value(serde_json::json!({
+            "query": query,
+            "n": 5,
+        }))
+        .unwrap();
+        let resp = query_documents(
+            Extension(server.clone()),
+            Path(("garden".into(), "bids".into())),
+            ctx(),
+            Json(req),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let hive = server.database("garden").unwrap();
+        let entries = hive.query_audit(&AuditQuery::new(10)).unwrap();
+        assert_eq!(entries.len(), 1, "writes are not audited, reads are");
+        let e = &entries[0];
+        assert_eq!(e.database, "garden");
+        assert_eq!(e.collection, "bids");
+        assert_eq!(e.route, "documents/query");
+        assert_eq!(e.user, "alice");
+        assert_eq!(e.status, 200);
+        assert!(e.result_count > 0, "the query returned nothing to audit");
+        assert_eq!(e.document_ids.len(), e.result_count);
+        assert_eq!(e.query_hash, Some(heather_db::query_hash(&query)));
+
+        // The legacy `default` database saw none of it.
+        let default_hive = server.database("default").unwrap();
+        assert!(
+            default_hive
+                .query_audit(&AuditQuery::new(10))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// A read that fails is still recorded — a refused access attempt is
+    /// exactly what an access log exists to capture.
+    #[tokio::test]
+    async fn failed_reads_are_audited_with_their_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+        server
+            .create_database(DbConfig::new("garden", 4).unwrap())
+            .unwrap();
+
+        // Wrong dimension → 400 from the engine.
+        let resp = read(
+            Extension(server.clone()),
+            Path(("garden".into(), "bids".into())),
+            ctx(),
+            Json(serde_json::from_value(serde_json::json!({"query": [1.0, 2.0]})).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let hive = server.database("garden").unwrap();
+        let entries = hive.query_audit(&AuditQuery::new(10)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].route, "read");
+        assert_eq!(entries[0].status, 400);
+        assert_eq!(entries[0].result_count, 0);
+    }
 }

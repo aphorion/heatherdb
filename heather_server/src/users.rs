@@ -239,8 +239,46 @@ impl UserStore {
 
 /* ─── auth-route classifier (unchanged from JSON era) ─────────────────────── */
 
+/// Routes under `/db/{name}/` that a `Database(name)` scope reaches only
+/// under a database-specific policy, rather than by the ordinary "does the
+/// path's db match my scope" rule.
+///
+/// The access log is a record of what *every* user of a database searched
+/// for. `Scope::Database(name)` is a data scope shared by every user of that
+/// database — in a knowledge-repository deployment, that is the ordinary
+/// employee scope. Letting it read `/db/{name}/audit` by default would let
+/// any employee read every colleague's search history over confidential
+/// personnel, legal and financial material; searches over a bid repository
+/// leak commercial intent on their own. So the default (`AuditConfig::
+/// visibility == Root`) denies it, matching the original, non-configurable
+/// behavior. An operator who wants a database's own users to see their
+/// database's log — nothing about other databases — can opt in per database
+/// via `AuditConfig::visibility = DbUsers`; `is_authorized` takes that
+/// decision as a parameter rather than hard-coding it, since it has no way
+/// to look up per-database config itself.
+///
+/// The `Scope` enum has two levels and no per-user or role dimension, so it
+/// still cannot express "read your own entries but not your colleagues'" or
+/// a dedicated auditor role — this is one binary policy switch, not a role
+/// system.
+fn is_policy_gated_db_route(tail: &str) -> bool {
+    let seg = tail.strip_prefix('/').unwrap_or(tail);
+    let seg = &seg[..seg.find('/').unwrap_or(seg.len())];
+    seg == "audit"
+}
+
 /// Authorisation check: does `scope` permit access to a request `path`?
-pub fn is_authorized(scope: &Scope, path: &str) -> bool {
+///
+/// `audit_visibility` is the resolved `AuditConfig::visibility` of the
+/// database named in `path`, when `path` is a policy-gated route (currently
+/// just `/db/{name}/audit`) and that database exists. Pass `None` when
+/// neither applies, or when the caller has no way to look it up — that
+/// preserves the safe, original Root-only behavior.
+pub fn is_authorized(
+    scope: &Scope,
+    path: &str,
+    audit_visibility: Option<heather_db::AuditVisibility>,
+) -> bool {
     if matches!(scope, Scope::Root) {
         return true;
     }
@@ -252,6 +290,11 @@ pub fn is_authorized(scope: &Scope, path: &str) -> bool {
     if let Some(rest) = path.strip_prefix("/db/") {
         let segment_end = rest.find('/').unwrap_or(rest.len());
         let route_db = &rest[..segment_end];
+        if is_policy_gated_db_route(&rest[segment_end..])
+            && audit_visibility != Some(heather_db::AuditVisibility::DbUsers)
+        {
+            return false;
+        }
         return route_db == db_name;
     }
 
@@ -395,32 +438,81 @@ mod tests {
     #[test]
     fn auth_root_can_anything() {
         let s = Scope::Root;
-        assert!(is_authorized(&s, "/db"));
-        assert!(is_authorized(&s, "/db/anything"));
-        assert!(is_authorized(&s, "/collections/foo/write"));
-        assert!(is_authorized(&s, "/algebra/add"));
+        assert!(is_authorized(&s, "/db", None));
+        assert!(is_authorized(&s, "/db/anything", None));
+        assert!(is_authorized(&s, "/collections/foo/write", None));
+        assert!(is_authorized(&s, "/algebra/add", None));
     }
 
     #[test]
     fn auth_db_scoped() {
         let s = Scope::Database("memoria".into());
-        assert!(is_authorized(&s, "/db/memoria"));
-        assert!(is_authorized(&s, "/db/memoria/collections/users/write"));
-        assert!(!is_authorized(&s, "/db/navigator/collections/x"));
-        assert!(!is_authorized(&s, "/db"));
-        assert!(!is_authorized(&s, "/collections/x"));
-        assert!(!is_authorized(&s, "/algebra/add"));
+        assert!(is_authorized(&s, "/db/memoria", None));
+        assert!(is_authorized(
+            &s,
+            "/db/memoria/collections/users/write",
+            None
+        ));
+        assert!(!is_authorized(&s, "/db/navigator/collections/x", None));
+        assert!(!is_authorized(&s, "/db", None));
+        assert!(!is_authorized(&s, "/collections/x", None));
+        assert!(!is_authorized(&s, "/algebra/add", None));
+    }
+
+    /// The access log is Root-only by default, even for the database you
+    /// own — `audit_visibility: None` is what a caller passes when it
+    /// hasn't been told to allow database-scoped access.
+    #[test]
+    fn auth_audit_route_is_root_only_by_default() {
+        for s in [
+            Scope::Database("memoria".into()),
+            Scope::Database("default".into()),
+        ] {
+            assert!(!is_authorized(&s, "/db/memoria/audit", None));
+            assert!(!is_authorized(&s, "/db/default/audit", None));
+        }
+        // Root still reaches it.
+        assert!(is_authorized(&Scope::Root, "/db/memoria/audit", None));
+        // And the prefix match doesn't over-reach: a collection *named*
+        // `audit` under /collections/ is ordinary data, not the log.
+        let s = Scope::Database("memoria".into());
+        assert!(is_authorized(
+            &s,
+            "/db/memoria/collections/audit/read",
+            None
+        ));
+    }
+
+    /// `AuditVisibility::DbUsers` lets a database's own scope read its own
+    /// log — but never another database's, even with the policy set.
+    #[test]
+    fn auth_audit_route_honors_db_users_visibility() {
+        use heather_db::AuditVisibility;
+        let s = Scope::Database("memoria".into());
+        assert!(is_authorized(
+            &s,
+            "/db/memoria/audit",
+            Some(AuditVisibility::DbUsers)
+        ));
+        // A visibility policy resolved for a *different* database (as would
+        // happen if the caller looked up the wrong db) still doesn't help —
+        // the route_db == scope db_name check still applies.
+        assert!(!is_authorized(
+            &s,
+            "/db/navigator/audit",
+            Some(AuditVisibility::DbUsers)
+        ));
     }
 
     #[test]
     fn auth_default_scoped_can_legacy() {
         let s = Scope::Database("default".into());
-        assert!(is_authorized(&s, "/db/default"));
-        assert!(is_authorized(&s, "/db/default/collections/x"));
-        assert!(is_authorized(&s, "/collections/x"));
-        assert!(is_authorized(&s, "/algebra/add"));
-        assert!(is_authorized(&s, "/compose/read"));
-        assert!(!is_authorized(&s, "/db/memoria/collections/x"));
-        assert!(!is_authorized(&s, "/db"));
+        assert!(is_authorized(&s, "/db/default", None));
+        assert!(is_authorized(&s, "/db/default/collections/x", None));
+        assert!(is_authorized(&s, "/collections/x", None));
+        assert!(is_authorized(&s, "/algebra/add", None));
+        assert!(is_authorized(&s, "/compose/read", None));
+        assert!(!is_authorized(&s, "/db/memoria/collections/x", None));
+        assert!(!is_authorized(&s, "/db", None));
     }
 }

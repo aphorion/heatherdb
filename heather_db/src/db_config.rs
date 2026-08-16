@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::audit::AuditConfig;
 use crate::config::EAMConfig;
 use crate::error::{HeatherError, Result};
 
@@ -38,6 +39,13 @@ pub struct DbConfig {
     /// dreams only when an operator opts it in via `db.toml`.
     #[serde(default)]
     pub dream: DreamConfig,
+
+    /// Access logging. Default: **enabled** — unlike `dream`, this is a
+    /// security control, so it is on unless an operator explicitly turns it
+    /// off. Turning it off silently stops recording who read what; see
+    /// `docs/api.md` for the privacy implications of leaving it on.
+    #[serde(default)]
+    pub audit: AuditConfig,
 }
 
 fn default_map_size() -> usize {
@@ -145,6 +153,7 @@ impl DbConfig {
             eam: EAMConfig::new(dimension)?,
             map_size_mb: DEFAULT_MAP_SIZE_MB,
             dream: DreamConfig::default(),
+            audit: AuditConfig::default(),
         })
     }
 

@@ -28,6 +28,8 @@ use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as B64;
 
+use heather_db::Server;
+
 use crate::models::ErrorResponse;
 use crate::tokens::{AuthKind, Tokens};
 use crate::users::{Scope, User, UserStore, is_authorized};
@@ -39,23 +41,38 @@ pub struct AuthState {
     /// Session-token store. `None` only when auth is disabled.
     pub tokens: Option<Arc<Tokens>>,
     pub disabled: bool,
+    /// Needed to resolve a database's `AuditConfig::visibility` for
+    /// `/db/{name}/audit` — every other route ignores it.
+    pub server: Arc<Server>,
 }
 
 impl AuthState {
-    pub fn enabled(users: Arc<UserStore>, tokens: Arc<Tokens>) -> Self {
+    pub fn enabled(users: Arc<UserStore>, tokens: Arc<Tokens>, server: Arc<Server>) -> Self {
         Self {
             users,
             tokens: Some(tokens),
             disabled: false,
+            server,
         }
     }
-    pub fn disabled(users: Arc<UserStore>) -> Self {
+    pub fn disabled(users: Arc<UserStore>, server: Arc<Server>) -> Self {
         Self {
             users,
             tokens: None,
             disabled: true,
+            server,
         }
     }
+}
+
+/// Pulls the database name out of a `/db/{name}/audit` path so the
+/// middleware can look up that database's `AuditConfig::visibility`. `None`
+/// for every other path shape (including `/db/{name}/usage`, which no
+/// longer exists, and `/db/{name}/collections/audit/...`, ordinary data).
+fn audit_route_db(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/db/")?;
+    let (db, tail) = rest.split_once('/')?;
+    (tail == "audit").then_some(db)
 }
 
 /// Identity resolved by the middleware and attached to the request. Handlers
@@ -115,7 +132,10 @@ pub async fn middleware(State(auth): State<AuthState>, req: Request<Body>, next:
     // `/auth/*` are identity operations (mint/revoke the caller's own token) —
     // any authenticated user may use them regardless of data scope. Every
     // other route checks the user's scope against the path.
-    if !path.starts_with("/auth/") && !is_authorized(&user.scope, &path) {
+    let audit_visibility = audit_route_db(&path)
+        .and_then(|db_name| auth.server.database(db_name))
+        .map(|hive| hive.audit().config().visibility);
+    if !path.starts_with("/auth/") && !is_authorized(&user.scope, &path, audit_visibility) {
         return deny_403(&format!(
             "user '{}' (scope {}) is not authorised for {}",
             user.name,

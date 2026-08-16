@@ -10,9 +10,10 @@ use heather_algebra::{
     EAMSnapshot, bind_vec, bundle_vec, circular_convolve, compose_read as algebra_compose_read,
     ops, pow_vec, unbind_exact_vec, unbind_vec,
 };
-use heather_db::{HardLocation, Hive, LocationId, ReadStrategy, RoleCleanup};
+use heather_db::{HardLocation, Hive, LocationId, ReadStrategy, RoleCleanup, query_hash};
 use rayon::prelude::*;
 
+use crate::audit::{self, AuditCtx, ReadEvent};
 use crate::limits;
 use crate::models::*;
 
@@ -369,9 +370,94 @@ pub async fn bulk_load(
     }
 }
 
+/// The query vector, in audit terms: always a hash, plus the raw vector when
+/// the caller decided to offer one.
+struct AuditQueryInfo {
+    hash: Option<String>,
+    raw: Option<Vec<f64>>,
+}
+
+impl AuditQueryInfo {
+    /// Hash always; clone the raw vector only when this database is
+    /// configured to store it (`AuditConfig::store_raw_query`) — the policy
+    /// decision itself lives in `heather_db::audit` / `crate::audit::record`,
+    /// but the clone has to happen here, before the request's query vector
+    /// is moved into the read closure.
+    fn of(hive: &AppState, query: &[f64]) -> Self {
+        Self {
+            hash: Some(query_hash(query)),
+            raw: hive
+                .audit()
+                .config()
+                .store_raw_query
+                .then(|| query.to_vec()),
+        }
+    }
+}
+
+/// Instrument one read. Single call shape for every audited route — the
+/// `/db/{db}/...` wrappers in `routes_db.rs` delegate here, so a route is
+/// instrumented once, not once per router shape.
+fn audit_read(
+    hive: &AppState,
+    ctx: &AuditCtx,
+    collection: &str,
+    route: &str,
+    status: StatusCode,
+    ids: AuditIds,
+    q: AuditQueryInfo,
+) {
+    audit::record(
+        hive,
+        ctx,
+        ReadEvent {
+            collection,
+            route,
+            status,
+            result_count: ids.result_count,
+            location_ids: ids.location_ids,
+            document_ids: ids.document_ids,
+            query_hash: q.hash,
+            query_raw: q.raw,
+        },
+    );
+}
+
+/// The identifiers a read handed back, as the audit log wants them.
+#[derive(Default)]
+struct AuditIds {
+    result_count: usize,
+    location_ids: Vec<u64>,
+    document_ids: Vec<u64>,
+}
+
+impl AuditIds {
+    fn documents(ids: Vec<u64>) -> Self {
+        Self {
+            result_count: ids.len(),
+            location_ids: Vec::new(),
+            document_ids: ids,
+        }
+    }
+    fn locations(ids: Vec<u64>) -> Self {
+        Self {
+            result_count: ids.len(),
+            location_ids: ids,
+            document_ids: Vec::new(),
+        }
+    }
+    fn count(n: usize) -> Self {
+        Self {
+            result_count: n,
+            ..Default::default()
+        }
+    }
+}
+
 pub async fn read(
     State(hive): State<AppState>,
     Path(name): Path<String>,
+    ctx: AuditCtx,
     Json(req): Json<ReadRequest>,
 ) -> Response {
     let strategy_name = req.strategy.as_deref().unwrap_or("iterative");
@@ -395,7 +481,15 @@ pub async fn read(
     };
 
     let dims = req.query.len();
+    let qinfo = AuditQueryInfo::of(&hive, &req.query);
     let result = tokio::task::spawn_blocking(move || col.read(&req.query, strategy)).await;
+
+    let (status, ids) = match &result {
+        Ok(Ok(_)) => (StatusCode::OK, AuditIds::count(1)),
+        Ok(Err(_)) => (StatusCode::BAD_REQUEST, AuditIds::count(0)),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::count(0)),
+    };
+    audit_read(&hive, &ctx, &name, "read", status, ids, qinfo);
 
     match result {
         Ok(Ok(vec)) => {
@@ -416,6 +510,7 @@ pub async fn read(
 pub async fn attention(
     State(hive): State<AppState>,
     Path(name): Path<String>,
+    ctx: AuditCtx,
     Json(req): Json<AttentionRequest>,
 ) -> Response {
     let col = match hive.get_or_create_collection(&name) {
@@ -423,10 +518,19 @@ pub async fn attention(
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
     let scale = req.scale;
+    let qinfo = AuditQueryInfo::of(&hive, &req.query);
     let result = tokio::task::spawn_blocking(move || {
         col.read_attention_ex(&req.query, req.scale, req.exclude_id)
     })
     .await;
+
+    let (status, ids) = match &result {
+        Ok(Ok(_)) => (StatusCode::OK, AuditIds::count(1)),
+        Ok(Err(_)) => (StatusCode::BAD_REQUEST, AuditIds::default()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::default()),
+    };
+    audit_read(&hive, &ctx, &name, "attention", status, ids, qinfo);
+
     match result {
         Ok(Ok(vec)) => Json(AttentionResponse {
             result: vec,
@@ -652,6 +756,7 @@ pub async fn fingerprint(State(hive): State<AppState>, Path(name): Path<String>)
 pub async fn analyze(
     State(hive): State<AppState>,
     Path(name): Path<String>,
+    ctx: AuditCtx,
     Json(req): Json<AnalyzeRequest>,
 ) -> Response {
     let strategy_name = req.strategy.as_deref().unwrap_or("iterative");
@@ -674,7 +779,18 @@ pub async fn analyze(
         }
     };
 
+    let qinfo = AuditQueryInfo::of(&hive, &req.query);
     let result = tokio::task::spawn_blocking(move || col.analyze_read(&req.query, strategy)).await;
+
+    let (status, ids) = match &result {
+        Ok(Ok(t)) => (
+            StatusCode::OK,
+            AuditIds::locations(t.activated_locations.iter().map(|a| a.id as u64).collect()),
+        ),
+        Ok(Err(_)) => (StatusCode::BAD_REQUEST, AuditIds::default()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::default()),
+    };
+    audit_read(&hive, &ctx, &name, "analyze", status, ids, qinfo);
 
     match result {
         Ok(Ok(trace)) => {
@@ -892,6 +1008,7 @@ pub async fn get_document(
 pub async fn query_documents(
     State(hive): State<AppState>,
     Path(name): Path<String>,
+    ctx: AuditCtx,
     Json(req): Json<QueryDocumentsRequest>,
 ) -> Response {
     let col = match hive.get_or_create_collection(&name) {
@@ -908,13 +1025,24 @@ pub async fn query_documents(
                  path gives every pair its own",
             );
         }
-        return multi_role_query(col, req).await;
+        return multi_role_query(hive, col, name, ctx, req).await;
     }
 
+    let qinfo = AuditQueryInfo::of(&hive, &req.query);
     let result = tokio::task::spawn_blocking(move || {
         col.query_documents_scoped(&req.query, req.n, req.unbind_role.as_deref())
     })
     .await;
+
+    let (status, ids) = match &result {
+        Ok(Ok(rs)) => (
+            StatusCode::OK,
+            AuditIds::documents(rs.iter().map(|(id, _, _)| *id).collect()),
+        ),
+        Ok(Err(_)) => (StatusCode::BAD_REQUEST, AuditIds::default()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::default()),
+    };
+    audit_read(&hive, &ctx, &name, "documents/query", status, ids, qinfo);
 
     match result {
         Ok(Ok(results)) => {
@@ -946,10 +1074,14 @@ pub async fn query_documents(
 /// full-bundle recall score that ordered the results; the per-criterion
 /// breakdown rides alongside it in `role_scores`, unweighted and unaggregated.
 async fn multi_role_query(
+    hive: AppState,
     col: Arc<heather_db::Collection>,
+    name: String,
+    ctx: AuditCtx,
     req: QueryDocumentsRequest,
 ) -> Response {
     let cleanup: RoleCleanup = req.cleanup.into();
+    let qinfo = AuditQueryInfo::of(&hive, &req.query);
     let result = tokio::task::spawn_blocking(move || {
         let pairs: Vec<(&[f64], &[f64])> = req
             .role_pairs
@@ -959,6 +1091,16 @@ async fn multi_role_query(
         col.query_documents_multi_role(&req.query, req.n, &pairs, cleanup)
     })
     .await;
+
+    let (status, ids) = match &result {
+        Ok(Ok(out)) => (
+            StatusCode::OK,
+            AuditIds::documents(out.hits.iter().map(|h| h.doc_id).collect()),
+        ),
+        Ok(Err(_)) => (StatusCode::BAD_REQUEST, AuditIds::default()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::default()),
+    };
+    audit_read(&hive, &ctx, &name, "documents/query", status, ids, qinfo);
 
     match result {
         Ok(Ok(out)) => {

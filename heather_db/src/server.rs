@@ -369,7 +369,12 @@ fn open_hive_for(root: &Path, cfg: &DbConfig) -> Result<Hive> {
     let data_dir = root.join("db").join(&cfg.name).join("data");
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| HeatherError::Storage(format!("create {}: {e}", data_dir.display())))?;
-    Hive::open(&data_dir, cfg.eam.clone(), cfg.map_size_mb)
+    Hive::open_with_audit(
+        &data_dir,
+        cfg.eam.clone(),
+        cfg.map_size_mb,
+        cfg.audit.clone(),
+    )
 }
 
 fn now_secs() -> u64 {
