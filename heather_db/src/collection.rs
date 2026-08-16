@@ -191,7 +191,7 @@ fn cleanup_read(inner: &EAMInner, v: &[f64], beta: f64) -> Vec<f64> {
         .iter()
         .map(|&i| {
             beta * vec_ops::dot(v, &inner.locations[i].address)
-                + inner.locations[i].write_count.max(1e-12).ln()
+                + inner.locations[i].write_count.max(0.0).ln()
         })
         .collect();
     let alpha = vec_ops::softmax(&logits, 1.0);
@@ -816,7 +816,7 @@ impl Collection {
             .iter()
             .map(|&i| {
                 scale * vec_ops::dot(query, &inner.locations[i].address)
-                    + inner.locations[i].write_count.max(1e-12).ln()
+                    + inner.locations[i].write_count.max(0.0).ln()
             })
             .collect();
         let alpha = vec_ops::softmax(&logits, 1.0);
@@ -945,7 +945,7 @@ impl Collection {
             .iter()
             .map(|&i| {
                 beta * vec_ops::dot(query, &inner.locations[i].address)
-                    + inner.locations[i].write_count.max(1e-12).ln()
+                    + inner.locations[i].write_count.max(0.0).ln()
             })
             .collect();
         let alpha = vec_ops::softmax(&logits, 1.0);
@@ -2581,7 +2581,7 @@ mod tests {
             let logits: Vec<f64> = inner
                 .locations
                 .iter()
-                .map(|l| scale * vec_ops::dot(&query, &l.address) + l.write_count.max(1e-12).ln())
+                .map(|l| scale * vec_ops::dot(&query, &l.address) + l.write_count.max(0.0).ln())
                 .collect();
             let alpha = vec_ops::softmax(&logits, 1.0);
             let vals: Vec<Vec<f64>> = inner

@@ -1,0 +1,37 @@
+HeatherDB ({{ .Chart.AppVersion }}) is deploying as a single-replica StatefulSet.
+
+1. Wait for the pod to be ready:
+
+   kubectl rollout status statefulset/{{ include "heatherdb.fullname" . }} -n {{ .Release.Namespace }}
+
+2. Port-forward to reach it locally:
+
+   kubectl port-forward -n {{ .Release.Namespace }} svc/{{ include "heatherdb.fullname" . }} 6380:{{ .Values.service.port }}
+   curl http://127.0.0.1:6380/health
+
+{{- if and (not .Values.auth.existingSecret) (not .Values.auth.password) (not .Values.auth.disabled) }}
+
+3. No admin password was configured — the engine generated one on first
+   boot. Retrieve it:
+
+   kubectl logs -n {{ .Release.Namespace }} {{ include "heatherdb.fullname" . }}-0 | grep -A8 first-boot
+
+   Rotate it once you have it:
+
+   kubectl exec -n {{ .Release.Namespace }} {{ include "heatherdb.fullname" . }}-0 -- \
+     heather user passwd admin --password '<new-password>'
+{{- else if .Values.auth.disabled }}
+
+3. HEATHER_AUTH_DISABLED=1 — auth is OFF. Anyone who can reach the
+   Service has full read+write access. Only appropriate for a
+   throwaway/dev cluster.
+{{- else }}
+
+3. Admin credentials come from {{ include "heatherdb.authSecretName" . }}
+   (keys: {{ .Values.auth.existingSecretUsernameKey }} / {{ .Values.auth.existingSecretPasswordKey }}).
+{{- end }}
+
+Data persists in the PVC created by the StatefulSet's volumeClaimTemplate
+(`data-{{ include "heatherdb.fullname" . }}-0`) — it survives pod
+restarts/reschedules but is NOT deleted by `helm uninstall`. Remove it
+manually with `kubectl delete pvc` once you're really done with it.

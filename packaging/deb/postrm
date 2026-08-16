@@ -1,0 +1,23 @@
+#!/bin/sh
+# postrm for heatherdb.deb — disable the unit; data and the service
+# account are left in place even on purge (LMDB data lives in
+# /var/lib/heatherdb — an operator should remove it deliberately, not
+# have `apt purge` do it for them).
+set -e
+
+case "$1" in
+  purge)
+    if [ -d /run/systemd/system ]; then
+      systemctl disable heatherdb.service >/dev/null 2>&1 || true
+    fi
+    echo "heatherdb: /var/lib/heatherdb (data) and the 'heatherdb' system user were left in place."
+    echo "heatherdb: remove them manually if you're done with this install."
+    ;;
+  remove)
+    if [ -d /run/systemd/system ]; then
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    ;;
+esac
+
+exit 0
