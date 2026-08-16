@@ -14,7 +14,10 @@ __pycache__/
 .DS_Store
 .cursorrules
 .cursorignore
-.cursorignore
 ._next/
 .next/
 *.db
+
+# Claude Code local session/runtime state (scheduled-task locks etc.) —
+# machine-local, not repo content.
+.claude/

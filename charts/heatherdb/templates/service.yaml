@@ -1,0 +1,30 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "heatherdb.fullname" . }}-headless
+  labels:
+    {{- include "heatherdb.labels" . | nindent 4 }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "heatherdb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "heatherdb.fullname" . }}
+  labels:
+    {{- include "heatherdb.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "heatherdb.selectorLabels" . | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.service.port }}
+      targetPort: http
+      protocol: TCP

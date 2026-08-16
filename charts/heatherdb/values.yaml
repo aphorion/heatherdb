@@ -1,0 +1,129 @@
+# Default values for the heatherdb chart.
+#
+# HeatherDB is a single-writer engine (embedded LMDB) — like Postgres,
+# not horizontally scalable. This chart always deploys exactly one
+# replica via a StatefulSet; there is no replicaCount knob.
+
+image:
+  # Currently GHCR-only (private). Switch to docker.io/aphorion/heatherdb
+  # once that image is published, or point at your own mirror.
+  repository: ghcr.io/aphorion/heather-db
+  tag: ""              # defaults to .Chart.AppVersion
+  pullPolicy: IfNotPresent
+
+# Name(s) of existing image pull secrets (kubectl create secret
+# docker-registry ...) — required for a private image repository.
+imagePullSecrets: []
+# - name: ghcr-pull-secret
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 6380
+
+# Persistent storage for /var/lib/heatherdb (LMDB data files). Use a
+# storage class backed by a volume that follows the pod on reschedule
+# (standard cloud block storage) — LMDB mmaps its data file and doesn't
+# tolerate NFS-style network filesystems well.
+persistence:
+  enabled: true
+  size: 10Gi
+  storageClassName: ""     # "" = cluster default
+  accessModes:
+    - ReadWriteOnce
+
+resources: {}
+  # HEATHER_MAP_SIZE_MB below is the LMDB memory-map ceiling — keep the
+  # memory limit comfortably above it.
+  # limits:
+  #   memory: 6Gi
+  #   cpu: "2"
+  # requests:
+  #   memory: 4608Mi
+  #   cpu: "500m"
+
+# Non-secret engine tunables — see docs/api.md / CLAUDE.md for details.
+env:
+  dimension: 128
+  mapSizeMb: 4096
+  requestTimeoutSecs: 600
+  logLevel: info
+
+# HTTP Basic Auth admin bootstrap. Auth is on by default; the engine
+# refuses to run without credentials or an explicit opt-out.
+auth:
+  # Preferred: point at a Secret you create/manage yourself (e.g. via
+  # your GitOps/secrets tooling) with keys HEATHER_ADMIN_USER and
+  # HEATHER_ADMIN_PASSWORD (key names configurable below).
+  existingSecret: ""
+  existingSecretUsernameKey: HEATHER_ADMIN_USER
+  existingSecretPasswordKey: HEATHER_ADMIN_PASSWORD
+
+  # Fallback: let the chart create the Secret from these values. Only
+  # sensible for local/dev clusters — Helm values land in `helm get
+  # values` / release history in plaintext. Leave auth.password empty
+  # (with existingSecret also empty) to fall back to the engine's
+  # own random-admin-password-on-first-boot path — retrieve it with
+  # `kubectl logs <pod> | grep -A8 first-boot`, then rotate via
+  # `kubectl exec <pod> -- heather user passwd admin --password '...'`.
+  username: admin
+  password: ""
+
+  # DEV ONLY. Skips auth entirely; the engine logs a loud warning at
+  # boot. Never set this on a cluster reachable outside a trusted
+  # network.
+  disabled: false
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: heatherdb.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  # - secretName: heatherdb-tls
+  #   hosts:
+  #     - heatherdb.example.com
+
+podAnnotations: {}
+
+podSecurityContext:
+  fsGroup: 65532
+
+# Matches the Dockerfile's non-root `heatherdb` user (uid/gid 65532).
+securityContext:
+  runAsUser: 65532
+  runAsGroup: 65532
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false   # LMDB env lives under the mounted PVC; no other writes needed, but left off by default to avoid surprises with future features
+  capabilities:
+    drop: ["ALL"]
+
+# httpGet /health — same endpoint the Dockerfile's own HEALTHCHECK uses.
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 15
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
