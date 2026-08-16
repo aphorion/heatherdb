@@ -28,18 +28,17 @@ FROM rust:1.97-bookworm AS builder
 
 WORKDIR /src
 
-# Cache deps separately — copy manifests first. The four crates listed
+# Cache deps separately — copy manifests first. The three crates listed
 # in the workspace `members` field of the root Cargo.toml.
 COPY Cargo.toml Cargo.lock ./
 COPY heather_db/Cargo.toml      ./heather_db/
 COPY heather_server/Cargo.toml  ./heather_server/
 COPY heather_algebra/Cargo.toml ./heather_algebra/
-COPY heather_fornix/Cargo.toml  ./heather_fornix/
 
 # Stub mains so dep resolution succeeds before the real source lands.
-RUN mkdir -p heather_db/src heather_server/src heather_algebra/src heather_fornix/src \
+RUN mkdir -p heather_db/src heather_server/src heather_algebra/src \
  && echo "fn main() {}"     > heather_server/src/main.rs \
- && for c in heather_db heather_algebra heather_fornix; do \
+ && for c in heather_db heather_algebra; do \
       echo "pub fn _stub() {}" > $c/src/lib.rs; \
     done \
  && cargo build --release -p heather_server || true
@@ -48,7 +47,6 @@ RUN mkdir -p heather_db/src heather_server/src heather_algebra/src heather_forni
 COPY heather_db       ./heather_db
 COPY heather_server   ./heather_server
 COPY heather_algebra  ./heather_algebra
-COPY heather_fornix   ./heather_fornix
 
 # Force rebuild of the stub-replaced crates.
 # The crate is named `heather_server` but its binary is `heather`
@@ -61,8 +59,8 @@ RUN touch heather_db/src/lib.rs heather_server/src/main.rs \
 FROM debian:bookworm-slim AS runtime
 
 # LMDB needs no system libs at runtime — heed bundles it. We only pull in
-# ca-certificates so HEATHER_FORNIX or future outbound calls work, and tini for
-# correct signal handling.
+# ca-certificates for outbound TLS calls, and tini for correct signal
+# handling.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates tini curl \
  && rm -rf /var/lib/apt/lists/*
