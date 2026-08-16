@@ -20,6 +20,28 @@ pub struct VecPairRequest {
     pub eps: Option<f64>,
 }
 
+/// One term of a weighted superposition: a vector and how much of the
+/// bundle's budget it takes. `weight` defaults to 1.0 — an unweighted
+/// bundle is the plain set superposition.
+#[derive(Debug, Deserialize)]
+pub struct BundleTerm {
+    pub vector: Vec<f64>,
+    #[serde(default = "default_weight")]
+    pub weight: f64,
+}
+
+fn default_weight() -> f64 {
+    1.0
+}
+
+/// Weighted superposition for `/vec/bundle`: `Σ weightᵢ · vectorᵢ`,
+/// L2-normalised unless `normalize` is explicitly false.
+#[derive(Debug, Deserialize)]
+pub struct BundleRequest {
+    pub terms: Vec<BundleTerm>,
+    pub normalize: Option<bool>,
+}
+
 /// One raw vector and a real exponent for `/vec/pow` (spectral power).
 #[derive(Debug, Deserialize)]
 pub struct VecPowRequest {
@@ -588,6 +610,27 @@ mod tests {
             body["contributors"],
             serde_json::json!([{ "id": 7, "similarity": 0.9, "weight": 1.0 }])
         );
+    }
+
+    /// `/vec/bundle`: `weight` defaults to 1.0 per term and `normalize` is
+    /// optional, so the minimal body is just a list of vectors.
+    #[test]
+    fn bundle_request_weight_defaults_to_one() {
+        let bare: BundleRequest = serde_json::from_value(serde_json::json!({
+            "terms": [{"vector": [1.0, 0.0]}, {"vector": [0.0, 1.0], "weight": 3.0}],
+        }))
+        .unwrap();
+        assert!(bare.normalize.is_none());
+        assert_eq!(bare.terms[0].weight, 1.0);
+        assert_eq!(bare.terms[1].weight, 3.0);
+
+        let explicit: BundleRequest = serde_json::from_value(serde_json::json!({
+            "terms": [{"vector": [1.0], "weight": -2.0}],
+            "normalize": false,
+        }))
+        .unwrap();
+        assert_eq!(explicit.normalize, Some(false));
+        assert_eq!(explicit.terms[0].weight, -2.0);
     }
 
     #[test]
