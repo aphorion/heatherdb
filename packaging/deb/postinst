@@ -1,0 +1,45 @@
+#!/bin/sh
+# postinst for heatherdb.deb — create the service account, data dir, and a
+# default env file on first install; enable (but don't start) the systemd
+# unit. Idempotent: safe on upgrade too.
+set -e
+
+case "$1" in
+  configure)
+    if ! getent group heatherdb >/dev/null 2>&1; then
+      addgroup --system heatherdb
+    fi
+    if ! getent passwd heatherdb >/dev/null 2>&1; then
+      adduser --system --ingroup heatherdb --home /var/lib/heatherdb \
+        --no-create-home --shell /usr/sbin/nologin heatherdb
+    fi
+
+    mkdir -p /var/lib/heatherdb
+    chown heatherdb:heatherdb /var/lib/heatherdb
+    chmod 750 /var/lib/heatherdb
+
+    mkdir -p /etc/heatherdb
+    if [ ! -e /etc/heatherdb/env ]; then
+      GEN_PASSWORD="$(head -c18 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c24)"
+      cat > /etc/heatherdb/env <<EOF
+# HeatherDB environment overrides — edit, then \`systemctl restart heatherdb\`.
+# Generated on install: $(date -u +%Y-%m-%dT%H:%M:%SZ)
+HEATHER_ADMIN_USER=admin
+HEATHER_ADMIN_PASSWORD=${GEN_PASSWORD}
+EOF
+      chmod 600 /etc/heatherdb/env
+      chown heatherdb:heatherdb /etc/heatherdb/env
+      echo "heatherdb: generated admin credentials in /etc/heatherdb/env (admin / ${GEN_PASSWORD})"
+      echo "heatherdb: rotate the password after first login."
+    fi
+    ;;
+esac
+
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable heatherdb.service >/dev/null 2>&1 || true
+  # Don't auto-start: first boot needs an operator to review
+  # /etc/heatherdb/env (dimension, generated admin password) first.
+fi
+
+exit 0
