@@ -1,15 +1,26 @@
 name: Docker
 
-# Build and publish multi-arch container images to ghcr.io.
+# Build and publish multi-arch container images to ghcr.io and, if
+# DOCKERHUB_USERNAME/DOCKERHUB_TOKEN secrets are configured, Docker Hub too
+# (docker.io/aphorion/heatherdb) — the postgres-style `docker pull
+# aphorion/heatherdb` path, no ghcr.io auth required.
 #
 # Triggers:
-#   - push to main:        ghcr.io/<owner>/heather-db:edge
-#   - push tag v*.*.*:     ghcr.io/<owner>/heather-db:vX.Y.Z + :vX.Y + :latest
+#   - push to main:        <registry>/heather-db:edge      (+ heatherdb on Hub)
+#   - push tag v*.*.*:     <registry>/...:vX.Y.Z + :vX.Y + :latest
 #   - PR (build only, no push) so we catch Dockerfile breakage early
 #
 # Architectures: linux/amd64 + linux/arm64 (covers VPS + Pi 5 + most clouds).
 #
-# GHCR uses the workflow's auto-generated GITHUB_TOKEN — no extra secret needed.
+# GHCR uses the workflow's auto-generated GITHUB_TOKEN — no extra secret
+# needed. Docker Hub needs two repo secrets:
+#   DOCKERHUB_USERNAME   the pushing account/org
+#   DOCKERHUB_TOKEN      an access token (Docker Hub → Account Settings →
+#                        Security → New Access Token), NOT the account password
+# The Docker Hub repo (aphorion/heatherdb) must exist already — create it
+# manually first and set its visibility (private for now), since a
+# first-push auto-create defaults to public. Until both secrets are set,
+# the Docker Hub steps below no-op — GHCR publishing is unaffected.
 
 on:
   push:
@@ -36,6 +47,7 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository_owner }}/heather-db
+  DOCKERHUB_IMAGE: aphorion/heatherdb
 
 jobs:
   build:
@@ -61,6 +73,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      # Docker Hub push is opt-in: only fires once both secrets exist, so
+      # this workflow keeps working (GHCR-only) before they're configured.
+      - name: Check for Docker Hub credentials
+        id: dockerhub
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -n "$DOCKERHUB_USERNAME" ] && [ -n "$DOCKERHUB_TOKEN" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to Docker Hub
+        if: github.event_name != 'pull_request' && steps.dockerhub.outputs.enabled == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
       # Generate the tag set + OCI labels from refs.
       #   - main          → :edge + :sha-<short>
       #   - v1.2.3        → :v1.2.3 + :v1.2 + :latest
@@ -69,7 +102,9 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+            ${{ steps.dockerhub.outputs.enabled == 'true' && env.DOCKERHUB_IMAGE || '' }}
           tags: |
             type=ref,event=pr
             type=ref,event=branch,enable=${{ github.ref == 'refs/heads/main' }},priority=900,prefix=,suffix=,value=edge
