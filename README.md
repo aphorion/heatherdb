@@ -552,24 +552,15 @@ heather_db/
 
 ## Documentation
 
-Operator-grade docs live in [`docs/`](./docs/):
-
-| | |
-|---|---|
-| [Getting started](./docs/getting-started.md)         | Install → first authenticated request → first multi-DB setup |
-| [Authentication](./docs/auth.md)                     | HTTP Basic + scopes + the `user` CLI + **TLS guidance** |
-| [Databases](./docs/databases.md)                     | Multi-tenancy, per-DB dimensions, lifecycle, backup |
-| [HTTP API](./docs/api.md)                            | Every route, scope rules per endpoint, error matrix |
-| [Operations](./docs/operations.md)                   | Deploy / monitor / back up / upgrade |
-| [Fovea operator GUI](./docs/fovea.md)                | Desktop + web modes, all screens, state files |
-| [RFC 0001 — Multi-tenancy](./docs/0001-multi-tenancy.md) | Why the database layer exists, design tradeoffs |
+The in-repo `docs/` tree has been retired pending a proper docs rewrite —
+none of the links below exist yet. Until that lands, the HTTP API is
+self-describing (see the route handlers under `heather_server/src/`) and
+`deploy/README.md` covers the deploy path.
 
 ## Inside this repo
 
-- **`heather_db/`** · **`heather_server/`** · **`heather_algebra/`** · **`heather_fornix/`** — the engine (Rust workspace).
-- **`fovea/`** — the operator GUI (Tauri 2 + React 19). Run `npm run tauri:dev` for the desktop app, or `docker compose up` to get the web build alongside the engine. See [fovea/README.md](./fovea/README.md).
+- **`heather_db/`** · **`heather_server/`** · **`heather_algebra/`** — the engine (Rust workspace).
 - **`deploy/`** — `deploy/deploy` script for in-VPS deploys + the systemd unit.
-- **`docs/`** — RFCs and architecture notes.
 
 ## Related repos
 

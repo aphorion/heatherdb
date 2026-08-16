@@ -17,19 +17,8 @@ target/
 .gitignore
 .github/
 
-# Docs / sample projects (not needed in the image)
+# Docs (not needed in the image)
 *.md
-sample_projects/
-zero-shot-capability.md
-
-# heather_cortex is a Node sample app, not a Rust workspace member.
-# Excluding it keeps the build context small and avoids accidentally
-# shipping its node_modules into the image.
-
-# Fovea has its own Dockerfile (fovea/Dockerfile). The engine's Dockerfile
-# doesn't need any of fovea's source — exclude it from the engine build
-# context to keep it small.
-fovea/
 
 # Local data dirs
 data/

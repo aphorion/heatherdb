@@ -5,22 +5,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Repository orientation
 
 HeatherDB is a Rust HTTP database that stores vectors in an Adaptive Elastic
-Associative Memory. The repo holds **the engine + the operator GUI**:
+Associative Memory. The repo holds **the engine**:
 
 - **Rust workspace** at the root — engine library, HTTP server, vector
-  algebra, model-ingestion CLI (`Cargo.toml` lists 4 members).
-- **`fovea/`** — a Tauri 2 + React 19 desktop app. **Deliberately excluded
-  from the workspace** via `exclude = ["fovea/src-tauri"]` because it has
-  its own resolver, deps, and build cadence. Touching the engine workspace
-  doesn't touch Fovea and vice versa.
-- **`docs/`** — operator-grade documentation; `docs/README.md` is the
-  index. Always cross-link these instead of restating their content.
+  algebra (`Cargo.toml` lists 3 members).
 - **`deploy/`** — `deploy/deploy` is a self-contained in-VPS install
   script + the systemd unit it drops.
 
-The deeper "why does this look like this" answers live in
-`docs/0001-multi-tenancy.md`. Read that before refactoring anything in
-`heather_db::server` or `heather_server::routes_db`.
+`docs/`, `fovea/` (the Tauri operator GUI), and `heather_fornix/`
+(model-ingestion CLI) have been removed pending a rewrite — don't
+reintroduce references to them without checking they actually exist first.
 
 ## Common commands
 
@@ -74,29 +68,12 @@ heather --data-dir DIR snapshot {list,delete NAME}      # $DATA/snapshots/
 copy via `Env::copy_to_file`). `backup` is cold; `restore` requires
 the engine stopped (LMDB lock).
 
-### Fovea (separate sub-project)
-
-```bash
-cd fovea
-npm install
-npx tauri icon src-tauri/icons/icon.svg     # one-time, generates platform icons
-npm run tauri:dev                            # desktop dev shell (recommended)
-npm run dev                                  # browser-only iteration (CORS may bite)
-npm run build                                # web bundle to dist/
-npm run tauri:build                          # signed installable
-```
-
-Type-check before claiming a Fovea change works: `cd fovea && npx tsc -b`.
-
 ### Docker
 
 ```bash
-docker compose up -d            # builds engine + (optional) fovea container
+docker compose up -d            # builds and runs the engine
 docker compose logs -f
 ```
-
-The `fovea` service may be commented out in `docker-compose.yml` — leave
-it however the user has it.
 
 **Production target is Coolify** (self-hosted PaaS, Docker-Compose
 runner). The compose file is already Coolify-friendly: every tunable
@@ -104,7 +81,6 @@ is `${VAR:-default}` so Coolify's UI can override; named volume
 `heatherdb_data` maps to Coolify's persistent storage; healthcheck
 drives Coolify's app-up status. Don't introduce host-port hardcoding
 or hostname assumptions that would break behind Coolify's Traefik.
-Full guide: `docs/coolify.md`.
 
 ## Architecture (the bits that span files)
 
@@ -121,7 +97,6 @@ Full guide: `docs/coolify.md`.
 - **`heather_algebra`** — energy-correct vector algebra ops (`add`,
   `sub`, `scale`, `intersect`). Owns `EAMSnapshot` for ferrying state
   between collections.
-- **`heather_fornix`** — model-ingestion (Pinecone/Weaviate/etc. → Heather).
 
 ### The route-table dual-router pattern (the most likely thing to confuse you)
 
@@ -182,17 +157,14 @@ _trash/                  # dropped DBs land here (recoverable by mv-back)
 `.github/workflows/`:
 - **ci.yml** — `fmt → clippy → test` across Linux/macOS/Windows × stable+beta,
   plus `doc`, `audit`, `msrv` (1.84 — required by `resolver = "3"`).
-- **release.yml** — fires on `v*.*.*` tags. Builds 8 targets including
-  **freebsd-x86_64** (via `vmactions/freebsd-vm@v1`). Cosign-signs every
-  pushed tag.
+- **release.yml** — fires on `v*.*.*` tags. Builds 4 Linux targets
+  (x86_64/aarch64 × gnu/musl).
 - **docker.yml** — multi-arch (amd64+arm64) image to `ghcr.io`.
 
 ## Things that will trip you up
 
 - **`heather_server` has no library target.** `cargo test -p heather_server --lib`
   fails. Use `--bin heather` to run its tests.
-- **The workspace excludes `fovea/src-tauri`.** Adding it back will
-  break `cargo check` (different Rust resolver, different deps).
 - **Dimension is immutable per-DB.** Engine refuses to load a
   collection at a dimension that doesn't match `db.toml`. To change,
   create a new DB and re-write data.
@@ -202,9 +174,9 @@ _trash/                  # dropped DBs land here (recoverable by mv-back)
 - **Pre-1.0**: no migration code anywhere. Per the user's standing
   policy, fresh-start changes are fine; don't write migration shims
   unless asked.
-- **`heather_fornix` and the older `heather_algebra` glue** existed
-  before multi-tenancy — when adding new APIs, mirror the
-  `routes.rs` / `routes_db.rs` dual-router pattern.
+- **The older `heather_algebra` glue** existed before multi-tenancy —
+  when adding new APIs, mirror the `routes.rs` / `routes_db.rs`
+  dual-router pattern.
 
 ## Sibling repos (referenced from this code, not vendored)
 
