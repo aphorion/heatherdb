@@ -1,0 +1,86 @@
+# syntax=docker/dockerfile:1.7
+#
+# HeatherDB — production image, thin/pre-built variant
+# ──────────────────────────────────────────────────────
+# Companion to `Dockerfile`. Used by .github/workflows/docker.yml: the
+# `heather` binary for each target architecture is cross-compiled OUTSIDE
+# this build (via `cross`, mirroring release.yml's approach) and staged at
+# dist/linux-<arch>/heather *before* `docker buildx build` runs. This
+# Dockerfile only copies the pre-built binary and assembles the runtime
+# image — no `cargo build`/`rustc` invocation happens inside it, so
+# building the arm64 image never compiles Rust under QEMU emulation.
+# (QEMU is still used for the couple of `apt-get install` calls in the
+# arm64 build — those are seconds, not the ~15 minutes a QEMU-emulated
+# Rust compile costs.)
+#
+# Expects, relative to the build context:
+#   dist/linux-amd64/heather
+#   dist/linux-arm64/heather
+# populated by the cross-build job in docker.yml (or manually for local
+# testing — see below).
+#
+# Build (multi-arch, after both dist/linux-<arch>/heather exist):
+#   docker buildx build --platform linux/amd64,linux/arm64 \
+#     -f Dockerfile.slim -t heatherdb:latest --load .
+#
+# Build (local single-arch smoke test):
+#   cross build --release --target x86_64-unknown-linux-gnu -p heather_server
+#   mkdir -p dist/linux-amd64
+#   cp target/x86_64-unknown-linux-gnu/release/heather dist/linux-amd64/heather
+#   docker build -f Dockerfile.slim -t heatherdb:test .
+
+# NOTE on base image: this must ship a glibc new enough for whatever
+# cross-rs's `:main` toolchain images link against, since the binary is
+# copied in pre-built rather than compiled here. As of writing, cross-rs's
+# x86_64/aarch64-unknown-linux-gnu `:main` images are Ubuntu 24.04
+# (glibc 2.39) — newer than debian:bookworm-slim's glibc 2.36, which fails
+# at runtime with "GLIBC_2.38 not found". Verified locally: a
+# cross-built binary run against debian:bookworm-slim crashes immediately;
+# the same binary against ubuntu:24.04 runs cleanly. Keep this base in
+# sync with whatever OS cross-rs's default gnu images use.
+FROM ubuntu:24.04 AS runtime
+
+# Set automatically by buildx per --platform target (e.g. "amd64", "arm64").
+ARG TARGETARCH
+ARG DEBIAN_FRONTEND=noninteractive
+
+# LMDB needs no system libs at runtime — heed bundles it. We only pull in
+# ca-certificates so HEATHER_FORNIX or future outbound calls work, and tini
+# for correct signal handling.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates tini curl \
+ && rm -rf /var/lib/apt/lists/*
+
+# Non-root user owns the data dir.
+RUN groupadd --system --gid 65532 heatherdb \
+ && useradd  --system --gid heatherdb --uid 65532 \
+       --home-dir /var/lib/heatherdb --shell /usr/sbin/nologin heatherdb \
+ && mkdir -p /var/lib/heatherdb \
+ && chown -R heatherdb:heatherdb /var/lib/heatherdb
+
+COPY dist/linux-${TARGETARCH}/heather /usr/local/bin/heather
+RUN chmod +x /usr/local/bin/heather
+
+ENV HEATHER_DATA_DIR=/var/lib/heatherdb \
+    HEATHER_DIMENSION=128 \
+    HEATHER_HOST=0.0.0.0 \
+    HEATHER_PORT=6380 \
+    HEATHER_MAP_SIZE_MB=4096 \
+    HEATHER_REQUEST_TIMEOUT=600 \
+    RUST_LOG=info
+# AUTH IS ON BY DEFAULT. On a fresh data-volume the engine mints an
+# `admin` user with a random password and prints it ONCE on stderr —
+# `docker logs heatherdb 2>&1 | grep -A8 first-boot` to retrieve.
+# Override by passing on `docker run`:
+#   -e HEATHER_ADMIN_USER=admin -e HEATHER_ADMIN_PASSWORD='<your-pw>'
+# Or disable entirely (DEV ONLY):
+#   -e HEATHER_AUTH_DISABLED=1
+
+VOLUME ["/var/lib/heatherdb"]
+EXPOSE 6380
+USER heatherdb
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -fsS http://127.0.0.1:6380/health || exit 1
+
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/heather"]
