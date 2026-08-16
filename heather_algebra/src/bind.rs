@@ -203,6 +203,64 @@ pub fn bind_vec(a: &[f64], b: &[f64]) -> Vec<f64> {
     raw.iter().map(|x| x / n).collect()
 }
 
+/// Weighted superposition (bundling): `Σ weightᵢ · vectorᵢ`, optionally
+/// L2-normalised.
+///
+/// Bundling is the other half of the VSA algebra: [`bind_vec`] makes a
+/// role/filler pair, bundling collects the pairs into one composite —
+/// `doc = normalize(Σ wᵢ · bind(roleᵢ, fillerᵢ))`. The weights are not
+/// decoration. They set how much of the composite's unit budget each slot
+/// family occupies, and therefore how strongly a query of that family
+/// resonates with the whole; the optimum is interior, so both under- and
+/// over-weighting a slot cost recall. Negative weights are legal and mean
+/// subtraction — the superposition is a linear space, not a multiset.
+///
+/// All vectors must share a length. Non-finite components or weights are
+/// rejected rather than propagated. With `normalize` set and a
+/// superposition that cancels to (numerically) zero, the zero vector is
+/// returned as-is: there is no direction left to normalise onto.
+pub fn bundle_vec(vectors: &[&[f64]], weights: &[f64], normalize: bool) -> Result<Vec<f64>> {
+    if vectors.is_empty() {
+        return Err(AlgebraError::EmptyBundle);
+    }
+    if weights.len() != vectors.len() {
+        return Err(AlgebraError::InvalidScalar(format!(
+            "bundle needs one weight per vector, got {} weights for {} vectors",
+            weights.len(),
+            vectors.len()
+        )));
+    }
+
+    let d = vectors[0].len();
+    if d == 0 {
+        return Err(AlgebraError::EmptyBundle);
+    }
+    for v in vectors {
+        if v.len() != d {
+            return Err(AlgebraError::DimensionMismatch {
+                left: d,
+                right: v.len(),
+            });
+        }
+        if v.iter().any(|x| !x.is_finite()) {
+            return Err(AlgebraError::InvalidScalar(
+                "bundle vectors must be finite".into(),
+            ));
+        }
+    }
+    if let Some(w) = weights.iter().find(|w| !w.is_finite()) {
+        return Err(AlgebraError::InvalidScalar(format!(
+            "bundle weights must be finite, got {w}"
+        )));
+    }
+
+    let sum = vec_ops::weighted_sum(vectors, weights);
+    if !normalize {
+        return Ok(sum);
+    }
+    Ok(vec_ops::normalize(&sum))
+}
+
 /// Pairwise bind of two snapshots: for each (loc_a, loc_b), produce a
 /// new location whose pattern is `bind(pattern_a, pattern_b)`. Up to
 /// `|A| · |B|` locations, minus any whose binding norm collapsed.
@@ -656,6 +714,102 @@ mod tests {
         assert!(rec.iter().all(|x| x.is_finite()));
         let sim = vec_ops::cosine_similarity(&rec, &filler);
         assert!(sim > 0.99, "sim={sim}");
+    }
+
+    #[test]
+    fn bundle_is_the_weighted_sum_it_says_it_is() {
+        // normalize: false is the raw Σ wᵢ·vᵢ, componentwise.
+        let a = [1.0, 0.0, 2.0];
+        let b = [0.0, 1.0, 1.0];
+        let out = bundle_vec(&[&a[..], &b[..]], &[2.0, -0.5], false).unwrap();
+        let expect = [2.0, -0.5, 3.5];
+        for (x, y) in out.iter().zip(expect.iter()) {
+            assert!((x - y).abs() < 1e-12, "bundle={x} expected={y}");
+        }
+
+        // normalize: true is the same direction, unit norm.
+        let unit = bundle_vec(&[&a[..], &b[..]], &[2.0, -0.5], true).unwrap();
+        assert!((vec_ops::l2_norm(&unit) - 1.0).abs() < 1e-12);
+        assert!(vec_ops::cosine_similarity(&unit, &out) > 1.0 - 1e-12);
+    }
+
+    #[test]
+    fn bundle_defaults_and_negative_weights() {
+        // Unit weights bundle a set; a negative weight subtracts a member,
+        // so bundling a vector back out leaves the rest.
+        let d = 4;
+        let a = [1.0, 0.0, 0.0, 0.0];
+        let b = [0.0, 1.0, 0.0, 0.0];
+        let both = bundle_vec(&[&a[..], &b[..]], &[1.0, 1.0], false).unwrap();
+        let back = bundle_vec(&[&both[..], &b[..]], &[1.0, -1.0], false).unwrap();
+        assert_eq!(back.len(), d);
+        for (x, y) in back.iter().zip(a.iter()) {
+            assert!((x - y).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn bundle_weight_steers_which_slot_a_query_resonates_with() {
+        // The composition the weights exist for: doc = Σ wᵢ·bind(roleᵢ, fillerᵢ).
+        // Up-weighting one slot raises that slot's unbound recovery and lowers
+        // the others' — the knob a study measured as load-bearing.
+        let d = 512;
+        let mut rng = StdRng::seed_from_u64(21);
+        let (r_text, f_text) = (rand_unit(d, &mut rng), rand_unit(d, &mut rng));
+        let (r_year, f_year) = (rand_unit(d, &mut rng), rand_unit(d, &mut rng));
+
+        let text = bind_vec(&r_text, &f_text);
+        let year = bind_vec(&r_year, &f_year);
+
+        let sim_at = |w_text: f64| {
+            let doc = bundle_vec(&[&text[..], &year[..]], &[w_text, 1.0], true).unwrap();
+            (
+                vec_ops::cosine_similarity(&unbind_vec(&doc, &r_text), &f_text),
+                vec_ops::cosine_similarity(&unbind_vec(&doc, &r_year), &f_year),
+            )
+        };
+
+        let (flat_text, flat_year) = sim_at(1.0);
+        let (heavy_text, heavy_year) = sim_at(3.0);
+        assert!(
+            heavy_text > flat_text,
+            "weighting the text slot must raise its recovery: {heavy_text} vs {flat_text}"
+        );
+        assert!(
+            heavy_year < flat_year,
+            "the budget is shared: {heavy_year} vs {flat_year}"
+        );
+    }
+
+    #[test]
+    fn bundle_rejects_malformed_input() {
+        let a = [1.0, 0.0];
+        let short = [1.0];
+        assert!(bundle_vec(&[], &[], true).is_err(), "empty terms");
+        assert!(
+            bundle_vec(&[&a[..], &short[..]], &[1.0, 1.0], true).is_err(),
+            "ragged lengths"
+        );
+        assert!(
+            bundle_vec(&[&a[..]], &[1.0, 1.0], true).is_err(),
+            "weight count must match"
+        );
+        assert!(
+            bundle_vec(&[&a[..]], &[f64::NAN], true).is_err(),
+            "non-finite weight"
+        );
+        let bad = [1.0, f64::INFINITY];
+        assert!(
+            bundle_vec(&[&bad[..]], &[1.0], true).is_err(),
+            "non-finite component"
+        );
+    }
+
+    #[test]
+    fn bundle_cancellation_returns_zero_not_nan() {
+        let a = [1.0, 2.0, 3.0];
+        let out = bundle_vec(&[&a[..], &a[..]], &[1.0, -1.0], true).unwrap();
+        assert!(out.iter().all(|x| x.is_finite() && x.abs() < 1e-12));
     }
 
     #[test]
