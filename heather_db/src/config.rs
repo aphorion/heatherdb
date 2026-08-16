@@ -26,7 +26,9 @@ pub struct EAMConfig {
     pub gamma: f64,
     /// Damping time constant for learning rate
     pub tau_damp: f64,
-    /// Overload split threshold (write count)
+    /// Overload split threshold (write count). Default tracks the per-read
+    /// capacity wall ≈ d/32: a saturating location splits as it reaches the
+    /// wall rather than well past it. Override per-DB for non-default β.
     pub tau_overload: f64,
     /// Inverse temperature for softmax
     pub beta: f64,
@@ -92,7 +94,9 @@ impl EAMConfig {
             tau_merge: 0.95,
             gamma: 1.0,
             tau_damp: 10.0,
-            tau_overload: 100.0,
+            // Capacity-derived: the ≥90%-recall budget is ≈ d/32 (measured),
+            // floored so low-d collections still tolerate small superpositions.
+            tau_overload: (d as f64 / 32.0).max(8.0),
             beta: 5.0,
             t_max: 10,
             epsilon: 1e-6,
@@ -230,5 +234,15 @@ mod tests {
         config.tau_split = 0.95;
         config.tau_merge = 0.3;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_tau_overload_tracks_capacity_wall() {
+        // ≈ d/32 (the measured per-read capacity budget), floored at 8.
+        assert_eq!(EAMConfig::new(1024).unwrap().tau_overload, 32.0);
+        assert_eq!(EAMConfig::new(512).unwrap().tau_overload, 16.0);
+        assert_eq!(EAMConfig::new(64).unwrap().tau_overload, 8.0); // floor
+        // dimension-aware: never the old dimension-blind 100.
+        assert!(EAMConfig::new(2048).unwrap().tau_overload < 100.0);
     }
 }
