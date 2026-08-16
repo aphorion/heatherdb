@@ -63,10 +63,41 @@ pub struct AttentionRequest {
     pub exclude_id: Option<usize>,
 }
 
+/// One location's contribution to an attention read. Field names match
+/// [`ActivatedLocationItem`] (the `analyze` response) on purpose, but
+/// `similarity` here is the raw dot product `Q·Kᵢ`, not a cosine.
+#[derive(Debug, Serialize)]
+pub struct AttentionContributorItem {
+    pub id: usize,
+    pub similarity: f64,
+    pub weight: f64,
+}
+
 #[derive(Debug, Serialize)]
 pub struct AttentionResponse {
     pub result: Vec<f64>,
     pub beta: f64,
+    /// The locations that produced `result`, descending by weight. Additive
+    /// field — clients that ignore it see the response they always saw.
+    pub contributors: Vec<AttentionContributorItem>,
+}
+
+/// Self-calibrating attention read: no `scale`, because the temperature is
+/// chosen by minimum description length from the activated keys' geometry.
+#[derive(Debug, Deserialize)]
+pub struct AttentionMdlRequest {
+    pub query: Vec<f64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttentionMdlResponse {
+    pub result: Vec<f64>,
+    /// The temperature the engine selected for this query, not one supplied.
+    pub beta: f64,
+    pub contributors: Vec<AttentionContributorItem>,
+    /// Normalised Shannon entropy of the weights, `-Σ w·ln w / ln n`, in
+    /// `0..1` (0 when fewer than two contributors). Reported, never acted on.
+    pub entropy: f64,
 }
 
 /// Calibrate the attention temperature by leave-one-out value-reconstruction
@@ -505,6 +536,59 @@ pub struct ComposeReadResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `contributors` is additive: the fields old clients read are unchanged
+    /// and still first-class, and each contributor carries id/similarity/weight.
+    #[test]
+    fn attention_response_carries_contributors() {
+        let body = serde_json::to_value(AttentionResponse {
+            result: vec![1.0, 0.0],
+            beta: 0.25,
+            contributors: vec![AttentionContributorItem {
+                id: 7,
+                similarity: 0.9,
+                weight: 0.75,
+            }],
+        })
+        .unwrap();
+        assert_eq!(body["result"], serde_json::json!([1.0, 0.0]));
+        assert_eq!(body["beta"], serde_json::json!(0.25));
+        assert_eq!(
+            body["contributors"],
+            serde_json::json!([{ "id": 7, "similarity": 0.9, "weight": 0.75 }])
+        );
+    }
+
+    /// The MDL read takes a query and nothing else — no temperature, no
+    /// threshold — and answers with the β it picked plus the gate scalars.
+    #[test]
+    fn attention_mdl_wire_shape() {
+        let req: AttentionMdlRequest =
+            serde_json::from_value(serde_json::json!({"query": [0.0, 1.0]})).unwrap();
+        assert_eq!(req.query.len(), 2);
+        // A stray `scale` is ignored rather than mistaken for a knob.
+        let with_scale: AttentionMdlRequest =
+            serde_json::from_value(serde_json::json!({"query": [0.0, 1.0], "scale": 4.0})).unwrap();
+        assert_eq!(with_scale.query.len(), 2);
+
+        let body = serde_json::to_value(AttentionMdlResponse {
+            result: vec![1.0, 0.0],
+            beta: 12.5,
+            contributors: vec![AttentionContributorItem {
+                id: 7,
+                similarity: 0.9,
+                weight: 1.0,
+            }],
+            entropy: 0.0,
+        })
+        .unwrap();
+        assert_eq!(body["beta"], serde_json::json!(12.5));
+        assert_eq!(body["entropy"], serde_json::json!(0.0));
+        assert_eq!(
+            body["contributors"],
+            serde_json::json!([{ "id": 7, "similarity": 0.9, "weight": 1.0 }])
+        );
+    }
 
     #[test]
     fn create_db_request_without_eam_defaults_to_none() {

@@ -292,6 +292,18 @@ pub async fn attention(
     routes::attention(State(hive), Path(col), Json(req)).await
 }
 
+pub async fn attention_mdl(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col)): Path<(String, String)>,
+    Json(req): Json<AttentionMdlRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::attention_mdl(State(hive), Path(col), Json(req)).await
+}
+
 pub async fn calibrate(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
