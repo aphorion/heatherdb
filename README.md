@@ -180,6 +180,41 @@ Energy-correct composition operators on top of the memory, exposed at
 | `pow` | Fractional powers of a bind operator (phase-unwrapped) |
 | `add` / `sub` / `scale` / `intersect` | Direct vector arithmetic |
 
+## What this composes into
+
+`bind`/`unbind`/`bundle` aren't just algebra for its own sake — composed a
+particular way, they turn into capabilities that normally need a training
+loop. This is **research**, in the sibling `heather_research` repo (not
+yet public), not built-in HeatherDB endpoints — but it's built on exactly
+the primitives above, measured against this same engine (see that repo's
+`SKILL.md`: falsifiable, measured-not-asserted, reproducible).
+
+- **Mnemonics** — a family of situations sharing a hidden procedure can be
+  summarized as one transform vector, `M = Σ unbind(procedureᵢ, situationᵢ)`.
+  Filler cancellation inside `unbind` leaves the shared wiring; `bind(M,
+  new_situation)` then *derives* that member's procedure — including
+  members never seen. Measured: 100% held-out derivation vs. 0% for a
+  nearest-neighbor cache, generalization unbounded in family size but
+  bounded by schema complexity at a quadratic wall (`n_slots ≲ √(D/32)`).
+- **World models** — state as a vector, action as a role vector, dynamics
+  as a per-state map `M_s = Σ_a bind(a, s'_a)`. Predicting is reading it;
+  imagining is reading it in a loop; learning is one write per experienced
+  transition, no training loop, no gradient. The `dreamer.py` demo runs
+  this **live against a real HeatherDB engine**: 8,000 wandered steps
+  learn a 5×5 grid's transitions, then the substrate predicts a full
+  held-out rollout (9/9 cells correct) and plans by random-shooting MPC
+  over the learned model.
+- **One law** — surprise = entropy = free energy = description length,
+  one idea running the same engine through association, abstraction,
+  perception, agency, world-modeling, planning, mnemonics,
+  meta-mnemonics, and code self-reconstruction. See `one_law/` in that
+  repo for the live, twelve-act tour.
+
+Every claim there is marked live-confirmed vs. instrument-only, and names
+which branch of this engine it was measured against — worth checking
+before repeating a number, since not everything measured there has landed
+on `main` yet.
+
 ## API reference
 
 The full route table (see `heather_server/src/routes.rs` for exact request/response shapes — the in-repo `docs/` tree is retired pending a rewrite, this is the source of truth today):
