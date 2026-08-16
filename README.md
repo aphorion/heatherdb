@@ -178,6 +178,7 @@ Energy-correct composition operators on top of the memory, exposed at
 | `permute` | Non-commutative binding (order matters — sequences, not just sets) |
 | `bundle` | Weighted superposition of multiple vectors into one |
 | `pow` | Fractional powers of a bind operator (phase-unwrapped) |
+| `rotate` | Continuous (fractional-`t`) generalisation of `permute` — a "dimmer dial" instead of `permute`'s on/off switch |
 | `add` / `sub` / `scale` / `intersect` | Direct vector arithmetic |
 
 ## What this composes into

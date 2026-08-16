@@ -49,6 +49,27 @@ pub struct VecPowRequest {
     pub t: f64,
 }
 
+/// One raw vector and a fractional permutation-cycle rotation for
+/// `/vec/rotate` — the continuous ("dimmer dial") generalisation of
+/// `/algebra/permute`'s integer `power`.
+///
+/// The permutation is identified by exactly one of `seed` (a raw u64) or
+/// `name` (hashed to a seed via SHA-256), matching `/algebra/permute`'s
+/// convention; supplying neither or both is an error.
+#[derive(Debug, Deserialize)]
+pub struct VecRotateRequest {
+    pub a: Vec<f64>,
+    /// Seed for the permutation. Mutually exclusive with `name`.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Name hashed (SHA-256) into a seed. Mutually exclusive with `seed`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Real (possibly fractional) rotation amount. `t=1.0` exactly
+    /// reproduces the discrete permutation; `t=0.0` is the identity.
+    pub t: f64,
+}
+
 /// Knobs for description-length-minimising compression (both optional).
 #[derive(Debug, Default, Deserialize)]
 pub struct CompressRequest {

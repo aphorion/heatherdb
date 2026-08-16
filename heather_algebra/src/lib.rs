@@ -14,6 +14,6 @@ pub use bind::{
 };
 pub use compose::{ComposeDiagnostics, ComposeParams, ComposeResult, compose};
 pub use error::AlgebraError;
-pub use permute::{Permutation, permute, permute_inv, permute_pow, permute_snapshot};
+pub use permute::{Permutation, permute, permute_inv, permute_pow, permute_snapshot, rotate};
 pub use routing::{ComposeReadResult, ComposedEAM, compose_read};
 pub use snapshot::EAMSnapshot;
