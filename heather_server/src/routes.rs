@@ -7,8 +7,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
 use heather_algebra::{
-    EAMSnapshot, bind_vec, circular_convolve, compose_read as algebra_compose_read, ops, pow_vec,
-    unbind_exact_vec, unbind_vec,
+    EAMSnapshot, bind_vec, bundle_vec, circular_convolve, compose_read as algebra_compose_read,
+    ops, pow_vec, unbind_exact_vec, unbind_vec,
 };
 use heather_db::{HardLocation, Hive, LocationId, ReadStrategy, RoleCleanup};
 use rayon::prelude::*;
@@ -61,6 +61,31 @@ pub async fn vec_unbind(Json(req): Json<VecPairRequest>) -> Response {
         Json(serde_json::json!({ "result": result })),
     )
         .into_response()
+}
+
+/// `POST /vec/bundle` — weighted superposition of raw vectors:
+/// `Σ weightᵢ · vectorᵢ`, L2-normalised unless `normalize: false`.
+///
+/// The companion of `/vec/bind`: bind makes a role/filler pair, bundle
+/// combines the pairs into one composite, so a role-filler encoding
+/// (`doc = normalize(Σ wᵢ · bind(roleᵢ, fillerᵢ))`) is expressible against
+/// the engine instead of being reimplemented in every client. Weights may
+/// be negative — that is subtraction, not an error.
+pub async fn vec_bundle(Json(req): Json<BundleRequest>) -> Response {
+    let vectors: Vec<&[f64]> = req.terms.iter().map(|t| t.vector.as_slice()).collect();
+    let weights: Vec<f64> = req.terms.iter().map(|t| t.weight).collect();
+    match bundle_vec(&vectors, &weights, req.normalize.unwrap_or(true)) {
+        Ok(result) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "result": result })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "error": e.to_string() })),
+        )
+            .into_response(),
+    }
 }
 
 /// `POST /vec/pow` — spectral power: `a^⊗t` for real `t`. Integer `t`
@@ -1468,5 +1493,54 @@ pub async fn compose_read(
         }
         Ok(Err(e)) => error_response(StatusCode::BAD_REQUEST, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+
+    async fn body_json(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn bundle_body(v: serde_json::Value) -> BundleRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// The endpoint is the weighted sum it advertises: default weights, an
+    /// explicit weight, and a negative weight (subtraction), unnormalised.
+    #[tokio::test]
+    async fn vec_bundle_sums_with_weights() {
+        let resp = vec_bundle(Json(bundle_body(serde_json::json!({
+            "terms": [
+                {"vector": [1.0, 0.0, 2.0], "weight": 2.0},
+                {"vector": [0.0, 1.0, 1.0], "weight": -0.5},
+            ],
+            "normalize": false,
+        }))))
+        .await;
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"], serde_json::json!([2.0, -0.5, 3.5]));
+    }
+
+    /// A malformed body (ragged vector lengths) surfaces as 400, not a panic.
+    #[tokio::test]
+    async fn vec_bundle_rejects_ragged_terms() {
+        let resp = vec_bundle(Json(bundle_body(serde_json::json!({
+            "terms": [
+                {"vector": [1.0, 0.0]},
+                {"vector": [1.0]},
+            ],
+        }))))
+        .await;
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].is_string());
     }
 }

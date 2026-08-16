@@ -9,8 +9,8 @@ pub mod snapshot;
 mod traits;
 
 pub use bind::{
-    bind, bind_vec, bind_with_limit, circular_convolve, involve, pow_vec, unbind, unbind_exact_vec,
-    unbind_vec,
+    bind, bind_vec, bind_with_limit, bundle_vec, circular_convolve, involve, pow_vec, unbind,
+    unbind_exact_vec, unbind_vec,
 };
 pub use compose::{ComposeDiagnostics, ComposeParams, ComposeResult, compose};
 pub use error::AlgebraError;

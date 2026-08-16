@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "heatherdb.fullname" . }}-config
+  labels:
+    {{- include "heatherdb.labels" . | nindent 4 }}
+data:
+  HEATHER_DATA_DIR: /var/lib/heatherdb
+  HEATHER_HOST: "0.0.0.0"
+  HEATHER_PORT: "6380"
+  HEATHER_DIMENSION: {{ .Values.env.dimension | quote }}
+  HEATHER_MAP_SIZE_MB: {{ .Values.env.mapSizeMb | quote }}
+  HEATHER_REQUEST_TIMEOUT: {{ .Values.env.requestTimeoutSecs | quote }}
+  RUST_LOG: {{ .Values.env.logLevel | quote }}
+  {{- if .Values.auth.disabled }}
+  HEATHER_AUTH_DISABLED: "1"
+  {{- end }}
