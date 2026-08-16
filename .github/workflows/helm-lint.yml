@@ -1,0 +1,60 @@
+name: Helm
+
+# Lints + template-renders the heatherdb chart on any change under
+# charts/. Doesn't need a cluster — `helm lint` + `helm template` are
+# both offline; schema-validity of the rendered output is checked with
+# kubeconform (also offline, bundled k8s OpenAPI schemas).
+
+on:
+  push:
+    branches: [main]
+    paths: ["charts/**", ".github/workflows/helm-lint.yml"]
+  pull_request:
+    paths: ["charts/**", ".github/workflows/helm-lint.yml"]
+  workflow_dispatch:
+
+concurrency:
+  group: helm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: lint + template
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: helm lint
+        run: helm lint charts/heatherdb --strict
+
+      - name: Install kubeconform
+        run: |
+          set -euxo pipefail
+          curl -fsSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+            | tar -xz -C /usr/local/bin kubeconform
+
+      # Render + validate a spread of value combinations, not just the
+      # defaults — the auth/ingress/persistence branches all diverge.
+      - name: Render + validate default values
+        run: |
+          set -euxo pipefail
+          helm template heatherdb charts/heatherdb --set auth.password=ci-lint-only \
+            | kubeconform -summary -strict
+
+      - name: Render + validate existingSecret + ingress + no-persistence
+        run: |
+          set -euxo pipefail
+          helm template heatherdb charts/heatherdb \
+            --set auth.existingSecret=x \
+            --set ingress.enabled=true \
+            --set persistence.enabled=false \
+            | kubeconform -summary -strict
+
+      - name: Render + validate auth.disabled
+        run: |
+          set -euxo pipefail
+          helm template heatherdb charts/heatherdb --set auth.disabled=true \
+            | kubeconform -summary -strict

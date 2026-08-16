@@ -8,6 +8,9 @@ pub enum AlgebraError {
     #[error("empty snapshot: no locations to operate on")]
     EmptySnapshot,
 
+    #[error("empty bundle: no terms to superpose")]
+    EmptyBundle,
+
     #[error("invalid scalar: {0}")]
     InvalidScalar(String),
 
