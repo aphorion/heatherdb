@@ -95,15 +95,23 @@ jobs:
       - run: cargo doc --workspace --no-deps --document-private-items
 
   # ─── audit: cargo-audit nightly DB sweep against Cargo.lock ─────────────────
+  # Plain CLI rather than rustsec/audit-check — that action posts its
+  # findings as a GitHub Check Run, which needs `checks: write`. This repo's
+  # default GITHUB_TOKEN permission is read-only, and a job-level
+  # `permissions:` block can only narrow that, never widen it, so the
+  # action's check-run creation fails outright ("Resource not accessible by
+  # integration") no matter what this workflow declares. `cargo audit`
+  # itself just exits non-zero on a finding — no Checks API involved.
   audit:
     name: audit
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: rustsec/audit-check@v2.0.0
+      - uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+      - run: cargo audit
 
   # ─── msrv: ensure we still build on the documented minimum supported Rust ──
   # Mirrors `rust-version` in every crate's Cargo.toml — keep the two in step.
