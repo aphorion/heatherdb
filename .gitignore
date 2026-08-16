@@ -21,21 +21,3 @@ __pycache__/
 # Claude Code local session/runtime state (scheduled-task locks etc.) —
 # machine-local, not repo content.
 .claude/
-
-# Fovea (sub-app: Tauri 2 + React 19) build artefacts.
-fovea/dist/
-fovea/.vite/
-fovea/.cinema-logs/
-fovea/vite.config.js
-fovea/vite.config.d.ts
-fovea/src-tauri/target/
-fovea/src-tauri/Cargo.lock
-fovea/src-tauri/gen/
-# Generated icons — regenerate via `npx tauri icon src-tauri/icons/icon.svg`
-fovea/src-tauri/icons/32x32.png
-fovea/src-tauri/icons/128x128.png
-fovea/src-tauri/icons/128x128@2x.png
-fovea/src-tauri/icons/icon.icns
-fovea/src-tauri/icons/icon.ico
-fovea/src-tauri/icons/StoreLogo.png
-fovea/src-tauri/icons/Square*.png

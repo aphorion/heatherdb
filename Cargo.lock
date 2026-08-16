@@ -665,17 +665,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "heather_fornix"
-version = "0.2.1"
-dependencies = [
- "anyhow",
- "clap",
- "heather_db",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "heather_server"
 version = "0.2.1"
 dependencies = [

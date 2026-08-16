@@ -6,7 +6,7 @@
 #   • Coolify: import this compose file as a "Docker Compose" application;
 #              set the env vars below in Coolify's UI; assign a domain to
 #              port 6380. Coolify's Traefik proxy fronts the engine with
-#              auto-managed TLS. See docs/coolify.md.
+#              auto-managed TLS.
 #
 # Auth is on by default. Provide credentials via:
 #
