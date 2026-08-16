@@ -239,6 +239,27 @@ impl UserStore {
 
 /* ─── auth-route classifier (unchanged from JSON era) ─────────────────────── */
 
+/// Routes under `/db/{name}/` that a `Database(name)` scope must NOT reach.
+///
+/// The access log is a record of what *every* user of a database searched
+/// for. `Scope::Database(name)` is a data scope shared by every user of that
+/// database — in a knowledge-repository deployment, that is the ordinary
+/// employee scope. Letting it read `/db/{name}/audit` would let any employee
+/// read every colleague's search history over confidential personnel, legal
+/// and financial material; searches over a bid repository leak commercial
+/// intent on their own. `/usage` aggregates the same data and still names
+/// documents and per-user counts, so it is held to the same bar.
+///
+/// The `Scope` enum has two levels and no per-user or role dimension, so it
+/// cannot express "read your own entries but not your colleagues'" or a
+/// dedicated auditor role. Rather than force that into it, these routes are
+/// denied to every non-Root scope.
+fn is_root_only_db_route(tail: &str) -> bool {
+    let seg = tail.strip_prefix('/').unwrap_or(tail);
+    let seg = &seg[..seg.find('/').unwrap_or(seg.len())];
+    matches!(seg, "audit" | "usage")
+}
+
 /// Authorisation check: does `scope` permit access to a request `path`?
 pub fn is_authorized(scope: &Scope, path: &str) -> bool {
     if matches!(scope, Scope::Root) {
@@ -252,6 +273,9 @@ pub fn is_authorized(scope: &Scope, path: &str) -> bool {
     if let Some(rest) = path.strip_prefix("/db/") {
         let segment_end = rest.find('/').unwrap_or(rest.len());
         let route_db = &rest[..segment_end];
+        if is_root_only_db_route(&rest[segment_end..]) {
+            return false;
+        }
         return route_db == db_name;
     }
 
@@ -410,6 +434,28 @@ mod tests {
         assert!(!is_authorized(&s, "/db"));
         assert!(!is_authorized(&s, "/collections/x"));
         assert!(!is_authorized(&s, "/algebra/add"));
+    }
+
+    /// The access log is Root-only, even for the database you own.
+    #[test]
+    fn auth_audit_routes_are_root_only() {
+        for s in [
+            Scope::Database("memoria".into()),
+            Scope::Database("default".into()),
+        ] {
+            assert!(!is_authorized(&s, "/db/memoria/audit"));
+            assert!(!is_authorized(&s, "/db/memoria/usage"));
+            assert!(!is_authorized(&s, "/db/default/audit"));
+            assert!(!is_authorized(&s, "/db/default/usage"));
+        }
+        // Root still reaches them.
+        assert!(is_authorized(&Scope::Root, "/db/memoria/audit"));
+        assert!(is_authorized(&Scope::Root, "/db/memoria/usage"));
+        // And the prefix match doesn't over-reach: a collection *named*
+        // `audit` under /collections/ is ordinary data, not the log.
+        let s = Scope::Database("memoria".into());
+        assert!(is_authorized(&s, "/db/memoria/collections/audit/read"));
+        assert!(is_authorized(&s, "/db/memoria/collections/usage/read"));
     }
 
     #[test]

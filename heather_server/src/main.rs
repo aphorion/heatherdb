@@ -1,3 +1,4 @@
+mod audit;
 mod auth;
 mod backup;
 mod cli;
@@ -330,7 +331,11 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/db", post(routes_db::create_database))
         .route("/db/{db}", get(routes_db::get_database))
         .route("/db/{db}", delete(routes_db::drop_database))
-        .route("/db/{db}/dream", post(dream::trigger));
+        .route("/db/{db}/dream", post(dream::trigger))
+        // Access log. Root-only — enforced in `users::is_authorized`, not
+        // here, because the middleware is the only place that sees the scope.
+        .route("/db/{db}/audit", get(audit::query_audit))
+        .route("/db/{db}/usage", get(audit::usage));
 
     // Scoped /db/{db}/collections/... and /db/{db}/algebra/...
     let db_scoped_router = Router::new()
@@ -458,6 +463,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
     // Idle-time dreaming: reprocess each opted-in database's memory while quiet.
     tokio::spawn(dream::run_dream_loop(server.clone(), last_activity.clone()));
 
+    // Periodic half of the audit flush policy (the other half is the buffer
+    // threshold, tripped on the read path itself).
+    tokio::spawn(audit::run_flush_loop(server.clone()));
+
     // Sweep expired session tokens every 5 minutes.
     {
         let tokens = tokens.clone();
@@ -480,6 +489,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
         eprintln!("server error: {e}");
         return std::process::ExitCode::FAILURE;
     }
+
+    // Graceful shutdown flushes staged audit records, so the "lose the last
+    // few records" trade-off only bites on a hard kill.
+    audit::flush_all(&server).await;
 
     tracing::info!("Server shut down cleanly");
     std::process::ExitCode::SUCCESS

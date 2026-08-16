@@ -33,6 +33,7 @@
 //! [`Hive`] and [`Collection`] are `Send + Sync`. All methods take `&self` —
 //! reads acquire a shared lock, writes acquire an exclusive lock.
 
+pub mod audit;
 pub mod collection;
 pub mod config;
 pub mod db_config;
@@ -46,6 +47,10 @@ pub mod store;
 pub mod vec_ops;
 pub mod write;
 
+pub use audit::{
+    AuditConfig, AuditLog, AuditQuery, AuditRecord, DocumentUsage, NameCount, UsageSummary,
+    query_hash,
+};
 pub use collection::{
     Collection, CompressResult, EAMStats, LocationSummary, MIN_CLEANUP_BETA, MultiRoleHit,
     MultiRoleResults, ReadStrategy, RoleCleanup,
