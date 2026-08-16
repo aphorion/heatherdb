@@ -4,15 +4,24 @@ name: Release
 #
 # Builds the `heather` binary (from the `heather_server` crate) for every
 # supported target, packages each as a .tar.gz, generates SHA-256
-# checksums, and attaches everything to a GitHub Release.
+# checksums, and attaches everything to a GitHub Release. The two glibc
+# targets also get a `.deb` (apt-installable, systemd unit included) —
+# see packaging/deb/.
 #
 # Linux only for now. The macOS, Windows and FreeBSD targets were removed
 # rather than left failing; re-add them to the matrix when they are wanted.
 #
+# All four targets build via `cross` (not bare `cargo build`), including
+# x86_64-gnu — cross's docker images pin an old glibc baseline, which is
+# the whole point: a bare `ubuntu-latest` runner build would link against
+# whatever glibc that runner image ships (often newer than what's on a
+# user's box) and silently produce a binary that only runs on equally new
+# distros.
+#
 # Targets:
-#   linux-x86_64-gnu      Linux glibc 2.31+
+#   linux-x86_64-gnu      Linux glibc 2.31+                 (+ .deb, amd64)
 #   linux-x86_64-musl     Linux static (works on Alpine + everything)
-#   linux-aarch64-gnu     Linux glibc 2.31+, arm64
+#   linux-aarch64-gnu     Linux glibc 2.31+, arm64           (+ .deb, arm64)
 #   linux-aarch64-musl    Linux static, arm64
 #
 # Manual trigger: workflow_dispatch with a version input lets you cut a
@@ -68,19 +77,25 @@ jobs:
           - label: linux-x86_64-gnu
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
-            cross: false
+            cross: true                         # old-glibc docker image, see header note
+            deb: true
+            deb-arch: amd64
           - label: linux-x86_64-musl
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true                         # use cross-rs for static musl
+            deb: false
           - label: linux-aarch64-gnu
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             cross: true
+            deb: true
+            deb-arch: arm64
           - label: linux-aarch64-musl
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             cross: true
+            deb: false
 
     steps:
       - uses: actions/checkout@v4
@@ -110,12 +125,17 @@ jobs:
             cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.CARGO_PACKAGE }}
           fi
 
-      - name: Strip binary (Unix only)
-        if: runner.os != 'Windows' && !matrix.cross
+      - name: Strip binary (same-arch targets only)
+        # The runner is x86_64 — its `strip` can handle both gnu/musl
+        # x86_64 binaries, but not aarch64 ones (no cross-binutils here).
+        # aarch64 binaries ship unstripped rather than risk a silent no-op
+        # or a hard failure depending on the runner's binutils build.
+        if: startsWith(matrix.target, 'x86_64')
         shell: bash
         run: |
+          set -euxo pipefail
           BIN=target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
-          strip "$BIN" || true
+          strip "$BIN"
 
       - name: Package
         id: package
@@ -123,45 +143,72 @@ jobs:
         env:
           VERSION: ${{ needs.prep.outputs.version }}
           LABEL:   ${{ matrix.label }}
-          EXT:     ${{ matrix.ext }}
         run: |
           set -euxo pipefail
 
           STAGE="${BINARY_NAME}-${VERSION}-${LABEL}"
           mkdir -p "dist/$STAGE"
 
-          BIN="target/${{ matrix.target }}/release/${BINARY_NAME}${EXT}"
+          BIN="target/${{ matrix.target }}/release/${BINARY_NAME}"
           cp "$BIN" "dist/$STAGE/"
           cp README.md     "dist/$STAGE/" 2>/dev/null || true
           cp LICENSE*      "dist/$STAGE/" 2>/dev/null || true
           cp CHANGELOG*    "dist/$STAGE/" 2>/dev/null || true
 
           cd dist
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            ASSET="${STAGE}.zip"
-            7z a -tzip "$ASSET" "$STAGE" >/dev/null
-          else
-            ASSET="${STAGE}.tar.gz"
-            tar -czf "$ASSET" "$STAGE"
-          fi
-
-          # SHA-256 sidecar — portable across mac/linux runners.
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "$ASSET" > "${ASSET}.sha256"
-          else
-            shasum -a 256 "$ASSET" > "${ASSET}.sha256"
-          fi
+          ASSET="${STAGE}.tar.gz"
+          tar -czf "$ASSET" "$STAGE"
+          sha256sum "$ASSET" > "${ASSET}.sha256"
 
           echo "asset=dist/$ASSET"        >> "$GITHUB_OUTPUT"
           echo "checksum=dist/$ASSET.sha256" >> "$GITHUB_OUTPUT"
 
-      - name: Upload artifacts
+      - name: Install cargo-deb (glibc targets only)
+        if: matrix.deb
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb
+
+      - name: Build .deb (glibc targets only)
+        id: deb
+        if: matrix.deb
+        shell: bash
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          set -euxo pipefail
+          # Strip the leading 'v' — Debian package versions can't start
+          # with a non-digit.
+          DEB_VERSION="${VERSION#v}"
+          cargo deb --no-build --no-strip \
+            --target ${{ matrix.target }} \
+            --deb-version "$DEB_VERSION" \
+            -p ${{ env.CARGO_PACKAGE }} \
+            --output dist/
+
+          DEB="$(ls dist/*_${{ matrix.deb-arch }}.deb)"
+          sha256sum "$DEB" > "${DEB}.sha256"
+          echo "asset=$DEB"          >> "$GITHUB_OUTPUT"
+          echo "checksum=${DEB}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload tarball
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
           path: |
             ${{ steps.package.outputs.asset }}
             ${{ steps.package.outputs.checksum }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload .deb (glibc targets only)
+        if: matrix.deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.label }}-deb
+          path: |
+            ${{ steps.deb.outputs.asset }}
+            ${{ steps.deb.outputs.checksum }}
           if-no-files-found: error
           retention-days: 7
 
@@ -185,7 +232,7 @@ jobs:
         working-directory: dist
         run: |
           set -euxo pipefail
-          sha256sum *.tar.gz *.zip 2>/dev/null > SHA256SUMS.txt || true
+          sha256sum *.tar.gz *.deb > SHA256SUMS.txt
           cat SHA256SUMS.txt
           # Drop per-asset .sha256 sidecars now that we have a single manifest.
           rm -f *.sha256
@@ -213,14 +260,31 @@ jobs:
             echo
             echo "| Platform | Asset |"
             echo "|----------|-------|"
-            for f in dist/*.tar.gz dist/*.zip; do
+            for f in dist/*.tar.gz; do
               [ -f "$f" ] || continue
               name="$(basename "$f")"
               # crude label parse — strip BIN_NAME-VERSION- prefix
               plat="${name#${BINARY_NAME}-${VERSION}-}"
-              plat="${plat%.tar.gz}"; plat="${plat%.zip}"
+              plat="${plat%.tar.gz}"
               echo "| \`$plat\` | [\`$name\`](https://github.com/${{ github.repository }}/releases/download/${VERSION}/${name}) |"
             done
+            for f in dist/*.deb; do
+              [ -f "$f" ] || continue
+              name="$(basename "$f")"
+              arch="${name%.deb}"; arch="${arch##*_}"
+              echo "| \`ubuntu/debian ($arch, .deb)\` | [\`$name\`](https://github.com/${{ github.repository }}/releases/download/${VERSION}/${name}) |"
+            done
+            echo
+            echo "Install the \`.deb\` on Ubuntu/Debian:"
+            echo
+            echo '```sh'
+            echo "curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${VERSION}/heatherdb_${VERSION#v}-1_amd64.deb"
+            echo "sudo apt install ./heatherdb_${VERSION#v}-1_amd64.deb"
+            echo '```'
+            echo
+            echo "This installs a \`heatherdb\` systemd service, a dedicated \`heatherdb\` user, and"
+            echo "generates admin credentials in \`/etc/heatherdb/env\` — read that file, then"
+            echo "\`sudo systemctl start heatherdb\`."
             echo
             echo "Verify with the bundled \`SHA256SUMS.txt\`:"
             echo
@@ -242,4 +306,5 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             dist/*.tar.gz
+            dist/*.deb
             dist/SHA256SUMS.txt

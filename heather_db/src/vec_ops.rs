@@ -43,6 +43,16 @@ pub fn softmax(values: &[f64], beta: f64) -> Vec<f64> {
         return vec![];
     }
     let max_val = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // `max_val` is only non-finite when every value is `-inf` (all candidates
+    // carry zero weight — e.g. every activated location has no accumulated
+    // evidence) or `+inf` (a caller-side overflow upstream of this call).
+    // Either way `v - max_val` degenerates to `inf - inf = NaN` for the
+    // dominant entries, which would poison the whole distribution. There is
+    // no informative choice of weights left, so fall back to uniform rather
+    // than propagate NaN.
+    if !max_val.is_finite() {
+        return vec![1.0 / values.len() as f64; values.len()];
+    }
     let exps: Vec<f64> = values
         .iter()
         .map(|v| ((v - max_val) * beta).exp())

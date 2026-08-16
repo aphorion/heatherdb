@@ -44,3 +44,27 @@ toml = "0.8"    # parsing per-database db.toml during restore + snapshot
 
 [dev-dependencies]
 tempfile = "3"
+
+# `cargo deb` packaging — built in CI (release.yml) via `cargo-deb`, not run
+# locally as part of a normal build. Produces an apt-installable package with
+# a systemd unit, dedicated service account, and generated admin credentials
+# on first install. See packaging/deb/ for the maintainer scripts + unit file.
+[package.metadata.deb]
+name = "heatherdb"
+maintainer = "Aphorion Labs <hello@aphorion.dev>"
+copyright = "2026, Aphorion Labs"
+extended-description = """\
+HeatherDB — memory that learns. An associative-memory database: one write \
+rule does inference and learning jointly, one read rule is simultaneously \
+an attention head, a Hopfield cleanup, and a posterior under a Gaussian \
+mixture. Ships as a single `heather` binary with an HTTP API."""
+section = "database"
+priority = "optional"
+depends = "$auto"
+maintainer-scripts = "packaging/deb"
+conf-files = ["/etc/heatherdb/env"]
+assets = [
+    ["target/release/heather", "usr/bin/heather", "755"],
+    ["packaging/deb/heatherdb.service", "lib/systemd/system/heatherdb.service", "644"],
+    ["deploy/README.md", "usr/share/doc/heatherdb/deploy-README.md", "644"],
+]
