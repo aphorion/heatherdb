@@ -1,0 +1,108 @@
+{{/*
+Always exactly one replica: HeatherDB is a single-writer engine
+(embedded LMDB, mmap'd data file) — like Postgres, it does not
+horizontally scale by adding pods against the same volume. A
+StatefulSet (rather than a Deployment) still buys a stable identity
+and a per-pod PVC that survives rescheduling.
+*/}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "heatherdb.fullname" . }}
+  labels:
+    {{- include "heatherdb.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ include "heatherdb.fullname" . }}-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "heatherdb.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "heatherdb.selectorLabels" . | nindent 8 }}
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: heatherdb
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 6380
+              protocol: TCP
+          envFrom:
+            - configMapRef:
+                name: {{ include "heatherdb.fullname" . }}-config
+          env:
+            {{- if or .Values.auth.existingSecret .Values.auth.password }}
+            - name: HEATHER_ADMIN_USER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "heatherdb.authSecretName" . }}
+                  key: {{ .Values.auth.existingSecretUsernameKey }}
+            - name: HEATHER_ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "heatherdb.authSecretName" . }}
+                  key: {{ .Values.auth.existingSecretPasswordKey }}
+            {{- end }}
+          {{- if .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml .Values.livenessProbe | nindent 12 }}
+          {{- end }}
+          {{- if .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml .Values.readinessProbe | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/heatherdb
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if not .Values.persistence.enabled }}
+      volumes:
+        - name: data
+          emptyDir: {}
+      {{- end }}
+  {{- if .Values.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          {{- include "heatherdb.selectorLabels" . | nindent 10 }}
+      spec:
+        accessModes:
+          {{- toYaml .Values.persistence.accessModes | nindent 10 }}
+        {{- if .Values.persistence.storageClassName }}
+        storageClassName: {{ .Values.persistence.storageClassName }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.persistence.size }}
+  {{- end }}
