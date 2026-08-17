@@ -40,7 +40,7 @@ rand = "0.8"
 tar = "0.4"
 flate2 = "1"
 heed = "0.20"   # for live Env::copy_to_file snapshots
-toml = "0.8"    # parsing per-database db.toml during restore + snapshot
+toml = "1.1"    # parsing per-database db.toml during restore + snapshot
 
 [dev-dependencies]
 tempfile = "3"

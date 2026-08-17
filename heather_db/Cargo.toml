@@ -17,7 +17,7 @@ rayon = "1"
 # runs once per candidate document. Same crate heather_algebra binds with.
 realfft = "3"
 # Per-database persisted config (db.toml) — see db_config.rs.
-toml = "0.8"
+toml = "1.1"
 # Advisory engine lock file (flock) — see server::try_acquire_engine_lock.
 fs4 = { version = "0.13", features = ["sync"] }
 # Used by `Server`'s tests AND by downstream tooling that wants scratch
