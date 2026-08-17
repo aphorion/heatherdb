@@ -321,8 +321,8 @@ cosign verify ghcr.io/aphorion/heather-db:latest \
 ### `.deb` package (Ubuntu / Debian)
 
 ```bash
-curl -fsSLO https://github.com/aphorion/heather-db/releases/latest/download/heatherdb_<version>-1_amd64.deb
-sudo apt install ./heatherdb_<version>-1_amd64.deb
+curl -fsSLO https://github.com/aphorion/heather-db/releases/latest/download/heatherdb_<version>_amd64.deb
+sudo apt install ./heatherdb_<version>_amd64.deb
 ```
 
 Installs a `heatherdb` systemd service, a dedicated system user, and
