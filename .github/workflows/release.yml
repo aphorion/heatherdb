@@ -278,8 +278,8 @@ jobs:
             echo "Install the \`.deb\` on Ubuntu/Debian:"
             echo
             echo '```sh'
-            echo "curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${VERSION}/heatherdb_${VERSION#v}-1_amd64.deb"
-            echo "sudo apt install ./heatherdb_${VERSION#v}-1_amd64.deb"
+            echo "curl -fsSLO https://github.com/${{ github.repository }}/releases/download/${VERSION}/heatherdb_${VERSION#v}_amd64.deb"
+            echo "sudo apt install ./heatherdb_${VERSION#v}_amd64.deb"
             echo '```'
             echo
             echo "This installs a \`heatherdb\` systemd service, a dedicated \`heatherdb\` user, and"

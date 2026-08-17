@@ -3,6 +3,8 @@ name = "heather_server"
 version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
+description = "HeatherDB — an associative-memory database with an HTTP API"
+license = "LicenseRef-Proprietary"
 
 # The binary is named `heather` (not `heather_server`) — operators get
 # a short, memorable command:
@@ -61,10 +63,10 @@ mixture. Ships as a single `heather` binary with an HTTP API."""
 section = "database"
 priority = "optional"
 depends = "$auto"
-maintainer-scripts = "packaging/deb"
+maintainer-scripts = "../packaging/deb"
 conf-files = ["/etc/heatherdb/env"]
 assets = [
     ["target/release/heather", "usr/bin/heather", "755"],
-    ["packaging/deb/heatherdb.service", "lib/systemd/system/heatherdb.service", "644"],
-    ["deploy/README.md", "usr/share/doc/heatherdb/deploy-README.md", "644"],
+    ["../packaging/deb/heatherdb.service", "lib/systemd/system/heatherdb.service", "644"],
+    ["../deploy/README.md", "usr/share/doc/heatherdb/deploy-README.md", "644"],
 ]
