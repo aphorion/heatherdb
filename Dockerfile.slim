@@ -38,7 +38,7 @@
 # cross-built binary run against debian:bookworm-slim crashes immediately;
 # the same binary against ubuntu:24.04 runs cleanly. Keep this base in
 # sync with whatever OS cross-rs's default gnu images use.
-FROM ubuntu:24.04 AS runtime
+FROM ubuntu:26.04 AS runtime
 
 # Set automatically by buildx per --platform target (e.g. "amd64", "arm64").
 ARG TARGETARCH
