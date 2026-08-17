@@ -20,7 +20,7 @@ use axum::extract::{DefaultBodyLimit, Extension};
 use axum::middleware;
 use axum::routing::{delete, get, post};
 use clap::{Parser, Subcommand};
-use heather_db::{DEFAULT_DB, Server};
+use heather_db::{DEFAULT_DB, DEFAULT_MAP_SIZE_MB, Server};
 use tower::ServiceBuilder;
 use tower_http::cors::CorsLayer;
 use tower_http::timeout::TimeoutLayer;
@@ -65,9 +65,16 @@ struct Args {
     #[arg(long, env = "HEATHER_REQUEST_TIMEOUT", default_value = "30")]
     request_timeout: u64,
 
-    /// LMDB map size in megabytes for the auto-created `default` DB
-    /// (default: 256). Other DBs set their own.
-    #[arg(long, env = "HEATHER_MAP_SIZE_MB", default_value = "256")]
+    /// LMDB map ceiling in megabytes for the auto-created `default` DB, and
+    /// only on the boot that creates it. Every other database sets its own via
+    /// `map_size_mb` on `POST /db`, so this does **not** size the databases
+    /// your application creates.
+    ///
+    /// Raising a ceiling later does not require a re-ingest: edit
+    /// `map_size_mb` in that database's `db.toml` and restart. LMDB's map size
+    /// belongs to the environment handle, not the file, and it is re-read on
+    /// every mount.
+    #[arg(long, env = "HEATHER_MAP_SIZE_MB", default_value_t = DEFAULT_MAP_SIZE_MB)]
     map_size_mb: usize,
 
     /// DANGER: disable HTTP Basic Auth entirely. Local dev only — anyone
@@ -213,7 +220,7 @@ async fn serve(args: Args) -> std::process::ExitCode {
     // the `default` database with the dimension we pass here.
     // Keeps the `--l0` seeding knob while reporting a failed open instead of
     // panicking, which is what the hardening pass was after.
-    let server = match Server::open_with(&data_dir, args.dimension, args.l0) {
+    let server = match Server::open_with(&data_dir, args.dimension, args.l0, args.map_size_mb) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("error: open server: {e}");
@@ -456,11 +463,15 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .layer(DefaultBodyLimit::max(args.max_body_size));
 
     let addr = format!("{}:{}", args.host, args.port);
+    // `map_size_mb` is deliberately absent: it applies only to the `default`
+    // database on the boot that creates it, so reporting it beside genuinely
+    // server-wide limits read as a global setting and misled operators into
+    // believing it had sized their own databases. Per-database ceilings are
+    // visible via `GET /db`.
     tracing::info!(
         addr = %addr,
         max_body_size = args.max_body_size,
         request_timeout_secs = args.request_timeout,
-        map_size_mb = args.map_size_mb,
         "HeatherDB server listening"
     );
 

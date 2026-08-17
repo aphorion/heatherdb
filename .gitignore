@@ -1,4 +1,7 @@
 /target
+# `cargo deb --output dist/` — release artefacts, built in CI and sometimes
+# locally when reproducing a packaging problem.
+/dist
 .env
 node_modules/
 package-lock.json

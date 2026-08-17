@@ -263,12 +263,39 @@ fingerprint).
 | `--dimension` | `HEATHER_DIMENSION` | `128` | Default vector dimension for new DBs |
 | `--port` | `HEATHER_PORT` | `6380` | Listen port |
 | `--host` | `HEATHER_HOST` | `0.0.0.0` | Bind address |
-| `--map-size-mb` | `HEATHER_MAP_SIZE_MB` | `256` | LMDB map size — set to ~2× expected on-disk dataset |
+| `--map-size-mb` | `HEATHER_MAP_SIZE_MB` | `4096` | LMDB map ceiling for the auto-created `default` DB **only** — see below |
 | `--request-timeout` | `HEATHER_REQUEST_TIMEOUT` | `30` | Seconds, for long algebra ops |
 | `--max-body-size` | `HEATHER_MAX_BODY_SIZE` | `2097152` | Max request body, bytes |
 | `--admin-user` / `--admin-password` | `HEATHER_ADMIN_USER` / `HEATHER_ADMIN_PASSWORD` | `admin` / *(generated)* | First-boot admin credentials |
 | `--auth-disabled` | `HEATHER_AUTH_DISABLED` | `false` | Skip auth entirely — **dev only** |
 | — | `RUST_LOG` | `info` | `debug` for verbose tracing |
+
+### Map size is per database
+
+`--map-size-mb` sizes the auto-created `default` database, on the boot that
+creates it. It does **not** size the databases you create — those carry their
+own ceiling, set by `map_size_mb` on `POST /db` and stored in the database's
+`db.toml`:
+
+```bash
+curl -u admin:… -X POST -H 'Content-Type: application/json' \
+  -d '{"name":"movies","dimension":512,"map_size_mb":32768}' localhost:6380/db
+curl -u admin:… localhost:6380/db          # map_size_mb, per database
+```
+
+Getting it wrong is not fatal. The ceiling belongs to the LMDB environment
+handle rather than the file, and `db.toml` is re-read on every mount, so
+raising it is an edit and a restart — no dump, no reload, no re-ingest:
+
+```bash
+vi $HEATHER_DATA_DIR/db/movies/db.toml     # map_size_mb = 32768
+systemctl restart heatherdb                # or restart the process however you run it
+```
+
+A restart is required: LMDB refuses to reopen an environment with different
+options in the same process. Grow only — never set a ceiling below the data
+already stored. The map is sparse, so a generous ceiling costs address space
+rather than disk.
 
 ## Operator CLI
 
