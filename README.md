@@ -32,6 +32,15 @@ no neural network in the loop.
 None of this requires training data, GPUs, retraining schedules, or model
 versioning. It requires an HTTP POST.
 
+## Documentation
+
+Full docs live in [`docs/`](./docs/README.md):
+[getting started](./docs/getting-started.md) ·
+[how-to guides](./docs/README.md#how-to-guides) ·
+[HTTP API](./docs/reference/http-api.md) ·
+[configuration](./docs/reference/configuration.md) ·
+[architecture](./docs/explanation/architecture.md)
+
 ## What makes it different
 
 **Vector databases** (Pinecone, Weaviate, Milvus) store embeddings and
@@ -218,7 +227,9 @@ on `main` yet.
 
 ## API reference
 
-The full route table (see `heather_server/src/routes.rs` for exact request/response shapes — the in-repo `docs/` tree is retired pending a rewrite, this is the source of truth today):
+Full request and response shapes for every route are in
+[`docs/reference/http-api.md`](./docs/reference/http-api.md). The route table
+at a glance:
 
 | Category | Routes |
 |---|---|
