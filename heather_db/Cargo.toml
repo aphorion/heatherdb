@@ -10,7 +10,7 @@ rand = "0.8"
 rand_distr = "0.4"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
-bincode = "1"
+bincode = "3"
 rayon = "1"
 # Role-scoped scoring unbinds by circular correlation; doing it in the
 # frequency domain is O(d log d) instead of the O(d²) direct form, and this
