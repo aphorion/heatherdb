@@ -231,7 +231,7 @@ docker run -d --name heatherdb \
   -e HEATHER_DIMENSION=8 \
   -e HEATHER_ADMIN_USER=admin \
   -e HEATHER_ADMIN_PASSWORD='quickstart-password' \
-  ghcr.io/aphorion/heatherdb:latest
+  aphorion/heatherdb:latest
 ```
 
 Images are multi-arch (`linux/amd64` and `linux/arm64`) and signed with cosign

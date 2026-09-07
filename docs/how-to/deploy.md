@@ -21,15 +21,15 @@ bottom.
 ## Docker
 
 ```bash
-docker pull ghcr.io/aphorion/heatherdb:latest      # GHCR
-docker pull aphorion/heatherdb:latest               # Docker Hub
+docker pull aphorion/heatherdb:latest                 # Docker Hub
+docker pull ghcr.io/aphorion/heatherdb:latest         # GHCR mirror
 ```
 
 Images are multi-arch (`linux/amd64` + `linux/arm64`), cross-compiled natively
 rather than under QEMU emulation, and signed with cosign keyless:
 
 ```bash
-cosign verify ghcr.io/aphorion/heatherdb:latest \
+cosign verify aphorion/heatherdb:latest \
   --certificate-identity-regexp "^https://github.com/aphorion/heatherdb/" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
@@ -42,7 +42,7 @@ docker run -d --name heatherdb \
   -v heatherdb_data:/var/lib/heatherdb \
   -e HEATHER_ADMIN_USER=admin \
   -e HEATHER_ADMIN_PASSWORD='a-real-password' \
-  ghcr.io/aphorion/heatherdb:latest
+  aphorion/heatherdb:latest
 ```
 
 The named volume is not optional in any deploy you care about — without it the
