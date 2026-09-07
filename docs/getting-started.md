@@ -1,53 +1,244 @@
 # Getting started
 
-By the end of this page you will have built the engine, booted it, written 200
-vectors into it, watched a badly corrupted query reconstruct into the pattern
-it came from, and used the fidelity signal to tell a known pattern from an
-unknown one.
+By the end of this page HeatherDB is running on your machine, you have written
+a vector into it, and you have read a corrupted version of that vector back.
+Five minutes, most of it downloading.
 
-Everything happens in a throwaway directory. Nothing here touches a real
-deployment, and you can delete the whole thing at the end.
+HeatherDB comes in two shapes and this page covers both:
 
-You need: a Rust toolchain (1.88 or newer), `curl`, and `python3` for the last
-two steps.
+- **Server** — one binary listening on port 6380, spoken to over HTTP. This is
+  what the tutorials use, and what the rest of this page installs.
+- **Embedded** — the engine as a Rust library inside your own process, no
+  server and no network. [Skip to embedded](#running-it-embedded) if that is
+  what you came for.
 
-## 1. Build the engine
+## 1. Install it
+
+Download the binary for your platform. It is a single self-contained
+executable — no runtime, no system dependency beyond libc, nothing to
+configure before it runs.
+
+Every build, with its size and SHA-256, is listed on the
+[downloads page](https://heather.aphorion.co/download); the archives
+themselves are served from
+[GitHub releases](https://github.com/aphorion/heatherdb/releases).
+
+<!--tabs:os-->
+<!--tab:macOS-->
 
 ```bash
-git clone https://github.com/aphorion/heather-db
+curl -fsSL https://heather.aphorion.co/install.sh | sh
+```
+
+The script detects Apple Silicon or Intel, resolves the latest release,
+verifies its SHA-256 against the checksum manifest published with it, and puts
+`heather` in `/usr/local/bin` — or `~/.local/bin` when it cannot escalate, and
+it says so. `HEATHER_VERSION` and `HEATHER_INSTALL_DIR` override both choices.
+
+To do it by hand, take the archive from the release. Asset names carry the
+version, so set it once — the [downloads page](https://heather.aphorion.co/download)
+lists the current one:
+
+```bash
+VERSION=v0.3.0
+curl -fsSLO https://github.com/aphorion/heatherdb/releases/download/$VERSION/heather-$VERSION-macos-aarch64.tar.gz
+tar -xzf heather-$VERSION-macos-aarch64.tar.gz
+sudo cp heather-$VERSION-macos-aarch64/heather /usr/local/bin/
+```
+
+Swap `aarch64` for `x86_64` on an Intel Mac. The builds are not codesigned, so
+Gatekeeper holds the first run until you clear the quarantine attribute:
+
+```bash
+xattr -d com.apple.quarantine /usr/local/bin/heather
+heather --version
+```
+
+<!--tab:Linux-->
+
+```bash
+curl -fsSL https://heather.aphorion.co/install.sh | sh
+```
+
+The script picks the right architecture and libc, checks the SHA-256, and
+installs to `/usr/local/bin` (or `~/.local/bin` without sudo). By hand:
+
+```bash
+VERSION=v0.3.0
+curl -fsSLO https://github.com/aphorion/heatherdb/releases/download/$VERSION/heather-$VERSION-linux-x86_64-gnu.tar.gz
+tar -xzf heather-$VERSION-linux-x86_64-gnu.tar.gz
+sudo cp heather-$VERSION-linux-x86_64-gnu/heather /usr/local/bin/
+```
+
+Swap `x86_64` for `aarch64` on ARM, and `gnu` for `musl` on Alpine or anywhere
+glibc is old — the musl builds are static.
+
+On Debian or Ubuntu the `.deb` is the better path: it brings a systemd
+service, a dedicated system user, and admin credentials generated into
+`/etc/heatherdb/env` on first install.
+
+```bash
+VERSION=v0.3.0
+curl -fsSLO https://github.com/aphorion/heatherdb/releases/download/$VERSION/heatherdb_${VERSION#v}_amd64.deb
+sudo apt install ./heatherdb_${VERSION#v}_amd64.deb
+```
+
+```bash
+heather --version
+```
+
+<!--tab:Windows-->
+
+```powershell
+irm https://heather.aphorion.co/install.ps1 | iex
+```
+
+The script downloads the x64 build, verifies its hash, extracts it to
+`%LOCALAPPDATA%\Heather`, and appends that to your user `PATH` — reopen the
+terminal before running `heather`, since a `PATH` change only reaches
+processes started after it.
+
+By hand, take the zip from the
+[downloads page](https://heather.aphorion.co/download), extract it, and put
+`heather.exe` somewhere on your `PATH`:
+
+```powershell
+$VERSION = "v0.3.0"
+Invoke-WebRequest "https://github.com/aphorion/heatherdb/releases/download/$VERSION/heather-$VERSION-windows-x86_64.zip" -OutFile heather.zip
+Expand-Archive heather.zip -DestinationPath $env:LOCALAPPDATA\Heather
+$env:PATH += ";$env:LOCALAPPDATA\Heather"
+```
+
+```powershell
+heather --version
+```
+
+<!--tab:From source-->
+
+Any platform with a Rust toolchain, 1.88 or newer. This is what you want if
+you are changing the engine, or on a platform we do not ship a build for.
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+git clone https://github.com/aphorion/heatherdb
 cd heather-db
 cargo build --release -p heather_server
 ```
 
-The first build takes a few minutes. It produces one binary,
-`target/release/heather`.
-
-## 2. Start the server
+The first build takes a few minutes and produces one binary,
+`target/release/heather`. Put it on your `PATH`:
 
 ```bash
-HEATHER_DATA_DIR=/tmp/heather-tutorial \
+sudo cp target/release/heather /usr/local/bin/
+```
+
+On Windows the binary lands at `target\release\heather.exe`, and Rustup will
+prompt you to install the Visual Studio Build Tools (the MSVC toolchain)
+first.
+
+<!--/tabs-->
+
+## 2. Start it
+
+The engine needs three things: somewhere to keep data, and an admin username
+and password to mint on first boot.
+
+<!--tabs:os-->
+<!--tab:macOS-->
+
+```bash
+HEATHER_DATA_DIR=/tmp/heather-quickstart \
+HEATHER_DIMENSION=8 \
 HEATHER_ADMIN_USER=admin \
-HEATHER_ADMIN_PASSWORD='tutorial-password' \
+HEATHER_ADMIN_PASSWORD='quickstart-password' \
+  heather
+```
+
+<!--tab:Linux-->
+
+```bash
+HEATHER_DATA_DIR=/tmp/heather-quickstart \
+HEATHER_DIMENSION=8 \
+HEATHER_ADMIN_USER=admin \
+HEATHER_ADMIN_PASSWORD='quickstart-password' \
+  heather
+```
+
+If you installed the `.deb`, the service is already running under systemd
+instead — `sudo systemctl status heatherdb`, with the generated password in
+`/etc/heatherdb/env`.
+
+<!--tab:Windows-->
+
+```powershell
+$env:HEATHER_DATA_DIR = "$env:TEMP\heather-quickstart"
+$env:HEATHER_DIMENSION = "8"
+$env:HEATHER_ADMIN_USER = "admin"
+$env:HEATHER_ADMIN_PASSWORD = "quickstart-password"
+heather
+```
+
+<!--tab:From source-->
+
+Run the binary you just built, from the repository root:
+
+```bash
+HEATHER_DATA_DIR=/tmp/heather-quickstart \
+HEATHER_DIMENSION=8 \
+HEATHER_ADMIN_USER=admin \
+HEATHER_ADMIN_PASSWORD='quickstart-password' \
   ./target/release/heather
 ```
+
+<!--/tabs-->
 
 The log tells you three things:
 
 ```
-INFO heather: Opened server path=/tmp/heather-tutorial databases=1 names=["default"]
+INFO heather: Opened server path=/tmp/heather-quickstart databases=1 names=["default"]
 INFO heather::auth: Auth: bootstrapped admin user from HEATHER_ADMIN_USER + HEATHER_ADMIN_PASSWORD
 INFO heather: HeatherDB server listening addr=0.0.0.0:6380
 ```
 
-A `default` database was created for you, an `admin` user was minted from the
-two environment variables, and the engine is listening on port 6380.
+A `default` database was created, an `admin` user was minted from the two
+environment variables, and the engine is listening on 6380.
 
-> If you leave `HEATHER_ADMIN_PASSWORD` unset, the engine generates a random
-> 24-character password instead, prints it once in a box on stderr, and writes
-> a copy to `$HEATHER_DATA_DIR/initial-admin-password`. Setting it explicitly
-> keeps this tutorial simple.
+`HEATHER_DIMENSION=8` sets the vector width of that `default` database so the
+vectors below are short enough to type. It is fixed for the life of a database
+— see [Tune a database](how-to/tune-a-database.md) for how to pick a real one.
+**The admin password must be at least 8 characters.** A shorter one stops the
+engine at boot rather than being accepted quietly:
 
-Leave that terminal running. Open a second one for everything below.
+```
+error: bootstrap admin user: password must be at least 8 characters
+```
+
+Leave `HEATHER_ADMIN_PASSWORD` unset in production and the engine generates a
+random 24-character password, prints it once on stderr, and writes it to
+`$HEATHER_DATA_DIR/initial-admin-password`.
+
+Leave that terminal running and open a second one for the rest.
+
+### Or run it in a container
+
+If you would rather not install anything, the image is the same engine and the
+rest of this page works unchanged against it.
+
+```bash
+docker run -d --name heatherdb \
+  -p 6380:6380 \
+  -v heatherdb_data:/var/lib/heatherdb \
+  -e HEATHER_DIMENSION=8 \
+  -e HEATHER_ADMIN_USER=admin \
+  -e HEATHER_ADMIN_PASSWORD='quickstart-password' \
+  ghcr.io/aphorion/heatherdb:latest
+```
+
+Images are multi-arch (`linux/amd64` and `linux/arm64`) and signed with cosign
+keyless. Without the named volume the data directory dies with the container.
+Follow the log with `docker logs -f heatherdb`, and see
+[Deploy HeatherDB](how-to/deploy.md#docker) for the verification command and
+the production flags.
 
 ## 3. Check it is alive
 
@@ -58,204 +249,144 @@ curl http://localhost:6380/health
 {"status":"ok"}
 ```
 
-`/health` is the only kind of route that needs no credentials. Everything else
-does:
+`/health` is the only route that needs no credentials. Everything else does:
 
 ```bash
-curl -s http://localhost:6380/collections
-```
-```json
-{"error":"missing or malformed Authorization header"}
-```
-
-```bash
-curl -s -u admin:tutorial-password http://localhost:6380/collections
+curl -s -u admin:quickstart-password http://localhost:6380/collections
 ```
 ```json
 {"collections":[]}
 ```
 
-No collections yet — you have not written anything.
+No collections yet — nothing has been written.
 
-## 4. Make a database for this tutorial
+## 4. Write something, then read it back wrong
 
-The `default` database exists already, but making your own is one call and
-shows you where the dimension actually lives.
+Write one vector into a collection called `quickstart`. The collection is
+created on first write; you do not declare it.
 
 ```bash
-curl -s -u admin:tutorial-password -X POST http://localhost:6380/db \
+curl -s -u admin:quickstart-password \
   -H 'Content-Type: application/json' \
-  -d '{"name":"tutorial","dimension":128}'
+  -d '{"vectors": [[1, 1, 1, 1, 0, 0, 0, 0]]}' \
+  http://localhost:6380/collections/quickstart/write
 ```
 ```json
-{"name":"tutorial","created_at":1788260246,"dimension":128,"map_size_mb":4096,"collections":0}
+{"count":1}
 ```
 
-**Vector dimension belongs to a database, not to the server.** It is fixed at
-creation and cannot be changed afterwards — to work at a different dimension
-you create a different database.
-
-## 5. Write some vectors
-
-128-dimensional vectors are awkward to type, so from here we drive the engine
-from Python. Save this as `tutorial.py`:
-
-```python
-import base64, json, math, random, urllib.request
-
-BASE = "http://localhost:6380"
-AUTH = base64.b64encode(b"admin:tutorial-password").decode()
-
-def call(method, path, body=None):
-    req = urllib.request.Request(
-        BASE + path, method=method,
-        data=json.dumps(body).encode() if body is not None else None,
-        headers={"Content-Type": "application/json", "Authorization": "Basic " + AUTH})
-    return json.load(urllib.request.urlopen(req))
-
-def unit(v):
-    n = math.sqrt(sum(x * x for x in v))
-    return [x / n for x in v]
-
-def cos(a, b):
-    return (sum(x * y for x, y in zip(a, b))
-            / (math.sqrt(sum(x * x for x in a)) * math.sqrt(sum(y * y for y in b))))
-
-random.seed(11)
-D = 128
-
-# Five underlying patterns, and 200 noisy observations of them.
-prototypes = [unit([random.gauss(0, 1) for _ in range(D)]) for _ in range(5)]
-
-def jitter(p, spread):
-    return unit([x + random.gauss(0, spread / math.sqrt(D)) for x in p])
-
-samples = [jitter(prototypes[i % 5], 0.35) for i in range(200)]
-
-print(call("POST", "/db/tutorial/collections/signals/write", {"vectors": samples}))
-print(call("GET", "/db/tutorial/collections/signals/stats"))
-```
+Now ask for it with a query that is *wrong* — half the components zeroed, one
+of them flipped to the opposite sign:
 
 ```bash
-python3 tutorial.py
+curl -s -u admin:quickstart-password \
+  -H 'Content-Type: application/json' \
+  -d '{"query": [1, 0, 0, -1, 0, 0, 0, 0]}' \
+  http://localhost:6380/collections/quickstart/read
 ```
-```
-{'count': 200}
-{'num_locations': 51, 'total_writes': 1062.2, 'current_eta': 0.0098,
- 'avg_write_count': 20.8, 'max_write_count': 44.8}
-```
-
-Your numbers will be close to these, not identical.
-
-Two things happened that a vector database would not have done.
-
-First, you never created the `signals` collection. Writing to a collection
-creates it.
-
-Second, and more interesting: **200 vectors became 51 hard locations.** The
-engine did not store your vectors. It grew a codebook to accommodate them —
-competitive learning, running online, in the same call that stored the data.
-There is no training step, and `num_locations` is not a setting you chose. It
-is a readout of how complex the data turned out to be.
-
-## 6. Read a corrupted query back
-
-Append to `tutorial.py`:
-
-```python
-# A badly corrupted observation of prototype 0.
-query = jitter(prototypes[0], 0.9)
-print("query vs prototype: %.3f" % cos(query, prototypes[0]))
-
-result = call("POST", "/db/tutorial/collections/signals/read", {"query": query})["result"]
-print("result vs prototype: %.3f" % cos(result, prototypes[0]))
+```json
+{"result":[0.4999,0.4999,0.4999,0.4999,0.0,0.0,0.0,0.0]}
 ```
 
-```
-query vs prototype: 0.768
-result vs prototype: 0.991
-```
+The exact numbers will differ. What matters is the shape: you asked with a
+mangled query and the engine returned the pattern that query belongs to, not
+the query itself and not "no match". That is a read in this database —
+a reconstruction rather than a lookup.
 
-That is the whole idea. You handed the engine a vector that was only 0.77
-similar to the pattern it came from, and it handed back one that is 0.99
-similar. It did not find the nearest stored row — no row you wrote is that
-close to the prototype either. It reconstructed the pattern from the
-interference between everything relevant that was ever written.
-
-## 7. Ask why
-
-Reconstruction is not a black box. `analyze` runs the same read and shows its
-work:
-
-```python
-a = call("POST", "/db/tutorial/collections/signals/analyze", {"query": query})
-print("iterations=%s converged=%s" % (a["iterations"], a["converged"]))
-for c in a["activated_locations"][:3]:
-    print("  location %-3d similarity=%.3f weight=%.3f" % (c["id"], c["similarity"], c["weight"]))
-```
-
-```
-iterations=3 converged=True
-  location 0   similarity=0.951 weight=0.094
-  location 21  similarity=0.941 weight=0.089
-  location 10  similarity=0.933 weight=0.086
-```
-
-Those are the hard locations that produced the answer and how much each one
-contributed. The Hopfield read settled in three iterations.
-
-## 8. The fidelity signal
-
-Compare what you asked for with what came back:
-
-```python
-novel = unit([random.gauss(0, 1) for _ in range(D)])
-
-for label, v in (("known", query), ("novel", novel)):
-    r = call("POST", "/db/tutorial/collections/signals/read", {"query": v})["result"]
-    print("fidelity(%-5s) = %.3f" % (label, cos(v, r)))
-```
-
-```
-fidelity(known) = 0.747
-fidelity(novel) = 0.142
-```
-
-That number — the cosine between a query and its reconstruction — is
-**fidelity**, and you get it for free on every read. High fidelity means a
-strong attractor exists for this pattern. Low fidelity means the query is
-novel, underrepresented, or in conflict with what the memory already holds.
-
-One metric, several jobs. Anomaly detection is fidelity below a threshold.
-Cold-start detection is fidelity on a new user's first vector. Regime-change
-detection is fidelity drifting down over time. There is no second model to
-train for any of them.
-
-## 9. The collection's self-summary
+If you want to know how sure it was, compare the two:
 
 ```bash
-curl -s -u admin:tutorial-password \
-  http://localhost:6380/db/tutorial/collections/signals/fingerprint
+python3 - <<'PY'
+import math
+a = [1, 1, 1, 1, 0, 0, 0, 0]
+b = [0.4999, 0.4999, 0.4999, 0.4999, 0.0, 0.0, 0.0, 0.0]   # paste your result
+dot = sum(x * y for x, y in zip(a, b))
+print(dot / (math.hypot(*a) * math.hypot(*b)))
+PY
 ```
 
-A single 128-dimensional vector summarising everything ever written to
-`signals` — the write-count-weighted centroid of every hard location, refined
-through a Hopfield read so it lands on a real attractor rather than being a
-bare average.
+That number is [fidelity](terms/fidelity.md), and it is what tells a
+remembered pattern from a stranger. [Your first
+memory](tutorials/first-memory.md) does this properly, with 200 vectors and a
+query corrupted past recognition.
+
+## Running it embedded
+
+The server is a thin HTTP layer over a library. If your program is written in
+Rust you can skip the network entirely and open the memory in your own process
+— same engine, same on-disk format, no port and no credentials.
+
+<!--tabs:shape-->
+<!--tab:Embedded-->
+
+`Cargo.toml`:
+
+```toml
+[dependencies]
+heather_db = { git = "https://github.com/aphorion/heatherdb" }
+```
+
+`src/main.rs`:
+
+```rust
+use std::path::Path;
+use heather_db::{EAMConfig, Hive, ReadStrategy};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // One LMDB environment, many collections. 8 dimensions, 256 MB map size.
+    let hive = Hive::open(Path::new("/tmp/heather-embedded"), EAMConfig::new(8)?, 256)?;
+    let col = hive.get_or_create_collection("quickstart")?;
+
+    col.write(&[1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0])?;
+
+    let query = [1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0];
+    let result = col.read(&query, ReadStrategy::HopfieldIter)?;
+
+    println!("{result:?}");
+    Ok(())
+}
+```
+
+`Hive` and `Collection` are `Send + Sync` and every method takes `&self`, so
+one hive can be shared across threads — reads take a shared lock, writes an
+exclusive one. The data directory is interchangeable with the server's: point
+`heather --data-dir` at it later and the same collections are there.
+
+<!--tab:Server-->
+
+What the rest of this page does. One binary, HTTP on port 6380, any language
+that can make a request:
+
+```bash
+curl -s -u admin:quickstart-password \
+  -H 'Content-Type: application/json' \
+  -d '{"query": [1, 0, 0, -1, 0, 0, 0, 0]}' \
+  http://localhost:6380/collections/quickstart/read
+```
+
+Pick this when more than one process needs the memory, when the callers are
+not written in Rust, or when you want the operator surface — users and scopes,
+backups, snapshots, the audit log — that the binary brings with it.
+
+<!--/tabs-->
 
 ## Clean up
 
-Stop the server with `Ctrl-C` (it shuts down gracefully and flushes its audit
-buffer), then:
-
 ```bash
-rm -rf /tmp/heather-tutorial
+rm -rf /tmp/heather-quickstart          # or: docker rm -f heatherdb
 ```
+
+Nothing else was installed outside the binary you copied.
 
 ## Where to go next
 
-- Run it somewhere real: [Deploy HeatherDB](how-to/deploy.md).
-- Give other people scoped access: [Manage users and authentication](how-to/manage-users.md).
-- Attach metadata and search over it: [Store and query structured documents](how-to/structured-documents.md).
-- Understand what you just watched: [How the memory works](explanation/associative-memory.md).
-- Look up any route: [HTTP API reference](reference/http-api.md).
+- [Your first memory](tutorials/first-memory.md) — the tutorial proper (stop
+  the quickstart server first; the lesson starts its own on the same port):
+  200 vectors, a query corrupted past recognition, and the fidelity signal
+  used to tell a known pattern from an unknown one.
+- [Deploy HeatherDB](how-to/deploy.md) — Compose, `.deb`, systemd, Kubernetes,
+  and what to do before you expose it.
+- [Configuration](reference/configuration.md) — every flag, environment
+  variable, and file the engine reads.
+- [Manage users and authentication](how-to/manage-users.md) — scoped users and
+  password rotation, before anyone else touches it.

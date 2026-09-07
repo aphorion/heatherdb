@@ -134,4 +134,4 @@ database has logging off, so a disabled log cannot be mistaken for a quiet one.
 
 - [Read the audit log](../how-to/read-the-audit-log.md) — querying, paging,
   retention, visibility.
-- [HTTP API: `GET /db/{db}/audit`](../reference/http-api.md#get-dbdbaudit).
+- [HTTP API: `GET /db/{db}/audit`](../api/audit.md#get-dbdbaudit).

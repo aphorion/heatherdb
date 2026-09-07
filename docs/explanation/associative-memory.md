@@ -130,6 +130,9 @@ along.
 
 ## Reading: a Hopfield loop over the activated set
 
+The short version of this section is the glossary entry for the
+[Hopfield read](../terms/hopfield-read.md).
+
 Activation picks the *k* most relevant locations. Then:
 
 ```

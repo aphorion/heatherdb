@@ -24,7 +24,7 @@ Every flag has an environment variable. The flag wins when both are set.
 | `--max-bulk-items` | `HEATHER_MAX_BULK_ITEMS` | `100000` | Cap on `bulk_load` items. `0` disables |
 | `--max-batch-queries` | `HEATHER_MAX_BATCH_QUERIES` | `1000` | Cap on `batch_analyze` queries. `0` disables |
 | `--admin-user` | `HEATHER_ADMIN_USER` | `admin` | First-boot admin username |
-| `--admin-password` | `HEATHER_ADMIN_PASSWORD` | *(generated)* | First-boot admin password |
+| `--admin-password` | `HEATHER_ADMIN_PASSWORD` | *(generated)* | First-boot admin password. Minimum 8 characters — a shorter one aborts the boot |
 | `--auth-disabled` | `HEATHER_AUTH_DISABLED` | `false` | Skip auth entirely. **Dev only** |
 | — | `RUST_LOG` | `info` | Tracing filter. `debug` for verbose |
 

@@ -146,4 +146,4 @@ write rule.
 
 - [How the memory works](associative-memory.md) — the write rule being replayed.
 - [Configuration: `[dream]`](../reference/configuration.md#dream) — every knob.
-- [HTTP API: `POST /db/{db}/dream`](../reference/http-api.md#post-dbdbdream).
+- [HTTP API: `POST /db/{db}/dream`](../api/dream.md#post-dbdbdream).

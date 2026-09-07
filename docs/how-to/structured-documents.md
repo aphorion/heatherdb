@@ -69,12 +69,20 @@ Fix one random unit vector per role (`GENRE`, `DIRECTOR`) and per value
 (`scifi`, `nolan`) and keep them client-side; they are the vocabulary.
 
 ```python
+# The two algebra primitives, as one-liners over the stateless /vec routes.
+# `bind` pairs a role with its value; `bundle` superposes several pairs into
+# one vector of the same width.
 def bind(a, b):    return call("POST", "/vec/bind",   {"a": a, "b": b})["result"]
 def bundle(vs):    return call("POST", "/vec/bundle", {"terms": [{"vector": v} for v in vs]})["result"]
 
 films = [("Solaris", scifi, tarkovsky), ("Interstellar", scifi, nolan)]
+
+# One vector per film: "genre is X" bound, "director is Y" bound, both bundled.
+# The result is a whole record in a single vector — no columns were declared.
 vectors = [bundle([bind(GENRE, g), bind(DIRECTOR, d)]) for _, g, d in films]
 
+# Metadata rides alongside the vector; it comes back with hits but is not what
+# the memory searches on.
 call("POST", "/db/movies/collections/films/write",
      {"vectors": vectors, "metadata": [{"title": t} for t, _, _ in films]})
 ```
@@ -82,7 +90,11 @@ call("POST", "/db/movies/collections/films/write",
 Query it by building the same shape from the attributes you want:
 
 ```python
+# Build the query the same way you built the records: it is not a filter
+# expression, it is a vector of the shape you are looking for.
 q = bundle([bind(GENRE, scifi), bind(DIRECTOR, nolan)])
+
+# `n` caps how many hits come back, ranked by similarity to that shape.
 call("POST", "/db/movies/collections/films/documents/query", {"query": q, "n": 5})
 ```
 
@@ -100,6 +112,10 @@ structured documents therefore rank lower for reasons unrelated to the query
 *and* its own expected filler:
 
 ```python
+# Same query vector, but ask for each criterion to be scored on its own.
+# Recall and ranking still use `query`; `role_pairs` only adds per-role numbers
+# to each hit, so keep `n` generous enough that the document you care about is
+# recalled before you re-rank it yourself.
 call("POST", "/db/movies/collections/films/documents/query", {
     "query": q, "n": 50,
     "role_pairs": [{"role": GENRE, "filler": scifi},

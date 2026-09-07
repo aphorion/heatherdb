@@ -148,5 +148,5 @@ number — not everything measured there has landed on `main`.
 
 - [Store and query structured documents](../how-to/structured-documents.md) —
   role/filler documents end to end.
-- [HTTP API: vector algebra](../reference/http-api.md#vector-algebra-on-raw-vectors)
-  — exact request shapes.
+- [HTTP API: vector algebra](../api/vectors.md) on raw vectors and
+  [on collections](../api/algebra.md) — exact request shapes.

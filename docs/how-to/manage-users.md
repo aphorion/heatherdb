@@ -18,7 +18,13 @@ root-scoped user.
 HEATHER_ADMIN_USER=admin HEATHER_ADMIN_PASSWORD='a-real-password' heather --data-dir /var/lib/heatherdb
 ```
 
-Nothing is printed or written; you already have the password.
+Nothing is printed or written; you already have the password. It must be at
+least 8 characters — the engine refuses to boot on a shorter one rather than
+minting a weak account:
+
+```
+error: bootstrap admin user: password must be at least 8 characters
+```
 
 **Otherwise — the engine generates one:**
 

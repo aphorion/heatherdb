@@ -21,7 +21,7 @@ bottom.
 ## Docker
 
 ```bash
-docker pull ghcr.io/aphorion/heather-db:latest      # GHCR
+docker pull ghcr.io/aphorion/heatherdb:latest      # GHCR
 docker pull aphorion/heatherdb:latest               # Docker Hub
 ```
 
@@ -29,8 +29,8 @@ Images are multi-arch (`linux/amd64` + `linux/arm64`), cross-compiled natively
 rather than under QEMU emulation, and signed with cosign keyless:
 
 ```bash
-cosign verify ghcr.io/aphorion/heather-db:latest \
-  --certificate-identity-regexp "^https://github.com/aphorion/heather-db/" \
+cosign verify ghcr.io/aphorion/heatherdb:latest \
+  --certificate-identity-regexp "^https://github.com/aphorion/heatherdb/" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 ```
 
@@ -42,7 +42,7 @@ docker run -d --name heatherdb \
   -v heatherdb_data:/var/lib/heatherdb \
   -e HEATHER_ADMIN_USER=admin \
   -e HEATHER_ADMIN_PASSWORD='a-real-password' \
-  ghcr.io/aphorion/heather-db:latest
+  ghcr.io/aphorion/heatherdb:latest
 ```
 
 The named volume is not optional in any deploy you care about — without it the
@@ -90,7 +90,7 @@ docker compose logs heatherdb 2>&1 | grep -A8 first-boot
 ## `.deb` package
 
 ```bash
-curl -fsSLO https://github.com/aphorion/heather-db/releases/latest/download/heatherdb_<version>_amd64.deb
+curl -fsSLO https://github.com/aphorion/heatherdb/releases/latest/download/heatherdb_<version>_amd64.deb
 sudo apt install ./heatherdb_<version>_amd64.deb
 ```
 
@@ -112,7 +112,7 @@ One idempotent script installs system dependencies, Rust if missing, the
 a `/health` smoke test:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/aphorion/heather-db/main/deploy/deploy | sudo bash
+curl -fsSL https://raw.githubusercontent.com/aphorion/heatherdb/main/deploy/deploy | sudo bash
 ```
 
 Re-run it to update the binary or apply config changes. Environment overrides
@@ -168,6 +168,9 @@ nginx, Traefik and a cloud load balancer all work equally well. On Coolify and
 most Kubernetes ingress setups this is already handled for you.
 
 ## Before you expose it
+
+The short version is below; [Run it in production](production.md) is the long
+version, with the checklist.
 
 - **Set a real admin password.** If you do not, the engine generates one and
   prints it once — recoverable from `$HEATHER_DATA_DIR/initial-admin-password`
