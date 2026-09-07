@@ -19,7 +19,7 @@ realfft = "3"
 # Per-database persisted config (db.toml) — see db_config.rs.
 toml = "0.8"
 # Advisory engine lock file (flock) — see server::try_acquire_engine_lock.
-fs4 = { version = "0.13", features = ["sync"] }
+fs4 = { version = "1.1", features = ["sync"] }
 # Used by `Server`'s tests AND by downstream tooling that wants scratch
 # dirs for spin-up scripts; cheap, leave in default deps.
 tempfile = "3"
