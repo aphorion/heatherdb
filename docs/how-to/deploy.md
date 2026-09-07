@@ -21,8 +21,7 @@ bottom.
 ## Docker
 
 ```bash
-docker pull aphorion/heatherdb:latest                 # Docker Hub
-docker pull ghcr.io/aphorion/heatherdb:latest         # GHCR mirror
+docker pull aphorion/heatherdb:latest
 ```
 
 Images are multi-arch (`linux/amd64` + `linux/arm64`), cross-compiled natively
