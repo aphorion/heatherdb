@@ -3,26 +3,32 @@ name: Release
 # Triggered by tags shaped like v*.*.* (e.g. v0.1.0, v1.2.3-rc.1).
 #
 # Builds the `heather` binary (from the `heather_server` crate) for every
-# supported target, packages each as a .tar.gz, generates SHA-256
-# checksums, and attaches everything to a GitHub Release. The two glibc
-# targets also get a `.deb` (apt-installable, systemd unit included) —
+# supported target, packages each as a .tar.gz (.zip on Windows), generates
+# SHA-256 checksums, and attaches everything to a GitHub Release. The two
+# glibc targets also get a `.deb` (apt-installable, systemd unit included) —
 # see packaging/deb/.
 #
-# Linux only for now. The macOS, Windows and FreeBSD targets were removed
-# rather than left failing; re-add them to the matrix when they are wanted.
-#
-# All four targets build via `cross` (not bare `cargo build`), including
+# The four Linux targets build via `cross` (not bare `cargo build`), including
 # x86_64-gnu — cross's docker images pin an old glibc baseline, which is
 # the whole point: a bare `ubuntu-latest` runner build would link against
 # whatever glibc that runner image ships (often newer than what's on a
 # user's box) and silently produce a binary that only runs on equally new
-# distros.
+# distros. macOS and Windows build natively on their own runners.
+#
+# FreeBSD was removed rather than left failing; re-add it to the matrix
+# when it is wanted.
 #
 # Targets:
 #   linux-x86_64-gnu      Linux glibc 2.31+                 (+ .deb, amd64)
 #   linux-x86_64-musl     Linux static (works on Alpine + everything)
 #   linux-aarch64-gnu     Linux glibc 2.31+, arm64           (+ .deb, arm64)
 #   linux-aarch64-musl    Linux static, arm64
+#   macos-aarch64         macOS 11+, Apple silicon      (unsigned, see below)
+#   macos-x86_64          macOS 11+, Intel              (unsigned, see below)
+#   windows-x86_64        Windows 10+, x64                          (.zip)
+#
+# The macOS binaries are neither codesigned nor notarized: a downloaded
+# archive trips Gatekeeper until the user clears the quarantine attribute.
 #
 # Manual trigger: workflow_dispatch with a version input lets you cut a
 # release without pushing a tag (useful for hotfix experiments).
@@ -65,7 +71,7 @@ jobs:
             echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
-  # ─── linux: cross-compile matrix ───────────────────────────────────────────
+  # ─── build matrix: linux (cross) + macOS/Windows (native) ──────────────────
   build:
     name: ${{ matrix.label }}
     needs: prep
@@ -78,23 +84,45 @@ jobs:
             os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
             cross: true                         # old-glibc docker image, see header note
+            strip: true
             deb: true
             deb-arch: amd64
           - label: linux-x86_64-musl
             os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             cross: true                         # use cross-rs for static musl
+            strip: true
             deb: false
           - label: linux-aarch64-gnu
             os: ubuntu-latest
             target: aarch64-unknown-linux-gnu
             cross: true
+            strip: false
             deb: true
             deb-arch: arm64
           - label: linux-aarch64-musl
             os: ubuntu-latest
             target: aarch64-unknown-linux-musl
             cross: true
+            strip: false
+            deb: false
+          - label: macos-aarch64
+            os: macos-14                        # arm64 runner, builds natively
+            target: aarch64-apple-darwin
+            cross: false
+            strip: false                        # `cargo build` output is fine unstripped
+            deb: false
+          - label: macos-x86_64
+            os: macos-14                        # arm64 host, cross-links to x86_64 via the Apple SDK
+            target: x86_64-apple-darwin
+            cross: false
+            strip: false
+            deb: false
+          - label: windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            cross: false
+            strip: false                        # no binutils `strip` on the MSVC runner
             deb: false
 
     steps:
@@ -125,12 +153,14 @@ jobs:
             cargo build --release --locked --target ${{ matrix.target }} -p ${{ env.CARGO_PACKAGE }}
           fi
 
-      - name: Strip binary (same-arch targets only)
-        # The runner is x86_64 — its `strip` can handle both gnu/musl
+      - name: Strip binary (same-arch Linux targets only)
+        # The Linux runner is x86_64 — its `strip` can handle both gnu/musl
         # x86_64 binaries, but not aarch64 ones (no cross-binutils here).
         # aarch64 binaries ship unstripped rather than risk a silent no-op
-        # or a hard failure depending on the runner's binutils build.
-        if: startsWith(matrix.target, 'x86_64')
+        # or a hard failure depending on the runner's binutils build. The
+        # macOS/Windows runners are skipped too (`strip: false`): Windows
+        # has no binutils `strip` at all.
+        if: matrix.strip
         shell: bash
         run: |
           set -euxo pipefail
@@ -139,6 +169,12 @@ jobs:
 
       - name: Package
         id: package
+        # One step for all three platforms — the shapes differ only in the
+        # binary suffix (.exe), the archive format (.zip on Windows, .tar.gz
+        # everywhere else) and the checksum tool (macOS has no `sha256sum`,
+        # only `shasum -a 256`). The $GITHUB_OUTPUT contract (asset=,
+        # checksum=) is identical on every platform so the upload and
+        # manifest jobs stay platform-agnostic.
         shell: bash
         env:
           VERSION: ${{ needs.prep.outputs.version }}
@@ -146,19 +182,40 @@ jobs:
         run: |
           set -euxo pipefail
 
+          # Portable sha256: coreutils on Linux and Git-Bash, BSD shasum on macOS.
+          # Both emit the same "<hash>  <file>" line the manifest job expects.
+          sha256_of() {
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "$1"
+            else
+              shasum -a 256 "$1"
+            fi
+          }
+
+          EXE=""
+          if [ "$RUNNER_OS" = "Windows" ]; then EXE=".exe"; fi
+
           STAGE="${BINARY_NAME}-${VERSION}-${LABEL}"
           mkdir -p "dist/$STAGE"
 
-          BIN="target/${{ matrix.target }}/release/${BINARY_NAME}"
+          BIN="target/${{ matrix.target }}/release/${BINARY_NAME}${EXE}"
           cp "$BIN" "dist/$STAGE/"
           cp README.md     "dist/$STAGE/" 2>/dev/null || true
           cp LICENSE*      "dist/$STAGE/" 2>/dev/null || true
           cp CHANGELOG*    "dist/$STAGE/" 2>/dev/null || true
 
           cd dist
-          ASSET="${STAGE}.tar.gz"
-          tar -czf "$ASSET" "$STAGE"
-          sha256sum "$ASSET" > "${ASSET}.sha256"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            ASSET="${STAGE}.zip"
+            # No `zip` on the Windows runner; PowerShell's Compress-Archive
+            # keeps the same one-directory-inside shape as the tarballs.
+            powershell -NoProfile -Command \
+              "Compress-Archive -Path '${STAGE}' -DestinationPath '${ASSET}' -Force"
+          else
+            ASSET="${STAGE}.tar.gz"
+            tar -czf "$ASSET" "$STAGE"
+          fi
+          sha256_of "$ASSET" > "${ASSET}.sha256"
 
           echo "asset=dist/$ASSET"        >> "$GITHUB_OUTPUT"
           echo "checksum=dist/$ASSET.sha256" >> "$GITHUB_OUTPUT"
@@ -191,7 +248,7 @@ jobs:
           echo "asset=$DEB"          >> "$GITHUB_OUTPUT"
           echo "checksum=${DEB}.sha256" >> "$GITHUB_OUTPUT"
 
-      - name: Upload tarball
+      - name: Upload archive
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.label }}
@@ -232,7 +289,10 @@ jobs:
         working-directory: dist
         run: |
           set -euxo pipefail
-          sha256sum *.tar.gz *.deb > SHA256SUMS.txt
+          # nullglob so a missing class of asset (e.g. no .zip) doesn't hand
+          # sha256sum a literal glob and fail the release.
+          shopt -s nullglob
+          sha256sum *.tar.gz *.zip *.deb > SHA256SUMS.txt
           cat SHA256SUMS.txt
           # Drop per-asset .sha256 sidecars now that we have a single manifest.
           rm -f *.sha256
@@ -260,12 +320,13 @@ jobs:
             echo
             echo "| Platform | Asset |"
             echo "|----------|-------|"
-            for f in dist/*.tar.gz; do
+            for f in dist/*.tar.gz dist/*.zip; do
               [ -f "$f" ] || continue
               name="$(basename "$f")"
-              # crude label parse — strip BIN_NAME-VERSION- prefix
+              # crude label parse — strip BIN_NAME-VERSION- prefix and suffix
               plat="${name#${BINARY_NAME}-${VERSION}-}"
               plat="${plat%.tar.gz}"
+              plat="${plat%.zip}"
               echo "| \`$plat\` | [\`$name\`](https://github.com/${{ github.repository }}/releases/download/${VERSION}/${name}) |"
             done
             for f in dist/*.deb; do
@@ -285,6 +346,13 @@ jobs:
             echo "This installs a \`heatherdb\` systemd service, a dedicated \`heatherdb\` user, and"
             echo "generates admin credentials in \`/etc/heatherdb/env\` — read that file, then"
             echo "\`sudo systemctl start heatherdb\`."
+            echo
+            echo "The macOS binaries are unsigned — clear the download quarantine before"
+            echo "the first run:"
+            echo
+            echo '```sh'
+            echo "xattr -d com.apple.quarantine ./heather"
+            echo '```'
             echo
             echo "Verify with the bundled \`SHA256SUMS.txt\`:"
             echo
@@ -306,5 +374,6 @@ jobs:
           fail_on_unmatched_files: true
           files: |
             dist/*.tar.gz
+            dist/*.zip
             dist/*.deb
             dist/SHA256SUMS.txt
