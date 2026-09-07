@@ -21,7 +21,15 @@ EnvironmentFile=-/etc/heatherdb/env
 Environment=HEATHER_DATA_DIR=/var/lib/heatherdb
 Environment=HEATHER_DIMENSION=128
 Environment=HEATHER_PORT=6380
-Environment=HEATHER_HOST=0.0.0.0
+# Loopback by default: the engine authenticates requests but has no notion of
+# your application's users, so it is not a service to put on a public
+# interface. Set HEATHER_HOST=0.0.0.0 in /etc/heatherdb/env deliberately, and
+# firewall it, if something off-box genuinely needs to reach it.
+Environment=HEATHER_HOST=127.0.0.1
+# Applies ONLY to the auto-created `default` database, and only on the boot
+# that creates it. Databases your application creates set their own ceiling via
+# map_size_mb on POST /db — raising this will not resize them. To raise an
+# existing one, edit map_size_mb in its db.toml and restart; no re-ingest.
 Environment=HEATHER_MAP_SIZE_MB=4096
 Environment=HEATHER_REQUEST_TIMEOUT=600
 Environment=RUST_LOG=info

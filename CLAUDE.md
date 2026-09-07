@@ -11,10 +11,14 @@ Associative Memory. The repo holds **the engine**:
   algebra (`Cargo.toml` lists 3 members).
 - **`deploy/`** — `deploy/deploy` is a self-contained in-VPS install
   script + the systemd unit it drops.
+- **`docs/`** — the documentation tree (Diataxis-shaped: one tutorial,
+  how-to guides, reference, explanation). `docs/README.md` is the index.
+  Keep it in step with the code — the HTTP reference and the config
+  reference are derived from `routes.rs` / `models.rs` / `config.rs`.
 
-`docs/`, `fovea/` (the Tauri operator GUI), and `heather_fornix/`
-(model-ingestion CLI) have been removed pending a rewrite — don't
-reintroduce references to them without checking they actually exist first.
+`fovea/` (the Tauri operator GUI) and `heather_fornix/` (model-ingestion
+CLI) have been removed pending a rewrite — don't reintroduce references to
+them without checking they actually exist first.
 
 ## Common commands
 
@@ -156,7 +160,8 @@ _trash/                  # dropped DBs land here (recoverable by mv-back)
 
 `.github/workflows/`:
 - **ci.yml** — `fmt → clippy → test` across Linux/macOS/Windows × stable+beta,
-  plus `doc`, `audit`, `msrv` (1.84 — required by `resolver = "3"`).
+  plus `doc`, `audit`, `msrv` (1.88 — `edition = "2024"` needs 1.85 and
+  the let-chains in `heather_db::read` need 1.88).
 - **release.yml** — fires on `v*.*.*` tags. Builds 4 Linux targets
   (x86_64/aarch64 × gnu/musl).
 - **docker.yml** — multi-arch (amd64+arm64) image to `ghcr.io`.

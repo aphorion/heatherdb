@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::config::EAMConfig;
-use crate::db_config::{DbConfig, validate_db_name};
+use crate::db_config::{DEFAULT_MAP_SIZE_MB, DbConfig, validate_db_name};
 use crate::error::{HeatherError, Result};
 use crate::hive::Hive;
 
@@ -103,14 +103,23 @@ impl Server {
     /// (commonly 128).
     pub fn open(root: &Path, default_dimension: usize) -> Result<Self> {
         // Default to a data-seeded index (no random pre-seeded locations).
-        Self::open_with(root, default_dimension, 0)
+        Self::open_with(root, default_dimension, 0, DEFAULT_MAP_SIZE_MB)
     }
 
     /// Like [`Server::open`], but also sets the initial hard-location count
-    /// (`l_0`) for the default DB created on a fresh boot. `default_l_0 == 0`
-    /// is data-seeded (the agreed default); a positive value pre-seeds that
-    /// many random locations.
-    pub fn open_with(root: &Path, default_dimension: usize, default_l_0: usize) -> Result<Self> {
+    /// (`l_0`) and the LMDB map ceiling for the default DB created on a fresh
+    /// boot. `default_l_0 == 0` is data-seeded (the agreed default); a positive
+    /// value pre-seeds that many random locations.
+    ///
+    /// Both extra knobs apply **only** to the `default` database, and only on
+    /// the boot that creates it. Every other database carries its own values in
+    /// its `db.toml`, set at create time and re-read on each mount.
+    pub fn open_with(
+        root: &Path,
+        default_dimension: usize,
+        default_l_0: usize,
+        default_map_size_mb: usize,
+    ) -> Result<Self> {
         std::fs::create_dir_all(root)
             .map_err(|e| HeatherError::Storage(format!("create root {}: {e}", root.display())))?;
 
@@ -203,6 +212,7 @@ impl Server {
         if needs_default {
             let mut cfg = DbConfig::new(DEFAULT_DB, default_dimension)?;
             cfg.eam.l_0 = default_l_0;
+            cfg.map_size_mb = default_map_size_mb;
             cfg.eam.validate()?;
             server.create_database(cfg)?;
         }
@@ -404,6 +414,47 @@ mod tests {
         assert_eq!(server.databases().unwrap(), vec![DEFAULT_DB.to_string()]);
         let cfg = server.database_config(DEFAULT_DB).unwrap();
         assert_eq!(cfg.dimension(), 64);
+        // `open` keeps the historical ceiling rather than inheriting whatever
+        // the CLI's own default happens to be.
+        assert_eq!(cfg.map_size_mb, DEFAULT_MAP_SIZE_MB);
+    }
+
+    /// The map ceiling passed to `open_with` reaches the `default` database it
+    /// creates. This was previously accepted and dropped on the floor, which
+    /// left the startup log reporting a size no database had been given.
+    #[test]
+    fn open_with_map_size_reaches_default_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open_with(dir.path(), 64, 0, 777).unwrap();
+        let cfg = server.database_config(DEFAULT_DB).unwrap();
+        assert_eq!(cfg.map_size_mb, 777);
+    }
+
+    /// Raising a ceiling is an edit to `db.toml` plus a restart, not a
+    /// re-ingest: the persisted value is the source of truth on mount and
+    /// overrides whatever the caller passes.
+    ///
+    /// Only the persistence half is asserted here. Actually re-opening the
+    /// environment at the new size requires a **fresh process** — LMDB rejects
+    /// a second open of the same path with different options in-process
+    /// ("an environment is already opened with different options"), which is
+    /// precisely why the operator procedure is `systemctl restart` rather than
+    /// a reload.
+    #[test]
+    fn raised_map_size_in_db_toml_wins_on_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open_with(dir.path(), 64, 0, 64).unwrap();
+        assert_eq!(server.database_config(DEFAULT_DB).unwrap().map_size_mb, 64);
+
+        let cfg_path = dir.path().join("db").join(DEFAULT_DB).join("db.toml");
+        let raised = std::fs::read_to_string(&cfg_path)
+            .unwrap()
+            .replace("map_size_mb = 64", "map_size_mb = 512");
+        std::fs::write(&cfg_path, raised).unwrap();
+
+        // What the next process would mount, regardless of the passed default.
+        let reloaded = DbConfig::load(&cfg_path).unwrap();
+        assert_eq!(reloaded.map_size_mb, 512);
     }
 
     #[test]

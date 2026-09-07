@@ -47,6 +47,10 @@ resources: {}
 # Non-secret engine tunables — see docs/api.md / CLAUDE.md for details.
 env:
   dimension: 128
+  # Applies to the auto-created `default` database only, on the boot that
+  # creates it. Databases you create set their own ceiling via map_size_mb on
+  # POST /db; changing this will not resize them. To raise an existing one,
+  # edit map_size_mb in its db.toml and restart the pod — no re-ingest.
   mapSizeMb: 4096
   requestTimeoutSecs: 600
   logLevel: info
