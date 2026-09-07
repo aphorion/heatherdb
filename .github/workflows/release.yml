@@ -377,3 +377,38 @@ jobs:
             dist/*.zip
             dist/*.deb
             dist/SHA256SUMS.txt
+
+      - name: Announce the version
+        # Runs after the release is published, so the endpoint can never name a
+        # version whose assets do not exist yet. Pre-releases are skipped — the
+        # site advertises stable only.
+        if: ${{ !contains(needs.prep.outputs.version, '-') }}
+        env:
+          ENVAAS_KEY: ${{ secrets.ENVAAS_KEY }}
+          VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${ENVAAS_KEY:-}" ]; then
+            echo "::warning::ENVAAS_KEY is not set — the site keeps advertising the previous version"
+            exit 0
+          fi
+
+          # The site reads a bare version, without the leading v.
+          BARE="${VERSION#v}"
+
+          code=$(curl -sS -o /tmp/envaas.out -w '%{http_code}' -X PUT \
+            -H "Authorization: Bearer ${ENVAAS_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "{\"value\": \"${BARE}\", \"is_public\": true}" \
+            https://envaas.dev/iz48cCJA/production/HEATHER_LATEST_VERSION)
+
+          if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+            echo "announced ${BARE}"
+          else
+            # The release itself succeeded; a hard failure here would imply
+            # otherwise. Surface it loudly and let the operator retry.
+            echo "::error::envaas returned HTTP ${code} — rerun this step or set the value by hand"
+            cat /tmp/envaas.out || true
+            exit 1
+          fi
