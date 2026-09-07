@@ -102,7 +102,7 @@ jobs:
           mkdir -p dist/linux-${{ matrix.arch }}
           cp target/${{ matrix.target }}/release/heather dist/linux-${{ matrix.arch }}/heather
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux-${{ matrix.arch }}
           path: dist/linux-${{ matrix.arch }}/heather
