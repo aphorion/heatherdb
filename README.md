@@ -163,7 +163,7 @@ Tagging `v*.*.*` builds seven targets — Linux x86_64 and aarch64 in gnu and
 musl, macOS on Apple Silicon and Intel, and Windows x86_64 — and publishes them
 to [GitHub Releases](https://github.com/aphorion/heatherdb/releases) with a
 combined checksum manifest. Multi-arch container images go to
-`aphorion/heatherdb` on Docker Hub. macOS binaries are unsigned, so a downloaded
+`aphorion/heatherdb` on Docker Hub and `ghcr.io/aphorion/heatherdb`. macOS binaries are unsigned, so a downloaded
 archive carries `com.apple.quarantine` until it is cleared.
 
 ## Related repos
