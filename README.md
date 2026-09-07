@@ -181,6 +181,20 @@ archive carries `com.apple.quarantine` until it is cleared.
 Energy-Based Retrieval"*, and the lineage described in
 [Pentti Kanerva](./docs/explanation/kanerva.md).
 
+## Sponsor
+
+HeatherDB is Apache-2.0 and developed in the open by
+[Aphorion Labs](https://aphorion.co) in Nairobi. Sponsorship pays for the
+unglamorous half of that — measured benchmarks, documentation, release
+engineering across seven targets, and the time to answer questions from people
+building on it.
+
+[**Sponsor on GitHub**](https://github.com/sponsors/aphorion)
+
+If you are deploying HeatherDB commercially and want support, ingestion help or
+a say in the roadmap, [get in touch](https://aphorion.co/contact) — that is a
+conversation rather than a checkout.
+
 ## License
 
 Apache License 2.0 — see [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
