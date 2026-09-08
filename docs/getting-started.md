@@ -40,7 +40,8 @@ version, so set it once — the [downloads page](https://heather.aphorion.co/dow
 lists the current one:
 
 ```bash
-VERSION=v0.3.0
+VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+  https://github.com/aphorion/heatherdb/releases/latest | sed 's|.*/||')
 curl -fsSLO https://github.com/aphorion/heatherdb/releases/download/$VERSION/heather-$VERSION-macos-aarch64.tar.gz
 tar -xzf heather-$VERSION-macos-aarch64.tar.gz
 sudo cp heather-$VERSION-macos-aarch64/heather /usr/local/bin/
@@ -64,7 +65,8 @@ The script picks the right architecture and libc, checks the SHA-256, and
 installs to `/usr/local/bin` (or `~/.local/bin` without sudo). By hand:
 
 ```bash
-VERSION=v0.3.0
+VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+  https://github.com/aphorion/heatherdb/releases/latest | sed 's|.*/||')
 curl -fsSLO https://github.com/aphorion/heatherdb/releases/download/$VERSION/heather-$VERSION-linux-x86_64-gnu.tar.gz
 tar -xzf heather-$VERSION-linux-x86_64-gnu.tar.gz
 sudo cp heather-$VERSION-linux-x86_64-gnu/heather /usr/local/bin/
@@ -78,7 +80,8 @@ service, a dedicated system user, and admin credentials generated into
 `/etc/heatherdb/env` on first install.
 
 ```bash
-VERSION=v0.3.0
+VERSION=$(curl -fsSL -o /dev/null -w '%{url_effective}' \
+  https://github.com/aphorion/heatherdb/releases/latest | sed 's|.*/||')
 curl -fsSLO https://github.com/aphorion/heatherdb/releases/download/$VERSION/heatherdb_${VERSION#v}_amd64.deb
 sudo apt install ./heatherdb_${VERSION#v}_amd64.deb
 ```
@@ -103,7 +106,7 @@ By hand, take the zip from the
 `heather.exe` somewhere on your `PATH`:
 
 ```powershell
-$VERSION = "v0.3.0"
+$VERSION = (Invoke-WebRequest https://github.com/aphorion/heatherdb/releases/latest).BaseResponse.RequestMessage.RequestUri.Segments[-1]
 Invoke-WebRequest "https://github.com/aphorion/heatherdb/releases/download/$VERSION/heather-$VERSION-windows-x86_64.zip" -OutFile heather.zip
 Expand-Archive heather.zip -DestinationPath $env:LOCALAPPDATA\Heather
 $env:PATH += ";$env:LOCALAPPDATA\Heather"

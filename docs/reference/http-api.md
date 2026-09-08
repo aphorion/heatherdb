@@ -28,7 +28,7 @@ endpoint that documents it.
 
 ## Route table
 
-45 endpoints, as of `heather_server` 0.3.0. Collection and algebra routes
+45 endpoints, verified against `heather_server` 0.4.1. Collection and algebra routes
 exist in two shapes; both are listed, and both link to the one endpoint that
 documents them. The `/db/{db}` shape addresses any database, the legacy shape
 addresses `default`.

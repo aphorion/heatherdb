@@ -3,7 +3,7 @@
 The front door to the HTTP API section. Everything here applies to every
 endpoint; the per-resource pages document only what is specific to a route.
 
-Current as of `heather_server` 0.3.0. Bodies are JSON
+Verified against `heather_server` 0.4.1. Bodies are JSON
 (`Content-Type: application/json`); responses are JSON.
 
 Source of truth: `heather_server/src/main.rs` (route table),
