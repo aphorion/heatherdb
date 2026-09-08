@@ -219,6 +219,25 @@ random 24-character password, prints it once on stderr, and writes it to
 
 Leave that terminal running and open a second one for the rest.
 
+**There is no `--daemon` flag, and that is deliberate.** The engine runs in the
+foreground and logs to stdout, because every supervisor you would actually use
+prefers it that way: systemd wants `Type=simple`, and a container needs the
+engine to *be* the process rather than fork away from it. A process that
+daemonises itself hides its exit code, loses its logs, and forces the
+supervisor to chase a PID file.
+
+To run it in the background, use the thing that is already watching it:
+
+| Where | How |
+|---|---|
+| A server | the `.deb`, which installs a systemd unit — `systemctl start heatherdb` |
+| A container | `docker run -d`, as below |
+| Your laptop, briefly | `heather … > heather.log 2>&1 &` |
+
+The last one is fine for a tutorial and wrong for anything you care about,
+because nothing restarts it. See [Run it in
+production](how-to/production.md).
+
 ### Or run it in a container
 
 If you would rather not install anything, the image is the same engine and the

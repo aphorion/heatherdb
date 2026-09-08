@@ -104,6 +104,12 @@ Four unauthenticated routes exist for exactly this:
 
 Everything else requires credentials, so do not point a probe at it.
 
+**Run it in the foreground, under a supervisor.** The engine does not
+daemonise and takes no `--daemon` flag. Use `Type=simple` with `Restart=always`
+under systemd — which is what the `.deb` installs — or `restart: unless-stopped`
+under Compose. Logs go to stdout, so the supervisor captures them and the exit
+code means something.
+
 **Stop gracefully.** SIGTERM and Ctrl-C flush staged audit records; SIGKILL
 loses whatever is still buffered. Give the engine a real termination grace
 period — 30 seconds is plenty — rather than the default impatience of some
