@@ -31,7 +31,10 @@ neural network in the loop.
 None of this requires training data, GPUs, retraining schedules, or model
 versioning. It requires an HTTP POST.
 
-Apache-2.0 licensed, and it runs on a laptop.
+AGPL-3.0 licensed, and it runs on a laptop. The engine remains open: anyone
+can run, study, modify, and redistribute it. If you modify the engine and
+offer it as a network service, the corresponding source must remain available
+to the users of that service.
 
 ## Documentation
 
@@ -184,7 +187,7 @@ Energy-Based Retrieval"*, and the lineage described in
 
 ## Sponsor
 
-HeatherDB is Apache-2.0 and developed in the open by
+HeatherDB is AGPL-3.0 and developed in the open by
 [Aphorion Labs](https://aphorion.co) in Nairobi. Sponsorship pays for the
 unglamorous half of that — measured benchmarks, documentation, release
 engineering across seven targets, and the time to answer questions from people
@@ -198,9 +201,10 @@ conversation rather than a checkout.
 
 ## License
 
-Apache License 2.0 — see [`LICENSE`](./LICENSE) and [`NOTICE`](./NOTICE).
+GNU Affero General Public License 3.0 — see [`LICENSE`](./LICENSE) and
+[`NOTICE`](./NOTICE).
 
-Permissive, with an explicit patent grant: you can use, modify, distribute
-and build products on HeatherDB, commercially or otherwise, and the patent
-licence means adopting it does not leave you exposed to a later claim over
-the algorithm.
+You can use, modify, distribute, and build commercial products around
+HeatherDB. The AGPL keeps modifications to the networked engine available to
+the people using those modifications. Applications that merely communicate
+with HeatherDB over its API are not thereby licensed under the AGPL.

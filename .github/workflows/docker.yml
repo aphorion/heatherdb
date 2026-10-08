@@ -193,7 +193,7 @@ jobs:
             org.opencontainers.image.description=Memory that learns — associative-memory database
             org.opencontainers.image.vendor=Aphorion Labs
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.licenses=NOASSERTION (proprietary, all rights reserved)
+            org.opencontainers.image.licenses=AGPL-3.0-only
 
       - name: Build (and push outside PR)
         id: build

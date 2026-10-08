@@ -4,7 +4,7 @@ version = "0.4.1"
 edition = "2024"
 rust-version = "1.88"
 description = "HeatherDB — an associative-memory database with an HTTP API"
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-only"
 
 # The binary is named `heather` (not `heather_server`) — operators get
 # a short, memorable command:

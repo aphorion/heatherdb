@@ -3,6 +3,7 @@ name = "heather_db"
 version = "0.4.1"
 edition = "2024"
 rust-version = "1.88"
+license = "AGPL-3.0-only"
 
 [dependencies]
 heed = "0.20"
