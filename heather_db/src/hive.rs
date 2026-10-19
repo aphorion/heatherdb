@@ -45,7 +45,11 @@ impl Hive {
         audit: AuditConfig,
     ) -> Result<Self> {
         config.validate()?;
-        let store = Arc::new(Store::open(path, map_size_mb)?);
+        let store = Arc::new(Store::open_with_precision(
+            path,
+            map_size_mb,
+            config.precision,
+        )?);
         let audit = AuditLog::open(&store, audit)?;
 
         Ok(Hive {
