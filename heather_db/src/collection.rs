@@ -1543,6 +1543,144 @@ impl Collection {
         Ok(doc_id)
     }
 
+    /// Write many patterns with their metadata in one atomic transaction.
+    /// Returns the document IDs, in input order.
+    ///
+    /// The result is the same as calling [`Self::write_with_metadata`] once per
+    /// item, in order: each adaptive write sees the locations the earlier ones
+    /// joined, migrated or created. Only persistence is batched. Every touched
+    /// location is stored once, in its final state, every location's posting
+    /// list is rewritten once with all of its new documents, and the whole
+    /// request commits once instead of once per vector.
+    ///
+    /// As with [`Self::write_batch`], in-memory state is updated before the
+    /// commit; a failed commit leaves it ahead of the store until reload.
+    pub fn write_batch_with_metadata(
+        &self,
+        items: &[(impl AsRef<[f64]>, impl AsRef<[u8]>)],
+    ) -> Result<Vec<u64>> {
+        for (input, _) in items {
+            vec_ops::validate_vector(input.as_ref())?;
+        }
+
+        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+
+        let d = inner.config.d;
+        for (input, _) in items {
+            if input.as_ref().len() != d {
+                return Err(HeatherError::DimensionMismatch {
+                    expected: d,
+                    got: input.as_ref().len(),
+                });
+            }
+        }
+
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        inner.version += 1;
+
+        let mut rng = rand::thread_rng();
+        // Indices into `inner.locations` of every location joined or created.
+        let mut touched = std::collections::BTreeSet::new();
+        // Location id -> documents to append to its posting list, in order.
+        let mut postings: std::collections::BTreeMap<u64, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        let mut documents = Vec::with_capacity(items.len());
+
+        for (input, metadata) in items {
+            let input = input.as_ref();
+            let result = {
+                let EAMInner {
+                    ref config,
+                    ref mut locations,
+                    ref mut next_id,
+                    ref mut eta,
+                    ref landmarks,
+                    ref id_lookup,
+                    ..
+                } = *inner;
+                let r = write::adaptive_write(
+                    input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                );
+                *eta = r.eta;
+                r
+            };
+
+            let doc_id = inner.doc_next_id;
+            inner.doc_next_id += 1;
+
+            // As in write_with_metadata: the document goes in the posting list
+            // of every location it joined and every location it created.
+            for &idx in &result.modified_indices {
+                touched.insert(idx);
+                postings
+                    .entry(inner.locations[idx].id.0)
+                    .or_default()
+                    .push(doc_id);
+            }
+
+            inner.sync_addresses(&result.modified_indices);
+
+            if !result.new_locations.is_empty() {
+                let start = inner.locations.len();
+                for loc in &result.new_locations {
+                    postings.entry(loc.id.0).or_default().push(doc_id);
+                }
+                inner.locations.extend(result.new_locations);
+                inner.extend_id_lookup(start);
+                inner.append_addresses(start);
+                touched.extend(start..inner.locations.len());
+            }
+
+            documents.push((
+                doc_id,
+                bincode::serialize(&(input.to_vec(), metadata.as_ref().to_vec()))?,
+            ));
+        }
+
+        let mut txn = self.store.write_txn()?;
+
+        for &idx in &touched {
+            self.store
+                .put_location(&mut txn, self.collection_id, &inner.locations[idx])?;
+        }
+
+        for (doc_id, data) in &documents {
+            self.store
+                .put_document(&mut txn, self.collection_id, *doc_id, data)?;
+        }
+
+        for (loc_id, doc_ids) in &postings {
+            self.store
+                .append_docs_to_location(&mut txn, self.collection_id, *loc_id, doc_ids)?;
+        }
+
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "next_id",
+            &bincode::serialize(&inner.next_id)?,
+        )?;
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "eta",
+            &bincode::serialize(&inner.eta)?,
+        )?;
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "doc_next_id",
+            &bincode::serialize(&inner.doc_next_id)?,
+        )?;
+
+        txn.commit()?;
+
+        Ok(documents.into_iter().map(|(id, _)| id).collect())
+    }
+
     /// Retrieve a document's metadata and vector by its ID.
     pub fn get_document(&self, write_index: u64) -> Result<Option<(Vec<f64>, Vec<u8>)>> {
         match self.store.get_document(self.collection_id, write_index)? {
@@ -3300,6 +3438,120 @@ mod tests {
                 "document {id} written to a spawned location is unreachable"
             );
         }
+    }
+
+    /// A batched write stores and indexes every document exactly as one-by-one
+    /// writes do: ids in input order, metadata kept, each document findable by
+    /// its own vector, whether it spawned a location or joined one, including
+    /// a location created earlier in the same batch.
+    #[test]
+    fn batched_metadata_writes_index_every_document() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let mut config = EAMConfig::new(d).unwrap();
+        config.k = 1;
+        config.gamma = 0.0;
+        let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+
+        // Orthogonal patterns spawn locations; the repeats join the location
+        // their first copy created in this same batch.
+        let vs = [
+            basis_vec(d, 0),
+            basis_vec(d, 4),
+            basis_vec(d, 0),
+            basis_vec(d, 8),
+            basis_vec(d, 4),
+        ];
+        let items: Vec<(Vec<f64>, Vec<u8>)> = vs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.clone(), format!(r#"{{"i":{i}}}"#).into_bytes()))
+            .collect();
+
+        let ids = col.write_batch_with_metadata(&items).unwrap();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+
+        for (i, (v, id)) in vs.iter().zip(&ids).enumerate() {
+            let got = col.query_documents(v, 10).unwrap();
+            assert!(
+                got.iter().any(|(g, _, _)| g == id),
+                "batched document {id} is unreachable"
+            );
+            let (vector, meta) = col.get_document(*id).unwrap().unwrap();
+            assert_eq!(&vector, v);
+            assert_eq!(meta, format!(r#"{{"i":{i}}}"#).into_bytes());
+        }
+
+        // A later write continues the document ids, and an empty batch is a no-op.
+        assert!(
+            col.write_batch_with_metadata(&Vec::<(Vec<f64>, Vec<u8>)>::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            col.write_with_metadata(&basis_vec(d, 12), b"{}").unwrap(),
+            5
+        );
+    }
+
+    /// Everything a batched write persists survives a reload: locations,
+    /// documents, posting lists and the document id counter.
+    #[test]
+    fn batched_metadata_writes_survive_a_reload() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let mut config = EAMConfig::new(d).unwrap();
+        config.k = 1;
+        config.gamma = 0.0;
+        let vs = [
+            basis_vec(d, 0),
+            basis_vec(d, 4),
+            basis_vec(d, 8),
+            basis_vec(d, 0),
+        ];
+        let items: Vec<(Vec<f64>, &[u8])> =
+            vs.iter().map(|v| (v.clone(), b"{}" as &[u8])).collect();
+
+        let (ids, locations) = {
+            let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+            let ids = col.write_batch_with_metadata(&items).unwrap();
+            (ids, col.num_locations().unwrap())
+        };
+
+        let col = Collection::load(col_id, "docs".into(), store, &config).unwrap();
+        assert_eq!(col.num_locations().unwrap(), locations);
+        for (v, id) in vs.iter().zip(&ids) {
+            assert!(
+                col.query_documents(v, 10)
+                    .unwrap()
+                    .iter()
+                    .any(|(g, _, _)| g == id)
+            );
+        }
+        assert_eq!(
+            col.write_with_metadata(&basis_vec(d, 12), b"{}").unwrap(),
+            ids.len() as u64
+        );
+    }
+
+    /// A dimension mismatch anywhere in the batch rejects the whole batch
+    /// before anything is written.
+    #[test]
+    fn batched_metadata_writes_reject_a_bad_item_without_writing() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "docs".into(), store, &config).unwrap();
+        let items = vec![
+            (basis_vec(d, 0), b"{}".to_vec()),
+            (vec![1.0; 8], b"{}".to_vec()),
+        ];
+
+        assert!(col.write_batch_with_metadata(&items).is_err());
+        assert_eq!(col.write_with_metadata(&basis_vec(d, 0), b"{}").unwrap(), 0);
     }
 
     /// Deletion removes a document from retrieval and from every posting
