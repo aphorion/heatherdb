@@ -70,6 +70,9 @@ fn widen(v: &[f32]) -> Vec<f64> {
     v.iter().map(|&x| f64::from(x)).collect()
 }
 
+/// A stored document: its id and its serialised (vector, metadata).
+pub type RawDocument = (u64, Vec<u8>);
+
 impl Store {
     /// Opens a store that keeps vectors in f64.
     pub fn open(path: &Path, map_size_mb: usize) -> Result<Self> {
@@ -370,6 +373,31 @@ impl Store {
         let key = document_key(collection_id, write_index);
         let val = self.documents_db.get(txn, &key)?;
         Ok(val.map(|v| v.to_vec()))
+    }
+
+    /// One page of a collection's documents in id order, and how many there
+    /// are in all. Only the page's values are copied.
+    pub fn list_documents_page(
+        &self,
+        collection_id: u32,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<RawDocument>, usize)> {
+        let rtxn = self.env.read_txn()?;
+        let prefix = collection_prefix(collection_id);
+        let mut docs = Vec::with_capacity(limit.min(1024));
+        let mut total = 0;
+        for result in self.documents_db.prefix_iter(&rtxn, &prefix)? {
+            let (key, value) = result?;
+            if total >= offset && docs.len() < limit {
+                let idx_bytes: [u8; 8] = key[4..12].try_into().map_err(|_| {
+                    HeatherError::Storage("invalid document key length".to_string())
+                })?;
+                docs.push((u64::from_be_bytes(idx_bytes), value.to_vec()));
+            }
+            total += 1;
+        }
+        Ok((docs, total))
     }
 
     pub fn list_documents(&self, collection_id: u32) -> Result<Vec<(u64, Vec<u8>)>> {
