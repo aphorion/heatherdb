@@ -3,6 +3,7 @@ use std::path::Path;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 
+use crate::config::Precision;
 use crate::error::{HeatherError, Result};
 use crate::location::{HardLocation, LocationId};
 
@@ -40,6 +41,8 @@ fn metadata_key(collection_id: u32, key: &str) -> Vec<u8> {
 
 pub struct Store {
     env: Env,
+    /// How vectors are encoded on disk (see [`crate::config::Precision`]).
+    precision: Precision,
     registry_db: Database<Bytes, Bytes>,
     locations_db: Database<Bytes, Bytes>,
     metadata_db: Database<Bytes, Bytes>,
@@ -48,8 +51,38 @@ pub struct Store {
     audit_db: Database<Bytes, Bytes>,
 }
 
+/// A [`HardLocation`] with f32 vectors, as an f32 store keeps it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CompactLocation {
+    id: LocationId,
+    address: Vec<f32>,
+    counter: Vec<f32>,
+    write_count: f64,
+    neighbors: Vec<u64>,
+    surprise_mass: f64,
+}
+
+fn narrow(v: &[f64]) -> Vec<f32> {
+    v.iter().map(|&x| x as f32).collect()
+}
+
+fn widen(v: &[f32]) -> Vec<f64> {
+    v.iter().map(|&x| f64::from(x)).collect()
+}
+
 impl Store {
+    /// Opens a store that keeps vectors in f64.
     pub fn open(path: &Path, map_size_mb: usize) -> Result<Self> {
+        Self::open_with_precision(path, map_size_mb, Precision::F64)
+    }
+
+    /// Opens a store that keeps vectors at `precision`. A store must always be
+    /// opened with the precision it was created with (`db.toml` records it).
+    pub fn open_with_precision(
+        path: &Path,
+        map_size_mb: usize,
+        precision: Precision,
+    ) -> Result<Self> {
         std::fs::create_dir_all(path)
             .map_err(|e| HeatherError::Storage(format!("failed to create dir: {e}")))?;
 
@@ -71,6 +104,7 @@ impl Store {
 
         Ok(Store {
             env,
+            precision,
             registry_db,
             locations_db,
             metadata_db,
@@ -204,7 +238,7 @@ impl Store {
         loc: &HardLocation,
     ) -> Result<()> {
         let key = location_key(collection_id, loc.id.0);
-        let data = bincode::serialize(loc)?;
+        let data = self.encode_location(loc)?;
         self.locations_db.put(txn, &key, &data)?;
         Ok(())
     }
@@ -227,10 +261,62 @@ impl Store {
         let iter = self.locations_db.prefix_iter(&rtxn, &prefix)?;
         for result in iter {
             let (_key, value) = result?;
-            let loc: HardLocation = bincode::deserialize(value)?;
-            locations.push(loc);
+            locations.push(self.decode_location(value)?);
         }
         Ok(locations)
+    }
+
+    // --- Vector encoding (by precision) ---
+
+    fn encode_location(&self, loc: &HardLocation) -> Result<Vec<u8>> {
+        Ok(match self.precision {
+            Precision::F64 => bincode::serialize(loc)?,
+            Precision::F32 => bincode::serialize(&CompactLocation {
+                id: loc.id,
+                address: narrow(&loc.address),
+                counter: narrow(&loc.counter),
+                write_count: loc.write_count,
+                neighbors: loc.neighbors.clone(),
+                surprise_mass: loc.surprise_mass,
+            })?,
+        })
+    }
+
+    fn decode_location(&self, bytes: &[u8]) -> Result<HardLocation> {
+        Ok(match self.precision {
+            Precision::F64 => bincode::deserialize(bytes)?,
+            Precision::F32 => {
+                let c: CompactLocation = bincode::deserialize(bytes)?;
+                HardLocation {
+                    id: c.id,
+                    address: widen(&c.address),
+                    counter: widen(&c.counter),
+                    write_count: c.write_count,
+                    neighbors: c.neighbors,
+                    surprise_mass: c.surprise_mass,
+                }
+            }
+        })
+    }
+
+    /// A document's stored bytes: its vector (at the store's precision) and
+    /// its metadata.
+    pub fn encode_document(&self, vector: &[f64], metadata: &[u8]) -> Result<Vec<u8>> {
+        Ok(match self.precision {
+            Precision::F64 => bincode::serialize(&(vector, metadata))?,
+            Precision::F32 => bincode::serialize(&(narrow(vector), metadata))?,
+        })
+    }
+
+    /// The vector and metadata of a stored document.
+    pub fn decode_document(&self, bytes: &[u8]) -> Result<(Vec<f64>, Vec<u8>)> {
+        Ok(match self.precision {
+            Precision::F64 => bincode::deserialize(bytes)?,
+            Precision::F32 => {
+                let (vector, metadata): (Vec<f32>, Vec<u8>) = bincode::deserialize(bytes)?;
+                (widen(&vector), metadata)
+            }
+        })
     }
 
     // --- Metadata operations (collection-scoped) ---
@@ -738,5 +824,55 @@ mod tests {
         assert_eq!(store.get_collection_id("doomed").unwrap(), None);
         assert_eq!(store.load_all_locations(col_id).unwrap().len(), 0);
         assert!(store.load_metadata(col_id, "next_id").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    /// An f32 store keeps vectors at f32 (rounded once, widened on load) in
+    /// about half the bytes; an f64 store keeps them exactly.
+    #[test]
+    fn f32_stores_round_trip_at_f32_in_half_the_space() {
+        let vector: Vec<f64> = (0..256).map(|i| (i as f64).sin() / 3.0).collect();
+        let rounded: Vec<f64> = vector.iter().map(|&x| f64::from(x as f32)).collect();
+
+        let dir32 = tempfile::TempDir::new().unwrap();
+        let s32 = Store::open_with_precision(dir32.path(), 16, Precision::F32).unwrap();
+        let dir64 = tempfile::TempDir::new().unwrap();
+        let s64 = Store::open(dir64.path(), 16).unwrap();
+
+        let d32 = s32.encode_document(&vector, b"{}").unwrap();
+        let d64 = s64.encode_document(&vector, b"{}").unwrap();
+        assert!(
+            d32.len() * 10 < d64.len() * 6,
+            "{} vs {} bytes",
+            d32.len(),
+            d64.len()
+        );
+        assert_eq!(
+            s32.decode_document(&d32).unwrap(),
+            (rounded.clone(), b"{}".to_vec())
+        );
+        assert_eq!(
+            s64.decode_document(&d64).unwrap(),
+            (vector.clone(), b"{}".to_vec())
+        );
+
+        let mut loc = HardLocation::new(LocationId(7), vector.clone());
+        loc.counter = vector.clone();
+        loc.write_count = 2.5;
+        loc.neighbors = vec![1, 2];
+        let mut txn = s32.write_txn().unwrap();
+        s32.put_location(&mut txn, 0, &loc).unwrap();
+        txn.commit().unwrap();
+        let back = s32.load_all_locations(0).unwrap().pop().unwrap();
+        assert_eq!(
+            (back.id, back.write_count, back.neighbors.clone()),
+            (LocationId(7), 2.5, vec![1, 2])
+        );
+        assert_eq!(back.address, rounded);
+        assert_eq!(back.counter, rounded);
     }
 }

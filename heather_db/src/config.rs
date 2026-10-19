@@ -58,10 +58,25 @@ pub struct EAMConfig {
     /// reproduce trained attention. Default true (the adaptive EAM behavior).
     #[serde(default = "default_competitive")]
     pub competitive: bool,
+    /// How vectors are stored on disk: `f64` (default, exact) or `f32`
+    /// (half the size: locations and documents are rounded to f32 when
+    /// written and widened back on load; all math stays in f64). Fixed for
+    /// a database's lifetime, like its dimension.
+    #[serde(default)]
+    pub precision: Precision,
 }
 
 fn default_competitive() -> bool {
     true
+}
+
+/// On-disk vector precision. See [`EAMConfig::precision`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Precision {
+    #[default]
+    F64,
+    F32,
 }
 
 /// Bits to store one new hard location: log2(L+1) address bits among the existing
@@ -104,6 +119,7 @@ impl EAMConfig {
             num_landmarks: 32,
             mdl_gate: false,
             competitive: true,
+            precision: Precision::F64,
         };
         config.validate()?;
         Ok(config)
