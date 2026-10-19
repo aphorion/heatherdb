@@ -228,6 +228,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
         }
     };
 
+    for (name, reason) in server.refused_databases() {
+        tracing::warn!(database = %name, "Not mounted: {reason}");
+    }
+
     let databases = server.databases().unwrap_or_default();
     tracing::info!(
         path = %data_dir.display(),

@@ -60,6 +60,12 @@ impl Hive {
         })
     }
 
+    /// Records reads skipped since the database was opened because they did
+    /// not decode (see [`Store::tolerate`]).
+    pub fn skipped_records(&self) -> u64 {
+        self.store.skipped_records()
+    }
+
     /// Create a new collection. Returns it if it already exists.
     pub fn create_collection(&self, name: &str) -> Result<Arc<Collection>> {
         // Check in-memory cache first

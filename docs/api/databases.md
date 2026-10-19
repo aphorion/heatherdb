@@ -59,7 +59,8 @@ Responds with the same shape as [`GET /db/{db}`](#get-dbdb):
 
 ```json
 { "name": "movies", "created_at": 1767225600, "dimension": 384,
-  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64" }
+  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64",
+  "format_version": 1, "skipped_records": 0 }
 ```
 
 | Status | Cause |
@@ -83,7 +84,8 @@ curl -u admin:pw http://localhost:6380/db/movies
 
 ```json
 { "name": "movies", "created_at": 1767225600, "dimension": 384,
-  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64" }
+  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64",
+  "format_version": 1, "skipped_records": 0 }
 ```
 
 `collections` is `0` when the collection list cannot be read, not an error.
@@ -92,6 +94,11 @@ curl -u admin:pw http://localhost:6380/db/movies
 |---|---|
 | `403 Forbidden` | the caller is scoped to a different database |
 | `404 Not Found` | no `db.toml` for that name |
+| `409 Conflict` | (any `/db/{db}/...` route) the database is on disk in a format newer than this server reads; the message says which. See [Storage format](../reference/storage-format.md) |
+
+`format_version` is the database's on-disk format; `skipped_records` counts
+records reads have skipped since it was opened because they did not decode
+(non-zero means damage).
 
 ### DELETE /db/{db}
 

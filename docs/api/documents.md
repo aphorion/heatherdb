@@ -24,8 +24,12 @@ curl -u admin:pw \
 ```
 
 ```json
-{ "documents": [ { "id": 17, "metadata": { "title": "Solaris" } } ], "total": 1 }
+{ "documents": [ { "id": 17, "metadata": { "title": "Solaris" } } ], "total": 1, "skipped": 0 }
 ```
+
+`skipped` counts documents of this page that were left out because their
+stored record is damaged or in a newer format (see
+[Storage format](../reference/storage-format.md)); the rest are served.
 
 `total` is the number of documents in the collection. With `?limit=n`
 (and optionally `?offset=k`, default `0`) only that page is returned, in id
