@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, FlagSetMode, RoTxn, RwTxn};
 
 use crate::error::{HeatherError, Result};
 use crate::location::{HardLocation, LocationId};
@@ -49,6 +49,36 @@ pub struct Store {
 }
 
 impl Store {
+    /// Whether every commit is synced to disk (the default).
+    pub fn syncs(&self) -> Result<bool> {
+        Ok(self.env.get_flags()? & EnvFlags::NO_SYNC.bits() == 0)
+    }
+
+    /// Turns per-commit syncing off (`false`) or back on (`true`).
+    ///
+    /// Without it (LMDB `NO_SYNC`) commits reach the OS but not the disk:
+    /// much faster where a sync is slow (macOS `F_FULLFSYNC`), but a system
+    /// crash (not a process crash) can lose recent commits or, on file
+    /// systems that reorder writes, corrupt the database. For data that can
+    /// be rebuilt, such as a memory replayed from a stream. Turning it back on
+    /// syncs everything written in between before returning. LMDB keeps the
+    /// flag on the open environment, not in the file, so a restarted server
+    /// syncs again.
+    pub fn set_sync(&self, sync: bool) -> Result<()> {
+        let mode = if sync {
+            FlagSetMode::Disable
+        } else {
+            FlagSetMode::Enable
+        };
+        // SAFETY: NO_SYNC only changes when commits are flushed, not their
+        // contents; the risk is the documented crash window above.
+        unsafe { self.env.set_flags(EnvFlags::NO_SYNC, mode)? };
+        if sync {
+            self.env.force_sync()?;
+        }
+        Ok(())
+    }
+
     pub fn open(path: &Path, map_size_mb: usize) -> Result<Self> {
         std::fs::create_dir_all(path)
             .map_err(|e| HeatherError::Storage(format!("failed to create dir: {e}")))?;
@@ -738,5 +768,25 @@ mod tests {
         assert_eq!(store.get_collection_id("doomed").unwrap(), None);
         assert_eq!(store.load_all_locations(col_id).unwrap().len(), 0);
         assert!(store.load_metadata(col_id, "next_id").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    /// Syncing is on by default and can be turned off and back on. (LMDB
+    /// keeps the flag on the open environment, not in the file, so a new
+    /// process syncs again; heed reuses an environment still open in this
+    /// process, so that part cannot be shown here.)
+    #[test]
+    fn sync_can_be_turned_off_and_back_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path(), 16).unwrap();
+        assert!(store.syncs().unwrap());
+        store.set_sync(false).unwrap();
+        assert!(!store.syncs().unwrap());
+        store.set_sync(true).unwrap();
+        assert!(store.syncs().unwrap());
     }
 }

@@ -79,6 +79,18 @@ pub struct CompressRequest {
     pub lambda: Option<f64>,
 }
 
+/// `PUT /db/{db}/durability`: whether every commit is synced to disk.
+#[derive(Debug, Deserialize)]
+pub struct DurabilityRequest {
+    pub sync: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DurabilityResponse {
+    pub database: String,
+    pub sync: bool,
+}
+
 /// Vectors come as `vectors` (JSON number arrays) or `vectors_b64` (each
 /// vector's little-endian f64 bytes, base64-encoded: about half the bytes
 /// of JSON numbers and no float parsing), not both.
