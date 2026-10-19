@@ -1031,7 +1031,11 @@ pub async fn batch_analyze(
     }
 }
 
-pub async fn get_documents(State(hive): State<AppState>, Path(name): Path<String>) -> Response {
+pub async fn get_documents(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DocumentsQuery>,
+) -> Response {
     let col = match hive.get_collection(&name) {
         Ok(Some(col)) => col,
         Ok(None) => {
@@ -1043,10 +1047,18 @@ pub async fn get_documents(State(hive): State<AppState>, Path(name): Path<String
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
-    let result = tokio::task::spawn_blocking(move || col.list_documents()).await;
+    // Paged with ?limit= (and ?offset=); the whole collection otherwise.
+    let result = tokio::task::spawn_blocking(move || match query.limit {
+        Some(limit) => col.list_documents_page(query.offset.unwrap_or(0), limit),
+        None => col.list_documents().map(|d| {
+            let n = d.len();
+            (d, n)
+        }),
+    })
+    .await;
 
     match result {
-        Ok(Ok(docs)) => {
+        Ok(Ok((docs, total))) => {
             let documents: Vec<DocumentItem> = docs
                 .into_iter()
                 .filter_map(|(id, _vec, meta)| {
@@ -1055,7 +1067,7 @@ pub async fn get_documents(State(hive): State<AppState>, Path(name): Path<String
                         .map(|metadata| DocumentItem { id, metadata })
                 })
                 .collect();
-            Json(DocumentsResponse { documents }).into_response()
+            Json(DocumentsResponse { documents, total }).into_response()
         }
         Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -1894,5 +1906,66 @@ mod rotate_tests {
         let (status, body) = body_json(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"].is_string());
+    }
+}
+
+#[cfg(test)]
+mod document_paging_tests {
+    use super::*;
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// `?limit=` (with `?offset=`) returns one page in id order and the
+    /// total; without it the whole collection comes back, with the total.
+    #[tokio::test]
+    async fn documents_page_with_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = heather_db::EAMConfig::new(4).unwrap();
+        let hive: AppState = Arc::new(Hive::open(dir.path(), config, 64).unwrap());
+        let col = hive.get_or_create_collection("docs").unwrap();
+        for i in 0..5 {
+            let mut v = vec![0.0; 4];
+            v[i % 4] = 1.0;
+            col.write_with_metadata(&v, format!(r#"{{"i":{i}}}"#).as_bytes())
+                .unwrap();
+        }
+
+        let page = |offset, limit| {
+            get_documents(
+                State(hive.clone()),
+                Path("docs".into()),
+                axum::extract::Query(DocumentsQuery { offset, limit }),
+            )
+        };
+        let ids = |body: &serde_json::Value| -> Vec<u64> {
+            body["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["id"].as_u64().unwrap())
+                .collect()
+        };
+
+        let first = body_json(page(None, Some(2)).await).await;
+        assert_eq!(
+            (ids(&first), first["total"].clone()),
+            (vec![0, 1], 5.into())
+        );
+        let last = body_json(page(Some(4), Some(2)).await).await;
+        assert_eq!(ids(&last), vec![4]);
+        assert_eq!(
+            first["documents"][1]["metadata"],
+            serde_json::json!({"i": 1})
+        );
+        let past = body_json(page(Some(9), Some(2)).await).await;
+        assert_eq!((ids(&past), past["total"].clone()), (vec![], 5.into()));
+
+        let all = body_json(page(None, None).await).await;
+        assert_eq!((ids(&all).len(), all["total"].clone()), (5, 5.into()));
     }
 }
