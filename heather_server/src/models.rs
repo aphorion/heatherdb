@@ -231,6 +231,12 @@ pub struct EamConfigOverride {
     pub neighbor_cap: Option<usize>,
     pub num_landmarks: Option<usize>,
     pub l_0: Option<usize>,
+    /// `false` makes every collection a plain store: writes append without
+    /// competitive learning (no activation, merge or migration). For
+    /// evidence that is listed or fetched by id, not searched by similarity.
+    pub competitive: Option<bool>,
+    /// `"f32"` stores vectors in half the space (math stays f64).
+    pub precision: Option<heather_db::Precision>,
 }
 
 #[derive(Debug, Serialize)]
@@ -240,6 +246,15 @@ pub struct DatabaseInfo {
     pub dimension: usize,
     pub map_size_mb: usize,
     pub collections: usize,
+    /// `false`: a plain store (see `EamConfigOverride::competitive`).
+    pub competitive: bool,
+    pub precision: heather_db::Precision,
+    /// The on-disk format version (`heather_db::FORMAT_VERSION` for new
+    /// databases).
+    pub format_version: u32,
+    /// Records reads skipped since the database was opened because they did
+    /// not decode; non-zero means something is corrupt (`heather verify`).
+    pub skipped_records: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -345,6 +360,18 @@ pub struct DeleteDocumentResponse {
 #[derive(Debug, Serialize)]
 pub struct DocumentsResponse {
     pub documents: Vec<DocumentItem>,
+    /// Documents in the collection (all pages).
+    pub total: usize,
+    /// Documents of this page left out because they did not decode
+    /// (corrupt, or written by a newer HeatherDB). The rest are served.
+    pub skipped: usize,
+}
+
+/// `GET .../documents?offset=&limit=`: one page, in id order.
+#[derive(Debug, Default, Deserialize)]
+pub struct DocumentsQuery {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]

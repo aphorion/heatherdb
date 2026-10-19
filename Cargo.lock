@@ -651,6 +651,7 @@ name = "heather_db"
 version = "0.4.2"
 dependencies = [
  "bincode",
+ "crc32fast",
  "criterion",
  "fs4",
  "heed",

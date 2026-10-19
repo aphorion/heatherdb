@@ -45,7 +45,11 @@ impl Hive {
         audit: AuditConfig,
     ) -> Result<Self> {
         config.validate()?;
-        let store = Arc::new(Store::open(path, map_size_mb)?);
+        let store = Arc::new(Store::open_with_precision(
+            path,
+            map_size_mb,
+            config.precision,
+        )?);
         let audit = AuditLog::open(&store, audit)?;
 
         Ok(Hive {
@@ -54,6 +58,12 @@ impl Hive {
             audit,
             collections: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Records reads skipped since the database was opened because they did
+    /// not decode (see [`Store::tolerate`]).
+    pub fn skipped_records(&self) -> u64 {
+        self.store.skipped_records()
     }
 
     /// Create a new collection. Returns it if it already exists.

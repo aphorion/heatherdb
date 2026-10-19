@@ -52,15 +52,13 @@ pub async fn ready(Extension(server): Extension<Arc<Server>>) -> Response {
 // boxing here would only add an indirection that is unwrapped one frame up.
 #[allow(clippy::result_large_err)]
 fn resolve_db(server: &Arc<Server>, name: &str) -> Result<Arc<Hive>, Response> {
-    server.database(name).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("database not found: {name}"),
-            }),
-        )
-            .into_response()
-    })
+    server
+        .database(name)
+        .ok_or_else(|| match server.refused(name) {
+            // On disk, but in a format this HeatherDB does not read.
+            Some(reason) => err(StatusCode::CONFLICT, reason),
+            None => err(StatusCode::NOT_FOUND, format!("database not found: {name}")),
+        })
 }
 
 fn err(status: StatusCode, msg: impl ToString) -> Response {
@@ -99,6 +97,13 @@ pub async fn list_databases(Extension(server): Extension<Arc<Server>>) -> Respon
             dimension,
             map_size_mb: cfg.map_size_mb,
             collections,
+            competitive: cfg.eam.competitive,
+            precision: cfg.eam.precision,
+            format_version: cfg.format_version,
+            skipped_records: server
+                .database(&name)
+                .map(|h| h.skipped_records())
+                .unwrap_or(0),
         });
     }
     Json(ListDatabasesResponse { databases }).into_response()
@@ -134,6 +139,12 @@ pub async fn create_database(
         if let Some(v) = o.l_0 {
             cfg.eam.l_0 = v;
         }
+        if let Some(v) = o.competitive {
+            cfg.eam.competitive = v;
+        }
+        if let Some(v) = o.precision {
+            cfg.eam.precision = v;
+        }
         if let Err(e) = cfg.eam.validate() {
             return err(StatusCode::BAD_REQUEST, e);
         }
@@ -149,6 +160,10 @@ pub async fn create_database(
                     dimension,
                     map_size_mb: c.map_size_mb,
                     collections: 0,
+                    competitive: c.eam.competitive,
+                    precision: c.eam.precision,
+                    format_version: c.format_version,
+                    skipped_records: 0,
                 })
                 .into_response()
             }
@@ -185,12 +200,20 @@ pub async fn get_database(
         .map(|v| v.len())
         .unwrap_or(0);
     let dimension = cfg.dimension();
+    let skipped_records = server
+        .database(&db_name)
+        .map(|h| h.skipped_records())
+        .unwrap_or(0);
     Json(DatabaseInfo {
         name: cfg.name,
         created_at: cfg.created_at,
         dimension,
         map_size_mb: cfg.map_size_mb,
         collections,
+        competitive: cfg.eam.competitive,
+        precision: cfg.eam.precision,
+        format_version: cfg.format_version,
+        skipped_records,
     })
     .into_response()
 }
@@ -416,12 +439,13 @@ pub async fn batch_analyze(
 pub async fn get_documents(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
+    query: axum::extract::Query<DocumentsQuery>,
 ) -> Response {
     let hive = match resolve_db(&server, &db_name) {
         Ok(h) => h,
         Err(r) => return r,
     };
-    routes::get_documents(State(hive), Path(col)).await
+    routes::get_documents(State(hive), Path(col), query).await
 }
 
 pub async fn get_document(
@@ -669,5 +693,88 @@ mod audit_tests {
         assert_eq!(entries[0].route, "read");
         assert_eq!(entries[0].status, 400);
         assert_eq!(entries[0].result_count, 0);
+    }
+}
+
+#[cfg(test)]
+mod plain_compact_tests {
+    use super::*;
+
+    /// A database created with `competitive: false` and `precision: "f32"`
+    /// reports both, keeps them across a restart, and stores one location
+    /// per write (no competitive learning).
+    #[tokio::test]
+    async fn plain_f32_databases_are_created_and_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+            let req: CreateDatabaseRequest = serde_json::from_value(serde_json::json!({
+                "name": "evidence", "dimension": 8,
+                "eam": {"competitive": false, "precision": "f32"}
+            }))
+            .unwrap();
+            let resp = create_database(Extension(server.clone()), Json(req)).await;
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["competitive"], false);
+            assert_eq!(body["precision"], "f32");
+
+            let hive = resolve_db(&server, "evidence").unwrap();
+            let col = hive.get_or_create_collection("docs").unwrap();
+            for i in 0..5 {
+                let mut v = vec![0.0; 8];
+                v[0] = 1.0;
+                v[1] = i as f64 * 0.01;
+                col.write_with_metadata(&v, b"{}").unwrap();
+            }
+            assert_eq!(
+                col.num_locations().unwrap(),
+                5,
+                "plain: one location per write"
+            );
+        }
+
+        let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+        let cfg = server.database_config("evidence").unwrap();
+        assert!(!cfg.eam.competitive);
+        assert_eq!(cfg.eam.precision, heather_db::Precision::F32);
+        let hive = resolve_db(&server, "evidence").unwrap();
+        let col = hive.get_or_create_collection("docs").unwrap();
+        let (v, _) = col.get_document(4).unwrap().unwrap();
+        assert!((v[1] - 0.04).abs() < 1e-6);
+    }
+}
+
+#[cfg(test)]
+mod refused_tests {
+    use super::*;
+
+    /// A database on disk in a newer format answers 409 with why, not 404.
+    #[tokio::test]
+    async fn refused_databases_answer_conflict_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let server = Server::open(dir.path(), 4).unwrap();
+            server
+                .create_database(DbConfig::new("future", 4).unwrap())
+                .unwrap();
+        }
+        let path = dir.path().join("db").join("future").join("db.toml");
+        let mut cfg = DbConfig::load(&path).unwrap();
+        cfg.format_version = heather_db::FORMAT_VERSION + 1;
+        cfg.save(&path).unwrap();
+
+        let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+        let resp = list_collections(Extension(server.clone()), Path("future".into())).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("upgrade HeatherDB"));
+
+        let missing = list_collections(Extension(server), Path("nope".into())).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 }

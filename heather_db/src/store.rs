@@ -3,6 +3,7 @@ use std::path::Path;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
 
+use crate::config::Precision;
 use crate::error::{HeatherError, Result};
 use crate::location::{HardLocation, LocationId};
 
@@ -40,6 +41,10 @@ fn metadata_key(collection_id: u32, key: &str) -> Vec<u8> {
 
 pub struct Store {
     env: Env,
+    /// Records tolerant reads skipped because they did not decode.
+    skipped: std::sync::atomic::AtomicU64,
+    /// How vectors are encoded on disk (see [`crate::config::Precision`]).
+    precision: Precision,
     registry_db: Database<Bytes, Bytes>,
     locations_db: Database<Bytes, Bytes>,
     metadata_db: Database<Bytes, Bytes>,
@@ -48,8 +53,22 @@ pub struct Store {
     audit_db: Database<Bytes, Bytes>,
 }
 
+/// A stored document: its id and its serialised (vector, metadata).
+pub type RawDocument = (u64, Vec<u8>);
+
 impl Store {
+    /// Opens a store that keeps vectors in f64.
     pub fn open(path: &Path, map_size_mb: usize) -> Result<Self> {
+        Self::open_with_precision(path, map_size_mb, Precision::F64)
+    }
+
+    /// Opens a store that keeps vectors at `precision`. A store must always be
+    /// opened with the precision it was created with (`db.toml` records it).
+    pub fn open_with_precision(
+        path: &Path,
+        map_size_mb: usize,
+        precision: Precision,
+    ) -> Result<Self> {
         std::fs::create_dir_all(path)
             .map_err(|e| HeatherError::Storage(format!("failed to create dir: {e}")))?;
 
@@ -71,6 +90,8 @@ impl Store {
 
         Ok(Store {
             env,
+            skipped: std::sync::atomic::AtomicU64::new(0),
+            precision,
             registry_db,
             locations_db,
             metadata_db,
@@ -204,8 +225,22 @@ impl Store {
         loc: &HardLocation,
     ) -> Result<()> {
         let key = location_key(collection_id, loc.id.0);
-        let data = bincode::serialize(loc)?;
+        let data = self.encode_location(loc)?;
         self.locations_db.put(txn, &key, &data)?;
+        Ok(())
+    }
+
+    /// Stores raw bytes as a location (tests: simulating damage).
+    #[cfg(test)]
+    pub(crate) fn put_raw_location(
+        &self,
+        txn: &mut RwTxn,
+        collection_id: u32,
+        location_id: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.locations_db
+            .put(txn, &location_key(collection_id, location_id), bytes)?;
         Ok(())
     }
 
@@ -227,10 +262,60 @@ impl Store {
         let iter = self.locations_db.prefix_iter(&rtxn, &prefix)?;
         for result in iter {
             let (_key, value) = result?;
-            let loc: HardLocation = bincode::deserialize(value)?;
-            locations.push(loc);
+            // A location that does not decode is skipped (and counted), so
+            // one bad record cannot keep the collection from opening.
+            if let Some(loc) = self.tolerate(self.decode_location(value))? {
+                locations.push(loc);
+            }
         }
         Ok(locations)
+    }
+
+    /// For reads that serve many records: a record that does not decode
+    /// ([`HeatherError::Corrupt`] or [`HeatherError::UnsupportedFormat`]) is
+    /// counted and skipped (`Ok(None)`) instead of failing the read. Storage
+    /// errors still fail it.
+    pub fn tolerate<T>(&self, decoded: Result<T>) -> Result<Option<T>> {
+        match decoded {
+            Ok(v) => Ok(Some(v)),
+            Err(HeatherError::Corrupt(_) | HeatherError::UnsupportedFormat(_)) => {
+                self.skipped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Records skipped by tolerant reads since the store was opened.
+    pub fn skipped_records(&self) -> u64 {
+        self.skipped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // --- Vector encoding (by precision) ---
+
+    fn encode_location(&self, loc: &HardLocation) -> Result<Vec<u8>> {
+        Ok(crate::codec::encode_location(loc, self.precision))
+    }
+
+    fn decode_location(&self, bytes: &[u8]) -> Result<HardLocation> {
+        crate::codec::decode_location(bytes, self.precision)
+    }
+
+    /// A document's stored bytes: its vector (at the store's precision) and
+    /// its metadata, in the record envelope (see [`crate::codec`]).
+    pub fn encode_document(&self, vector: &[f64], metadata: &[u8]) -> Result<Vec<u8>> {
+        Ok(crate::codec::encode_document(
+            vector,
+            metadata,
+            self.precision,
+        ))
+    }
+
+    /// The vector and metadata of a stored document. A value that does not
+    /// decode is [`HeatherError::Corrupt`].
+    pub fn decode_document(&self, bytes: &[u8]) -> Result<(Vec<f64>, Vec<u8>)> {
+        crate::codec::decode_document(bytes, self.precision)
     }
 
     // --- Metadata operations (collection-scoped) ---
@@ -284,6 +369,31 @@ impl Store {
         let key = document_key(collection_id, write_index);
         let val = self.documents_db.get(txn, &key)?;
         Ok(val.map(|v| v.to_vec()))
+    }
+
+    /// One page of a collection's documents in id order, and how many there
+    /// are in all. Only the page's values are copied.
+    pub fn list_documents_page(
+        &self,
+        collection_id: u32,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<RawDocument>, usize)> {
+        let rtxn = self.env.read_txn()?;
+        let prefix = collection_prefix(collection_id);
+        let mut docs = Vec::with_capacity(limit.min(1024));
+        let mut total = 0;
+        for result in self.documents_db.prefix_iter(&rtxn, &prefix)? {
+            let (key, value) = result?;
+            if total >= offset && docs.len() < limit {
+                let idx_bytes: [u8; 8] = key[4..12].try_into().map_err(|_| {
+                    HeatherError::Storage("invalid document key length".to_string())
+                })?;
+                docs.push((u64::from_be_bytes(idx_bytes), value.to_vec()));
+            }
+            total += 1;
+        }
+        Ok((docs, total))
     }
 
     pub fn list_documents(&self, collection_id: u32) -> Result<Vec<(u64, Vec<u8>)>> {
@@ -738,5 +848,55 @@ mod tests {
         assert_eq!(store.get_collection_id("doomed").unwrap(), None);
         assert_eq!(store.load_all_locations(col_id).unwrap().len(), 0);
         assert!(store.load_metadata(col_id, "next_id").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    /// An f32 store keeps vectors at f32 (rounded once, widened on load) in
+    /// about half the bytes; an f64 store keeps them exactly.
+    #[test]
+    fn f32_stores_round_trip_at_f32_in_half_the_space() {
+        let vector: Vec<f64> = (0..256).map(|i| (i as f64).sin() / 3.0).collect();
+        let rounded: Vec<f64> = vector.iter().map(|&x| f64::from(x as f32)).collect();
+
+        let dir32 = tempfile::TempDir::new().unwrap();
+        let s32 = Store::open_with_precision(dir32.path(), 16, Precision::F32).unwrap();
+        let dir64 = tempfile::TempDir::new().unwrap();
+        let s64 = Store::open(dir64.path(), 16).unwrap();
+
+        let d32 = s32.encode_document(&vector, b"{}").unwrap();
+        let d64 = s64.encode_document(&vector, b"{}").unwrap();
+        assert!(
+            d32.len() * 10 < d64.len() * 6,
+            "{} vs {} bytes",
+            d32.len(),
+            d64.len()
+        );
+        assert_eq!(
+            s32.decode_document(&d32).unwrap(),
+            (rounded.clone(), b"{}".to_vec())
+        );
+        assert_eq!(
+            s64.decode_document(&d64).unwrap(),
+            (vector.clone(), b"{}".to_vec())
+        );
+
+        let mut loc = HardLocation::new(LocationId(7), vector.clone());
+        loc.counter = vector.clone();
+        loc.write_count = 2.5;
+        loc.neighbors = vec![1, 2];
+        let mut txn = s32.write_txn().unwrap();
+        s32.put_location(&mut txn, 0, &loc).unwrap();
+        txn.commit().unwrap();
+        let back = s32.load_all_locations(0).unwrap().pop().unwrap();
+        assert_eq!(
+            (back.id, back.write_count, back.neighbors.clone()),
+            (LocationId(7), 2.5, vec![1, 2])
+        );
+        assert_eq!(back.address, rounded);
+        assert_eq!(back.counter, rounded);
     }
 }

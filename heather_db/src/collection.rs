@@ -1498,7 +1498,7 @@ impl Collection {
         }
 
         // Persist document (vector + metadata)
-        let doc_data = bincode::serialize(&(input.to_vec(), metadata.to_vec()))?;
+        let doc_data = self.store.encode_document(input, metadata)?;
         self.store
             .put_document(&mut txn, self.collection_id, doc_id, &doc_data)?;
 
@@ -1636,7 +1636,7 @@ impl Collection {
 
             documents.push((
                 doc_id,
-                bincode::serialize(&(input.to_vec(), metadata.as_ref().to_vec()))?,
+                self.store.encode_document(input, metadata.as_ref())?,
             ));
         }
 
@@ -1685,7 +1685,7 @@ impl Collection {
     pub fn get_document(&self, write_index: u64) -> Result<Option<(Vec<f64>, Vec<u8>)>> {
         match self.store.get_document(self.collection_id, write_index)? {
             Some(data) => {
-                let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+                let (vec, meta) = self.store.decode_document(&data)?;
                 Ok(Some((vec, meta)))
             }
             None => Ok(None),
@@ -1732,15 +1732,38 @@ impl Collection {
         Ok(existed)
     }
 
-    /// List all documents in this collection.
+    /// One page of this collection's documents (id order), the total count,
+    /// and how many of the page's documents were skipped because they did
+    /// not decode (see [`Store::tolerate`]).
+    pub fn list_documents_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<DocumentRecord>, usize, usize)> {
+        let (raw, total) = self
+            .store
+            .list_documents_page(self.collection_id, offset, limit)?;
+        let (docs, skipped) = self.decode_all(raw)?;
+        Ok((docs, total, skipped))
+    }
+
+    /// List all documents in this collection (skipping any that do not
+    /// decode; see [`Store::tolerate`]).
     pub fn list_documents(&self) -> Result<Vec<DocumentRecord>> {
         let raw = self.store.list_documents(self.collection_id)?;
+        Ok(self.decode_all(raw)?.0)
+    }
+
+    fn decode_all(&self, raw: Vec<(u64, Vec<u8>)>) -> Result<(Vec<DocumentRecord>, usize)> {
         let mut docs = Vec::with_capacity(raw.len());
+        let mut skipped = 0;
         for (id, data) in raw {
-            let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
-            docs.push((id, vec, meta));
+            match self.store.tolerate(self.store.decode_document(&data))? {
+                Some((vec, meta)) => docs.push((id, vec, meta)),
+                None => skipped += 1,
+            }
         }
-        Ok(docs)
+        Ok((docs, skipped))
     }
 
     /// Query documents by cosine similarity to a query vector, returning top-n.
@@ -1837,7 +1860,10 @@ impl Collection {
                 .store
                 .get_document_txn(&rtxn, self.collection_id, doc_id)?
             {
-                let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+                let Some((vec, meta)) = self.store.tolerate(self.store.decode_document(&data))?
+                else {
+                    continue;
+                };
                 // Role-scoped when a role is supplied: unbind the stored
                 // superposition by it first, so the score reflects only the
                 // role the query constrained rather than being diluted by
@@ -2012,7 +2038,10 @@ impl Collection {
             else {
                 continue;
             };
-            let (vec, metadata): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+            let Some((vec, metadata)) = self.store.tolerate(self.store.decode_document(&data))?
+            else {
+                continue;
+            };
             if vec.len() != d {
                 continue;
             }
@@ -3552,6 +3581,70 @@ mod tests {
 
         assert!(col.write_batch_with_metadata(&items).is_err());
         assert_eq!(col.write_with_metadata(&basis_vec(d, 0), b"{}").unwrap(), 0);
+    }
+
+    /// A document that no longer decodes is skipped (and counted) by
+    /// listings and queries; the others are still served.
+    #[test]
+    fn corrupt_documents_are_skipped_not_fatal() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let mut config = EAMConfig::new(d).unwrap();
+        config.k = 1;
+        config.gamma = 0.0;
+        let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+        for i in 0..3 {
+            col.write_with_metadata(&basis_vec(d, i * 4), format!(r#"{{"i":{i}}}"#).as_bytes())
+                .unwrap();
+        }
+
+        // Damage document 1 in place.
+        let mut txn = store.write_txn().unwrap();
+        store
+            .put_document(&mut txn, col_id, 1, b"not a record")
+            .unwrap();
+        txn.commit().unwrap();
+
+        let (docs, total, skipped) = col.list_documents_page(0, 10).unwrap();
+        assert_eq!((docs.len(), total, skipped), (2, 3, 1));
+        assert_eq!(col.list_documents().unwrap().len(), 2);
+        assert!(matches!(col.get_document(1), Err(HeatherError::Corrupt(_))));
+        // A query that reaches it still answers with the rest.
+        assert!(col.query_documents(&basis_vec(d, 0), 10).is_ok());
+        assert!(store.skipped_records() >= 2);
+    }
+
+    /// A location that no longer decodes is skipped when the collection is
+    /// opened, instead of keeping it from opening.
+    #[test]
+    fn corrupt_locations_do_not_stop_a_collection_opening() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let mut config = EAMConfig::new(d).unwrap();
+        config.k = 1;
+        config.gamma = 0.0;
+        let locations = {
+            let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+            for i in 0..4 {
+                col.write_with_metadata(&basis_vec(d, i * 4), b"{}")
+                    .unwrap();
+            }
+            col.num_locations().unwrap()
+        };
+
+        // Overwrite one stored location with garbage.
+        let first = store.load_all_locations(col_id).unwrap()[0].id.0;
+        let mut txn = store.write_txn().unwrap();
+        store
+            .put_raw_location(&mut txn, col_id, first, b"garbage")
+            .unwrap();
+        txn.commit().unwrap();
+
+        let col = Collection::load(col_id, "docs".into(), store.clone(), &config).unwrap();
+        assert_eq!(col.num_locations().unwrap(), locations - 1);
+        assert!(store.skipped_records() >= 1);
     }
 
     /// Deletion removes a document from retrieval and from every posting

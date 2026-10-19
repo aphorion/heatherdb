@@ -46,7 +46,7 @@ Auth: Basic or Bearer, **root scope**.
 | `dimension` | integer | *required* | Immutable for the life of the database |
 | `map_size_mb` | integer | `4096` | LMDB ceiling for this database's env |
 | `mdl_gate` | boolean | `false` | Allocate by description length instead of `tau_split`/`tau_overload` |
-| `eam` | object | — | Partial `EAMConfig` override: `k`, `t_max`, `beta`, `neighbor_cap`, `num_landmarks`, `l_0`. Unset fields keep the engine default; the merged config is validated |
+| `eam` | object | — | Partial `EAMConfig` override: `k`, `t_max`, `beta`, `neighbor_cap`, `num_landmarks`, `l_0`, `competitive`, `precision`. Unset fields keep the engine default; the merged config is validated. `"competitive": false` makes every collection a plain store: writes append each vector as its own location with no activation, merge or migration, which is much faster to write; use it for evidence that is listed or fetched by id rather than searched by similarity. `"precision": "f32"` stores vectors in half the space (rounded to f32 when written; all math stays f64). Both are fixed for the database's lifetime, and `GET /db` / `GET /db/{db}` report them |
 
 ```bash
 curl -u admin:pw -X POST http://localhost:6380/db \
@@ -59,7 +59,8 @@ Responds with the same shape as [`GET /db/{db}`](#get-dbdb):
 
 ```json
 { "name": "movies", "created_at": 1767225600, "dimension": 384,
-  "map_size_mb": 32768, "collections": 0 }
+  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64",
+  "format_version": 1, "skipped_records": 0 }
 ```
 
 | Status | Cause |
@@ -83,7 +84,8 @@ curl -u admin:pw http://localhost:6380/db/movies
 
 ```json
 { "name": "movies", "created_at": 1767225600, "dimension": 384,
-  "map_size_mb": 32768, "collections": 0 }
+  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64",
+  "format_version": 1, "skipped_records": 0 }
 ```
 
 `collections` is `0` when the collection list cannot be read, not an error.
@@ -92,6 +94,11 @@ curl -u admin:pw http://localhost:6380/db/movies
 |---|---|
 | `403 Forbidden` | the caller is scoped to a different database |
 | `404 Not Found` | no `db.toml` for that name |
+| `409 Conflict` | (any `/db/{db}/...` route) the database is on disk in a format newer than this server reads; the message says which. See [Storage format](../reference/storage-format.md) |
+
+`format_version` is the database's on-disk format; `skipped_records` counts
+records reads have skipped since it was opened because they did not decode
+(non-zero means damage).
 
 ### DELETE /db/{db}
 
