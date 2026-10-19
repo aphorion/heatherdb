@@ -36,10 +36,7 @@ pub async fn ready(Extension(server): Extension<Arc<Server>>) -> Response {
     .await;
 
     match result {
-        Ok(Ok(())) => Json(HealthResponse {
-            status: "ok".to_string(),
-        })
-        .into_response(),
+        Ok(Ok(())) => Json(HealthResponse::ok()).into_response(),
         Ok(Err(e)) => err(StatusCode::SERVICE_UNAVAILABLE, e),
         Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e),
     }
@@ -600,6 +597,7 @@ mod audit_tests {
                         .collect(),
                 ),
                 vectors,
+                vectors_b64: None,
             }),
         )
         .await;
