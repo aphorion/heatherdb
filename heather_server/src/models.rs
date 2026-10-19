@@ -345,6 +345,15 @@ pub struct DeleteDocumentResponse {
 #[derive(Debug, Serialize)]
 pub struct DocumentsResponse {
     pub documents: Vec<DocumentItem>,
+    /// Documents in the collection (all pages).
+    pub total: usize,
+}
+
+/// `GET .../documents?offset=&limit=`: one page, in id order.
+#[derive(Debug, Default, Deserialize)]
+pub struct DocumentsQuery {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]

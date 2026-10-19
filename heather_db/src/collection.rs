@@ -1732,6 +1732,23 @@ impl Collection {
         Ok(existed)
     }
 
+    /// One page of this collection's documents (id order) and the total count.
+    pub fn list_documents_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<DocumentRecord>, usize)> {
+        let (raw, total) = self
+            .store
+            .list_documents_page(self.collection_id, offset, limit)?;
+        let mut docs = Vec::with_capacity(raw.len());
+        for (id, data) in raw {
+            let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+            docs.push((id, vec, meta));
+        }
+        Ok((docs, total))
+    }
+
     /// List all documents in this collection.
     pub fn list_documents(&self) -> Result<Vec<DocumentRecord>> {
         let raw = self.store.list_documents(self.collection_id)?;

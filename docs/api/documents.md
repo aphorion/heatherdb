@@ -24,7 +24,16 @@ curl -u admin:pw \
 ```
 
 ```json
-{ "documents": [ { "id": 17, "metadata": { "title": "Solaris" } } ] }
+{ "documents": [ { "id": 17, "metadata": { "title": "Solaris" } } ], "total": 1 }
+```
+
+`total` is the number of documents in the collection. With `?limit=n`
+(and optionally `?offset=k`, default `0`) only that page is returned, in id
+order: page through a large collection instead of loading it whole.
+
+```bash
+curl -u admin:pw \
+  'http://localhost:6380/db/movies/collections/taste/documents?offset=1000&limit=1000'
 ```
 
 Documents whose metadata does not parse as JSON are skipped.
