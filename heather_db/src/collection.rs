@@ -249,6 +249,9 @@ pub(crate) struct EAMInner {
     pub(crate) doc_next_id: u64,
     /// Cached landmark indices for graph search entry points
     pub(crate) landmarks: Vec<usize>,
+    /// How many locations there were when `landmarks` was last selected
+    /// (see [`EAMInner::refresh_landmarks`]).
+    pub(crate) landmarks_at: usize,
     /// Flat LocationId → index lookup array for O(1) graph traversal
     pub(crate) id_lookup: Vec<u32>,
     /// Contiguous [L × D] address matrix for cache-friendly brute-force activation.
@@ -265,7 +268,30 @@ impl EAMInner {
     pub(crate) fn rebuild_graph_cache(&mut self) {
         self.id_lookup = read::build_id_lookup(&self.locations);
         self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
+        self.landmarks_at = self.locations.len();
         self.rebuild_address_matrix();
+    }
+
+    /// Re-selects landmarks as the collection grows.
+    ///
+    /// Writes take the graph path only with landmarks to enter it from
+    /// ([`read::activate_auto`]). Landmarks used to be chosen only when a
+    /// collection was opened (and by compress / merge / snapshot loads), so a
+    /// collection created empty and grown by writes kept none for the life
+    /// of the process, and every write scanned every location: O(N·d) per
+    /// vector, slower with each write. They are now re-selected while the
+    /// collection has fewer than `num_landmarks` locations' worth, and again
+    /// after each 25% of growth (at least 256 locations), which keeps the
+    /// O(N log N) selection amortised.
+    pub(crate) fn refresh_landmarks(&mut self) {
+        let len = self.locations.len();
+        let wanted = self.config.num_landmarks.min(len);
+        let grown = len >= self.landmarks_at + (self.landmarks_at / 4).max(256);
+
+        if self.config.num_landmarks > 0 && (self.landmarks.len() < wanted || grown) {
+            self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
+            self.landmarks_at = len;
+        }
     }
 
     /// Rebuild address matrix from locations.
@@ -286,12 +312,14 @@ impl EAMInner {
         }
     }
 
-    /// Append addresses for newly added locations.
+    /// Append addresses for newly added locations (and refresh landmarks
+    /// as the collection grows).
     pub(crate) fn append_addresses(&mut self, start_idx: usize) {
         for i in start_idx..self.locations.len() {
             self.address_matrix
                 .extend_from_slice(&self.locations[i].address);
         }
+        self.refresh_landmarks();
     }
 
     /// Incremental update after appending new locations.
@@ -361,6 +389,7 @@ impl Collection {
             address_matrix.extend_from_slice(&loc.address);
         }
 
+        let landmarks_at = locations.len();
         Ok(Collection {
             collection_id,
             name,
@@ -370,6 +399,7 @@ impl Collection {
                 next_id,
                 eta,
                 doc_next_id: 0,
+                landmarks_at,
                 landmarks,
                 id_lookup,
                 address_matrix,
@@ -424,6 +454,7 @@ impl Collection {
             address_matrix.extend_from_slice(&loc.address);
         }
 
+        let landmarks_at = locations.len();
         Ok(Collection {
             collection_id,
             name,
@@ -433,6 +464,7 @@ impl Collection {
                 next_id,
                 eta,
                 doc_next_id,
+                landmarks_at,
                 landmarks,
                 id_lookup,
                 address_matrix,
@@ -3552,6 +3584,63 @@ mod tests {
 
         assert!(col.write_batch_with_metadata(&items).is_err());
         assert_eq!(col.write_with_metadata(&basis_vec(d, 0), b"{}").unwrap(), 0);
+    }
+
+    /// A collection created empty and grown only by writes gets landmarks,
+    /// and they are re-selected as it keeps growing, so writes can take the
+    /// graph path instead of scanning every location (regression: landmarks
+    /// were chosen only on open, leaving a growing collection with none).
+    #[test]
+    fn landmarks_follow_a_collection_grown_by_writes() {
+        use rand::{Rng, SeedableRng};
+
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 32;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "docs".into(), store, &config).unwrap();
+        assert!(
+            col.inner.read().unwrap().landmarks.is_empty(),
+            "starts with none"
+        );
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let vector = |rng: &mut rand::rngs::StdRng| -> Vec<f64> {
+            vec_ops::normalize(
+                &(0..d)
+                    .map(|_| rng.gen_range(-1.0..1.0))
+                    .collect::<Vec<f64>>(),
+            )
+        };
+
+        for _ in 0..400 {
+            col.write_with_metadata(&vector(&mut rng), b"{}").unwrap();
+        }
+
+        let (landmarks, at, len) = {
+            let inner = col.inner.read().unwrap();
+            (
+                inner.landmarks.clone(),
+                inner.landmarks_at,
+                inner.locations.len(),
+            )
+        };
+        assert_eq!(
+            landmarks.len(),
+            config.num_landmarks.min(len),
+            "a grown collection has a full set"
+        );
+        assert!(landmarks.iter().all(|&i| i < len));
+
+        // Grow well past 25%: they are selected again.
+        let items: Vec<(Vec<f64>, Vec<u8>)> = (0..2_000)
+            .map(|_| (vector(&mut rng), b"{}".to_vec()))
+            .collect();
+        col.write_batch_with_metadata(&items).unwrap();
+        let inner = col.inner.read().unwrap();
+        assert!(inner.locations.len() > len);
+        assert!(inner.landmarks_at > at, "re-selected after growth");
+        assert!(inner.landmarks.iter().all(|&i| i < inner.locations.len()));
     }
 
     /// Deletion removes a document from retrieval and from every posting
