@@ -75,6 +75,11 @@ pub fn format(bytes: &[u8]) -> Result<Format> {
 
 pub fn encode_location(loc: &HardLocation, precision: Precision) -> Vec<u8> {
     let d = loc.address.len();
+    debug_assert_eq!(
+        d,
+        loc.counter.len(),
+        "a location's address and counter have the same length"
+    );
     let mut p =
         Vec::with_capacity(8 + 4 + 2 * d * width(precision) + 16 + 4 + 8 * loc.neighbors.len());
     p.extend_from_slice(&loc.id.0.to_le_bytes());
@@ -366,7 +371,17 @@ fn legacy_location(bytes: &[u8], precision: Precision) -> Result<HardLocation> {
             surprise_mass: c.surprise_mass,
         }),
     };
-    decoded.map_err(|e| corrupt(&format!("legacy location: {e}")))
+    let loc = decoded.map_err(|e| corrupt(&format!("legacy location: {e}")))?;
+    // A real location's address and counter always have the same length
+    // (bincode alone does not say so; found by fuzzing).
+    if loc.address.len() != loc.counter.len() {
+        return Err(corrupt(&format!(
+            "legacy location: address has {} values, counter {}",
+            loc.address.len(),
+            loc.counter.len()
+        )));
+    }
+    Ok(loc)
 }
 
 fn legacy_document(bytes: &[u8], precision: Precision) -> Result<(Vec<f64>, Vec<u8>)> {
@@ -511,9 +526,143 @@ mod tests {
             decode_document(&[1, 2, 3], Precision::F64),
             Err(HeatherError::Corrupt(_))
         ));
+        // A legacy location whose counter does not match its address (found
+        // by fuzzing: it decoded, then re-encoded into an unreadable record).
+        let mut odd = location();
+        odd.counter.pop();
+        assert!(matches!(
+            decode_location(&bincode::serialize(&odd).unwrap(), Precision::F64),
+            Err(HeatherError::Corrupt(m)) if m.contains("counter")
+        ));
+
         // A legacy length claiming a huge vector: an error, not a giant allocation.
         let mut huge = (u64::MAX / 2).to_le_bytes().to_vec();
         huge.extend_from_slice(&[0; 16]);
         assert!(decode_document(&huge, Precision::F64).is_err());
+    }
+}
+
+/// Golden records: the exact bytes of each record version, computed by an
+/// independent implementation of the format (Python `struct` + `zlib.crc32`).
+/// If an encoder changes what it writes, or a decoder stops reading what was
+/// written, these fail: bump the record version instead.
+#[cfg(test)]
+mod golden {
+    use super::*;
+
+    const LOCATION_F64: &str = "fffe48440101000078000000cbdd84822a0000000000000004000000000000000000e03f000000000000d0bf000000000000c03f000000000000f03f00000000000000400000000000000000000000000000f8bf000000000000d03f0000000000000c40000000000000e83f03000000010000000000000007000000000000000900000000000000";
+    const LOCATION_F32: &str = "fffe4844010101005800000011cebc862a00000000000000040000000000003f000080be0000003e0000803f00000040000000000000c0bf0000803e0000000000000c40000000000000e83f03000000010000000000000007000000000000000900000000000000";
+    const DOCUMENT_F64: &str = "fffe484401020000270000000625d7ff03000000000000000000e03f000000000000d03f000000000000f0bf070000007b2269223a317d";
+    const DOCUMENT_F32: &str =
+        "fffe4844010201001b000000ce427130030000000000003f0000803e000080bf070000007b2269223a317d";
+    const LEGACY_LOCATION_F64: &str = "2a000000000000000400000000000000000000000000e03f000000000000d0bf000000000000c03f000000000000f03f040000000000000000000000000000400000000000000000000000000000f8bf000000000000d03f0000000000000c400300000000000000010000000000000007000000000000000900000000000000000000000000e83f";
+    const LEGACY_DOCUMENT_F64: &str = "0300000000000000000000000000e03f000000000000d03f000000000000f0bf07000000000000007b2269223a317d";
+
+    fn bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // Values exact in f32 too, so both precisions decode to the same.
+    fn location() -> HardLocation {
+        HardLocation {
+            id: LocationId(42),
+            address: vec![0.5, -0.25, 0.125, 1.0],
+            counter: vec![2.0, 0.0, -1.5, 0.25],
+            write_count: 3.5,
+            neighbors: vec![1, 7, 9],
+            surprise_mass: 0.75,
+        }
+    }
+
+    fn document() -> (Vec<f64>, Vec<u8>) {
+        (vec![0.5, 0.25, -1.0], br#"{"i":1}"#.to_vec())
+    }
+
+    fn assert_location(decoded: HardLocation) {
+        let want = location();
+        assert_eq!(decoded.id, want.id);
+        assert_eq!(decoded.address, want.address);
+        assert_eq!(decoded.counter, want.counter);
+        assert_eq!(decoded.write_count, want.write_count);
+        assert_eq!(decoded.neighbors, want.neighbors);
+        assert_eq!(decoded.surprise_mass, want.surprise_mass);
+    }
+
+    #[test]
+    fn encoders_write_exactly_the_golden_bytes() {
+        assert_eq!(
+            encode_location(&location(), Precision::F64),
+            bytes(LOCATION_F64)
+        );
+        assert_eq!(
+            encode_location(&location(), Precision::F32),
+            bytes(LOCATION_F32)
+        );
+        let (v, m) = document();
+        assert_eq!(encode_document(&v, &m, Precision::F64), bytes(DOCUMENT_F64));
+        assert_eq!(encode_document(&v, &m, Precision::F32), bytes(DOCUMENT_F32));
+    }
+
+    #[test]
+    fn decoders_read_every_golden_record() {
+        for (hex, legacy) in [
+            (LOCATION_F64, Precision::F64),
+            (LOCATION_F32, Precision::F64),
+            (LEGACY_LOCATION_F64, Precision::F64),
+        ] {
+            assert_location(decode_location(&bytes(hex), legacy).unwrap());
+        }
+        for hex in [DOCUMENT_F64, DOCUMENT_F32, LEGACY_DOCUMENT_F64] {
+            assert_eq!(
+                decode_document(&bytes(hex), Precision::F64).unwrap(),
+                document()
+            );
+        }
+    }
+
+    /// No input makes a decoder panic: random bytes, and every golden record
+    /// with bytes flipped, truncated or extended. (The fuzz targets in
+    /// `fuzz/` explore further; this runs on stable in CI.)
+    #[test]
+    fn arbitrary_bytes_never_panic() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x4845_4154);
+        let seeds: Vec<Vec<u8>> = [
+            LOCATION_F64,
+            LOCATION_F32,
+            DOCUMENT_F64,
+            DOCUMENT_F32,
+            LEGACY_LOCATION_F64,
+            LEGACY_DOCUMENT_F64,
+        ]
+        .iter()
+        .map(|h| bytes(h))
+        .collect();
+
+        for i in 0..20_000 {
+            let mut input = if i % 4 == 0 {
+                (0..rng.gen_range(0..64))
+                    .map(|_| rng.r#gen::<u8>())
+                    .collect()
+            } else {
+                seeds[i % seeds.len()].clone()
+            };
+            match rng.gen_range(0..3) {
+                0 if !input.is_empty() => {
+                    let at = rng.gen_range(0..input.len());
+                    input[at] ^= 1 << rng.gen_range(0..8);
+                }
+                1 => input.truncate(rng.gen_range(0..=input.len())),
+                _ => input.extend((0..rng.gen_range(0..8)).map(|_| rng.r#gen::<u8>())),
+            }
+            for precision in [Precision::F64, Precision::F32] {
+                let _ = decode_location(&input, precision);
+                let _ = decode_document(&input, precision);
+                let _ = format(&input);
+            }
+        }
     }
 }

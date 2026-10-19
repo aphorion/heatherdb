@@ -108,6 +108,32 @@ Lists directories under `$DATA_DIR/snapshots/`.
 
 Deletes one snapshot directory under `$DATA_DIR/snapshots/`.
 
+## `verify`
+
+### `verify [--db <NAME>] [--json]`
+
+Offline integrity check. Decodes every stored location and document of
+every database (or only `--db`) and reports, per collection, how many
+records are in the current format, how many predate it (still readable),
+and how many are **corrupt** (checksum mismatch, truncation) or
+**unsupported** (a newer record format), naming the first 20 damaged
+records by key. Databases that are not mounted because their format is
+newer are reported as not checked. `--json` prints the report as JSON.
+
+Exits non-zero if anything is damaged or could not be checked. Needs the
+server stopped (it takes the engine lock). See
+[Storage format](storage-format.md).
+
+```bash
+heather verify --data-dir /var/lib/heatherdb
+```
+
+```text
+films:
+  docs    locations 3 ok (0 legacy), 0 corrupt, 0 unsupported · documents 3 ok (0 legacy), 0 corrupt, 0 unsupported
+✓ no damage found
+```
+
 ## Exit codes
 
 `0` on success, `1` on any error, with the message on stderr.

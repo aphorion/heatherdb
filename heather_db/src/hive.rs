@@ -60,6 +60,17 @@ impl Hive {
         })
     }
 
+    /// Decodes every stored record of every collection (see
+    /// [`crate::verify`]). Reads only.
+    pub fn verify(&self) -> Result<Vec<crate::verify::CollectionReport>> {
+        let mut collections = self.store.list_collections()?;
+        collections.sort();
+        collections
+            .iter()
+            .map(|(name, id)| self.store.verify_collection(name, *id))
+            .collect()
+    }
+
     /// Records reads skipped since the database was opened because they did
     /// not decode (see [`Store::tolerate`]).
     pub fn skipped_records(&self) -> u64 {
