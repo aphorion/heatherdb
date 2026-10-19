@@ -79,6 +79,18 @@ pub struct CompressRequest {
     pub lambda: Option<f64>,
 }
 
+/// `PUT /db/{db}/durability`: whether every commit is synced to disk.
+#[derive(Debug, Deserialize)]
+pub struct DurabilityRequest {
+    pub sync: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DurabilityResponse {
+    pub database: String,
+    pub sync: bool,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct WriteRequest {
     pub vectors: Vec<Vec<f64>>,
