@@ -113,10 +113,9 @@ pub fn decode_vectors(encoded: Vec<String>, field: &str) -> Result<Vec<Vec<f64>>
                     bytes.len()
                 ));
             }
-            Ok(bytes
-                .chunks_exact(8)
-                .map(|b| f64::from_le_bytes(b.try_into().expect("chunks of 8")))
-                .collect())
+            // The length is a multiple of 8 (checked above), so nothing remains.
+            let (values, _) = bytes.as_chunks::<8>();
+            Ok(values.iter().map(|b| f64::from_le_bytes(*b)).collect())
         })
         .collect()
 }
