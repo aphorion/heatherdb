@@ -1775,7 +1775,7 @@ impl Collection {
             .list_documents_page(self.collection_id, offset, limit)?;
         let mut docs = Vec::with_capacity(raw.len());
         for (id, data) in raw {
-            let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+            let (vec, meta) = self.store.decode_document(&data)?;
             docs.push((id, vec, meta));
         }
         Ok((docs, total))
@@ -3658,6 +3658,32 @@ mod tests {
         assert!(inner.locations.len() > len);
         assert!(inner.landmarks_at > at, "re-selected after growth");
         assert!(inner.landmarks.iter().all(|&i| i < inner.locations.len()));
+    }
+
+    /// Paging an f32 collection decodes its documents at f32 (regression: the
+    /// paged listing decoded every store as f64).
+    #[test]
+    fn paging_reads_f32_documents() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(
+            Store::open_with_precision(dir.path(), 64, crate::config::Precision::F32).unwrap(),
+        );
+        let col_id = {
+            let mut txn = store.write_txn().unwrap();
+            let id = store.create_collection(&mut txn, "docs").unwrap();
+            txn.commit().unwrap();
+            id
+        };
+        let mut config = EAMConfig::new(4).unwrap();
+        config.precision = crate::config::Precision::F32;
+        let col = Collection::new(col_id, "docs".into(), store, &config).unwrap();
+        col.write_with_metadata(&[0.5, 0.25, 0.0, 1.0], br#"{"i":0}"#)
+            .unwrap();
+
+        let (docs, total) = col.list_documents_page(0, 10).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(docs[0].1, vec![0.5, 0.25, 0.0, 1.0]);
+        assert_eq!(docs[0].2, br#"{"i":0}"#.to_vec());
     }
 
     /// Deletion removes a document from retrieval and from every posting
