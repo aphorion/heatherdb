@@ -46,6 +46,7 @@ pub mod read;
 pub mod server;
 pub mod store;
 pub mod vec_ops;
+pub mod verify;
 pub mod write;
 
 pub use audit::{AuditConfig, AuditLog, AuditQuery, AuditRecord, AuditVisibility, query_hash};

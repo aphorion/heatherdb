@@ -3647,6 +3647,123 @@ mod tests {
         assert!(store.skipped_records() >= 1);
     }
 
+    /// Every read path returns what was written, at both precisions (f32
+    /// within its rounding): writes one at a time and batched, get, list,
+    /// page, query, and the same after the collection is reopened.
+    #[test]
+    fn every_read_path_round_trips_at_both_precisions() {
+        use crate::config::Precision;
+
+        for precision in [Precision::F64, Precision::F32] {
+            let dir = TempDir::new().unwrap();
+            let store = Arc::new(Store::open_with_precision(dir.path(), 64, precision).unwrap());
+            let col_id = {
+                let mut txn = store.write_txn().unwrap();
+                let id = store.create_collection(&mut txn, "docs").unwrap();
+                txn.commit().unwrap();
+                id
+            };
+            let d = 16;
+            let mut config = EAMConfig::new(d).unwrap();
+            config.k = 1;
+            config.gamma = 0.0;
+            config.precision = precision;
+            let round = |v: &[f64]| -> Vec<f64> {
+                match precision {
+                    Precision::F64 => v.to_vec(),
+                    Precision::F32 => v.iter().map(|&x| f64::from(x as f32)).collect(),
+                }
+            };
+            let vectors: Vec<Vec<f64>> = (0..6)
+                .map(|i| {
+                    let mut v = basis_vec(d, (i * 3) % d);
+                    v[(i * 3 + 1) % d] = 0.1 * (i as f64 + 1.0) / 3.0;
+                    vec_ops::normalize(&v)
+                })
+                .collect();
+
+            let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+            for (i, v) in vectors.iter().take(3).enumerate() {
+                col.write_with_metadata(v, format!(r#"{{"i":{i}}}"#).as_bytes())
+                    .unwrap();
+            }
+            let batch: Vec<(Vec<f64>, Vec<u8>)> = vectors[3..]
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (v.clone(), format!(r#"{{"i":{}}}"#, i + 3).into_bytes()))
+                .collect();
+            col.write_batch_with_metadata(&batch).unwrap();
+            let locations_before = col.num_locations().unwrap();
+
+            let check = |col: &Collection| {
+                for (i, v) in vectors.iter().enumerate() {
+                    let (got, meta) = col.get_document(i as u64).unwrap().unwrap();
+                    assert_eq!(got, round(v), "{precision:?} get {i}");
+                    assert_eq!(meta, format!(r#"{{"i":{i}}}"#).into_bytes());
+                }
+                let all = col.list_documents().unwrap();
+                assert_eq!(all.len(), vectors.len());
+                let (page, total, skipped) = col.list_documents_page(2, 3).unwrap();
+                assert_eq!(
+                    (page.iter().map(|d| d.0).collect::<Vec<_>>(), total, skipped),
+                    (vec![2, 3, 4], 6, 0)
+                );
+                let hits = col.query_documents(&vectors[4], 6).unwrap();
+                assert!(
+                    hits.iter().any(|(id, _, _)| *id == 4),
+                    "{precision:?} query finds its own vector"
+                );
+            };
+
+            check(&col);
+            drop(col);
+            let col = Collection::load(col_id, "docs".into(), store.clone(), &config).unwrap();
+            assert_eq!(
+                col.num_locations().unwrap(),
+                locations_before,
+                "{precision:?} reopen keeps every location"
+            );
+            check(&col);
+            assert_eq!(store.skipped_records(), 0);
+        }
+    }
+
+    /// `verify` counts current, legacy and damaged records and names the
+    /// damaged ones.
+    #[test]
+    fn verify_reports_damage_by_record() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+        for i in 0..3 {
+            col.write_with_metadata(&basis_vec(d, i * 4), b"{}")
+                .unwrap();
+        }
+        let clean = store.verify_collection("docs", col_id).unwrap();
+        assert!(clean.is_clean());
+        assert_eq!(clean.documents.current, 3);
+
+        let mut txn = store.write_txn().unwrap();
+        store.put_document(&mut txn, col_id, 1, b"garbage").unwrap();
+        let legacy = bincode::serialize(&(basis_vec(d, 1), b"{}".to_vec())).unwrap();
+        store.put_document(&mut txn, col_id, 2, &legacy).unwrap();
+        txn.commit().unwrap();
+
+        let report = store.verify_collection("docs", col_id).unwrap();
+        assert!(!report.is_clean());
+        assert_eq!(
+            (
+                report.documents.current,
+                report.documents.legacy,
+                report.documents.corrupt
+            ),
+            (1, 1, 1)
+        );
+        assert!(report.problems.iter().any(|p| p.starts_with("document 1:")));
+    }
+
     /// Deletion removes a document from retrieval and from every posting
     /// list, leaves its neighbours alone, and is idempotent.
     #[test]

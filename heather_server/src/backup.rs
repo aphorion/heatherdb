@@ -458,7 +458,7 @@ fn delete_snapshot(data_dir: &Path, name: &str) -> Result<(), String> {
 
 /* ─── helpers ─────────────────────────────────────────────────────────────── */
 
-fn refuse_if_engine_running(data_dir: &Path) -> Result<(), String> {
+pub(crate) fn refuse_if_engine_running(data_dir: &Path) -> Result<(), String> {
     // The engine holds an exclusive flock on $DATA/engine.lock for its
     // whole lifetime. If we can't take it, an engine is live on this
     // data dir — a cold backup/restore would capture or clobber a
