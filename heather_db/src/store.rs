@@ -323,6 +323,29 @@ impl Store {
         Ok(())
     }
 
+    /// Append several document IDs to a location's posting list, reading and
+    /// rewriting the list once.
+    pub fn append_docs_to_location(
+        &self,
+        txn: &mut RwTxn,
+        collection_id: u32,
+        location_id: u64,
+        new_doc_ids: &[u64],
+    ) -> Result<()> {
+        if new_doc_ids.is_empty() {
+            return Ok(());
+        }
+        let key = location_key(collection_id, location_id);
+        let mut doc_ids: Vec<u64> = match self.doc_index_db.get(txn, &key)? {
+            Some(data) => bincode::deserialize(data)?,
+            None => Vec::new(),
+        };
+        doc_ids.extend_from_slice(new_doc_ids);
+        let data = bincode::serialize(&doc_ids)?;
+        self.doc_index_db.put(txn, &key, &data)?;
+        Ok(())
+    }
+
     /// Get all document IDs indexed under a hard location.
     pub fn get_doc_ids_for_location(
         &self,

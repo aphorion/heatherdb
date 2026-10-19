@@ -288,14 +288,22 @@ pub async fn write(
                     "metadata length must match vectors length".to_string(),
                 ));
             }
-            let mut ids = Vec::with_capacity(req.vectors.len());
-            for (vec, meta) in req.vectors.iter().zip(metadata.iter()) {
-                let meta_bytes = serde_json::to_vec(meta).map_err(|e| {
-                    heather_db::HeatherError::InvalidInput(format!("invalid metadata JSON: {e}"))
-                })?;
-                let id = col_clone.write_with_metadata(vec, &meta_bytes)?;
-                ids.push(id);
-            }
+            // One transaction for the whole request, not one per vector.
+            let items = req
+                .vectors
+                .iter()
+                .zip(metadata.iter())
+                .map(|(vec, meta)| {
+                    serde_json::to_vec(meta)
+                        .map(|bytes| (vec.as_slice(), bytes))
+                        .map_err(|e| {
+                            heather_db::HeatherError::InvalidInput(format!(
+                                "invalid metadata JSON: {e}"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let ids = col_clone.write_batch_with_metadata(&items)?;
             Ok((ids.len(), Some(ids)))
         } else {
             col_clone.write_batch(&req.vectors)?;
