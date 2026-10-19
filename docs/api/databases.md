@@ -111,10 +111,17 @@ curl -u admin:pw -X DELETE http://localhost:6380/db/movies
 ```
 
 ```json
-{ "dropped": true }
+{ "dropped": true, "purged": false }
 ```
 
 `{"dropped": false}` when the database was not mounted.
+
+With `?purge=true` the database is deleted for good instead of kept in
+`_trash/` (it is still moved there first, so it is unmounted atomically):
+`{"dropped": true, "purged": true}`. Use it for data you will never
+recover, such as scratch databases or ones rebuilt from a log; trash is
+never emptied automatically, so repeated drops of large databases fill the
+disk. Without it, `purged` is `false`.
 
 | Status | Cause |
 |---|---|
