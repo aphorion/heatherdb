@@ -342,6 +342,12 @@ pub struct Collection {
     store: Arc<Store>,
 }
 
+/// How many times more locations a document query draws candidates from
+/// than a read activates. At 1, about 16% of documents could not be found by
+/// their own vector once writes used the neighbour graph; at 2 none could not
+/// in tests; 4 leaves margin.
+const QUERY_CANDIDATE_FACTOR: usize = 4;
+
 impl Collection {
     /// Create a new collection, initializing with L_0 random locations.
     pub fn new(
@@ -1840,7 +1846,10 @@ impl Collection {
         }
 
         // Step 1: Activate query against hard locations (graph-accelerated when ready)
-        let k = inner.config.k.min(inner.locations.len());
+        // Candidates come from a wider set of locations than a read uses: a
+        // document is posted under the locations its write activated, which
+        // (graph-searched, and since migrated) need not be a query's nearest k.
+        let k = (inner.config.k * QUERY_CANDIDATE_FACTOR).min(inner.locations.len());
         let (indices, _sims) = read::activate_auto_full(
             query,
             &inner.locations,
@@ -1980,7 +1989,10 @@ impl Collection {
         // Recall is identical to `query_documents`: activate `query` against
         // the hard locations and take the union of their posting lists. The
         // pairs play no part in choosing candidates — see the doc comment.
-        let k = inner.config.k.min(inner.locations.len());
+        // Candidates come from a wider set of locations than a read uses: a
+        // document is posted under the locations its write activated, which
+        // (graph-searched, and since migrated) need not be a query's nearest k.
+        let k = (inner.config.k * QUERY_CANDIDATE_FACTOR).min(inner.locations.len());
         let (indices, _sims) = read::activate_auto_full(
             query,
             &inner.locations,
@@ -3641,6 +3653,47 @@ mod tests {
         assert!(inner.locations.len() > len);
         assert!(inner.landmarks_at > at, "re-selected after growth");
         assert!(inner.landmarks.iter().all(|&i| i < inner.locations.len()));
+    }
+
+    /// A stored document is always found by its own vector, also once the
+    /// collection has grown a neighbour graph (regression: reads used the
+    /// approximate graph search and missed ~16% of exact matches).
+    #[test]
+    fn documents_are_found_by_their_own_vector() {
+        use rand::{Rng, SeedableRng};
+
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 64;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "lookup".into(), store, &config).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let keys: Vec<Vec<f64>> = (0..3_000)
+            .map(|_| {
+                vec_ops::normalize(
+                    &(0..d)
+                        .map(|_| rng.gen_range(-1.0..1.0))
+                        .collect::<Vec<f64>>(),
+                )
+            })
+            .collect();
+        let items: Vec<(Vec<f64>, Vec<u8>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), format!(r#"{{"i":{i}}}"#).into_bytes()))
+            .collect();
+        for chunk in items.chunks(500) {
+            col.write_batch_with_metadata(chunk).unwrap();
+        }
+
+        let misses = (0..keys.len())
+            .step_by(7)
+            .filter(|&i| {
+                let hits = col.query_documents(&keys[i], 5).unwrap();
+                !hits.iter().any(|(id, _, _)| *id == i as u64)
+            })
+            .count();
+        assert_eq!(misses, 0, "{misses} keys did not find their own document");
     }
 
     /// Deletion removes a document from retrieval and from every posting
