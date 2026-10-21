@@ -9,7 +9,7 @@ use crate::location::{HardLocation, LocationId};
 use crate::merge;
 use crate::read;
 pub use crate::read::{ActivatedLocation, AttentionContributor, AttentionTrace, ReadTrace};
-use crate::store::Store;
+use crate::store::{DocVector, Store};
 use crate::vec_ops;
 use crate::write;
 
@@ -249,6 +249,9 @@ pub(crate) struct EAMInner {
     pub(crate) doc_next_id: u64,
     /// Cached landmark indices for graph search entry points
     pub(crate) landmarks: Vec<usize>,
+    /// How many locations there were when `landmarks` was last selected
+    /// (see [`EAMInner::refresh_landmarks`]).
+    pub(crate) landmarks_at: usize,
     /// Flat LocationId → index lookup array for O(1) graph traversal
     pub(crate) id_lookup: Vec<u32>,
     /// Contiguous [L × D] address matrix for cache-friendly brute-force activation.
@@ -265,7 +268,30 @@ impl EAMInner {
     pub(crate) fn rebuild_graph_cache(&mut self) {
         self.id_lookup = read::build_id_lookup(&self.locations);
         self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
+        self.landmarks_at = self.locations.len();
         self.rebuild_address_matrix();
+    }
+
+    /// Re-selects landmarks as the collection grows.
+    ///
+    /// Writes take the graph path only with landmarks to enter it from
+    /// ([`read::activate_auto`]). Landmarks used to be chosen only when a
+    /// collection was opened (and by compress / merge / snapshot loads), so a
+    /// collection created empty and grown by writes kept none for the life
+    /// of the process, and every write scanned every location: O(N·d) per
+    /// vector, slower with each write. They are now re-selected while the
+    /// collection has fewer than `num_landmarks` locations' worth, and again
+    /// after each 25% of growth (at least 256 locations), which keeps the
+    /// O(N log N) selection amortised.
+    pub(crate) fn refresh_landmarks(&mut self) {
+        let len = self.locations.len();
+        let wanted = self.config.num_landmarks.min(len);
+        let grown = len >= self.landmarks_at + (self.landmarks_at / 4).max(256);
+
+        if self.config.num_landmarks > 0 && (self.landmarks.len() < wanted || grown) {
+            self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
+            self.landmarks_at = len;
+        }
     }
 
     /// Rebuild address matrix from locations.
@@ -286,15 +312,24 @@ impl EAMInner {
         }
     }
 
-    /// Append addresses for newly added locations.
+    /// Append addresses for newly added locations (and refresh landmarks
+    /// as the collection grows).
     pub(crate) fn append_addresses(&mut self, start_idx: usize) {
         for i in start_idx..self.locations.len() {
             self.address_matrix
                 .extend_from_slice(&self.locations[i].address);
         }
+        self.refresh_landmarks();
     }
 
     /// Incremental update after appending new locations.
+    /// The address of the location with this id, if it exists.
+    pub(crate) fn location_address(&self, id: u64) -> Option<&[f64]> {
+        let idx = *self.id_lookup.get(id as usize)?;
+        let loc = self.locations.get(idx as usize)?;
+        (loc.id.0 == id).then_some(loc.address.as_slice())
+    }
+
     pub(crate) fn extend_id_lookup(&mut self, start_idx: usize) {
         for i in start_idx..self.locations.len() {
             let id = self.locations[i].id.0 as usize;
@@ -312,6 +347,30 @@ pub struct Collection {
     name: String,
     inner: RwLock<EAMInner>,
     store: Arc<Store>,
+}
+
+/// How many times more locations a document query draws candidates from
+/// than a read activates. At 1, about 16% of documents could not be found by
+/// their own vector once writes used the neighbour graph; at 2 none could not
+/// in tests; 4 leaves margin.
+const QUERY_CANDIDATE_FACTOR: usize = 4;
+
+/// The id of the location a write created, when the write was a plain
+/// (non-competitive) one that stored `input` verbatim as that location's
+/// address: its document can then refer to the location instead of keeping
+/// another copy of the vector.
+fn plain_location(
+    config: &EAMConfig,
+    modified: &[usize],
+    created: &[HardLocation],
+    input: &[f64],
+) -> Option<u64> {
+    match created {
+        [loc] if !config.competitive && modified.is_empty() && loc.address == input => {
+            Some(loc.id.0)
+        }
+        _ => None,
+    }
 }
 
 impl Collection {
@@ -361,6 +420,7 @@ impl Collection {
             address_matrix.extend_from_slice(&loc.address);
         }
 
+        let landmarks_at = locations.len();
         Ok(Collection {
             collection_id,
             name,
@@ -370,6 +430,7 @@ impl Collection {
                 next_id,
                 eta,
                 doc_next_id: 0,
+                landmarks_at,
                 landmarks,
                 id_lookup,
                 address_matrix,
@@ -424,6 +485,7 @@ impl Collection {
             address_matrix.extend_from_slice(&loc.address);
         }
 
+        let landmarks_at = locations.len();
         Ok(Collection {
             collection_id,
             name,
@@ -433,6 +495,7 @@ impl Collection {
                 next_id,
                 eta,
                 doc_next_id,
+                landmarks_at,
                 landmarks,
                 id_lookup,
                 address_matrix,
@@ -1216,6 +1279,7 @@ impl Collection {
     /// Migrates document index posting lists from removed locations to survivors.
     pub fn merge(&self) -> Result<usize> {
         let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        self.materialize_document_refs(&inner)?;
         inner.version += 1;
         let EAMInner {
             ref config,
@@ -1290,6 +1354,7 @@ impl Collection {
     /// the native objective; the location count is the emergent result.
     pub fn compress(&self, kappa: f64, lambda: f64) -> Result<CompressResult> {
         let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        self.materialize_document_refs(&inner)?;
         let w: f64 = inner
             .locations
             .iter()
@@ -1497,8 +1562,13 @@ impl Collection {
             self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
 
-        // Persist document (vector + metadata)
-        let doc_data = bincode::serialize(&(input.to_vec(), metadata.to_vec()))?;
+        // Persist document (vector + metadata). A plain write's vector is its
+        // new location's address, so the document refers to it instead.
+        let doc_data =
+            match plain_location(&inner.config, &result.modified_indices, &new_locs, input) {
+                Some(id) => self.store.encode_document_ref(id, metadata),
+                None => self.store.encode_document(input, metadata)?,
+            };
         self.store
             .put_document(&mut txn, self.collection_id, doc_id, &doc_data)?;
 
@@ -1622,6 +1692,12 @@ impl Collection {
             }
 
             inner.sync_addresses(&result.modified_indices);
+            let plain = plain_location(
+                &inner.config,
+                &result.modified_indices,
+                &result.new_locations,
+                input,
+            );
 
             if !result.new_locations.is_empty() {
                 let start = inner.locations.len();
@@ -1636,7 +1712,10 @@ impl Collection {
 
             documents.push((
                 doc_id,
-                bincode::serialize(&(input.to_vec(), metadata.as_ref().to_vec()))?,
+                match plain {
+                    Some(id) => self.store.encode_document_ref(id, metadata.as_ref()),
+                    None => self.store.encode_document(input, metadata.as_ref())?,
+                },
             ));
         }
 
@@ -1685,11 +1764,47 @@ impl Collection {
     pub fn get_document(&self, write_index: u64) -> Result<Option<(Vec<f64>, Vec<u8>)>> {
         match self.store.get_document(self.collection_id, write_index)? {
             Some(data) => {
-                let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
-                Ok(Some((vec, meta)))
+                let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+                Ok(Some(self.resolve_document(&inner, &data)?))
             }
             None => Ok(None),
         }
+    }
+
+    /// A stored document's vector and metadata, its vector resolved from its
+    /// location when it is stored by reference.
+    fn resolve_document(&self, inner: &EAMInner, data: &[u8]) -> Result<(Vec<f64>, Vec<u8>)> {
+        match self.store.decode_document_parts(data)? {
+            (DocVector::Inline(vector), metadata) => Ok((vector, metadata)),
+            (DocVector::Location(id), metadata) => match inner.location_address(id) {
+                Some(address) => Ok((address.to_vec(), metadata)),
+                None => Err(HeatherError::LocationNotFound(id)),
+            },
+        }
+    }
+
+    /// Stores every document of this collection that refers to its
+    /// location's address with its own copy of the vector again. Run before
+    /// anything changes or removes existing locations (merges, snapshot
+    /// loads), which would otherwise change or take away those documents'
+    /// vectors. Returns how many were rewritten.
+    fn materialize_document_refs(&self, inner: &EAMInner) -> Result<usize> {
+        let mut rewritten = Vec::new();
+        for (doc_id, data) in self.store.list_documents(self.collection_id)? {
+            if let (DocVector::Location(_), _) = self.store.decode_document_parts(&data)? {
+                let (vector, metadata) = self.resolve_document(inner, &data)?;
+                rewritten.push((doc_id, self.store.encode_document(&vector, &metadata)?));
+            }
+        }
+        if !rewritten.is_empty() {
+            let mut txn = self.store.write_txn()?;
+            for (doc_id, data) in &rewritten {
+                self.store
+                    .put_document(&mut txn, self.collection_id, *doc_id, data)?;
+            }
+            txn.commit()?;
+        }
+        Ok(rewritten.len())
     }
 
     /// The ids of this collection's hard locations, in storage order.
@@ -1732,12 +1847,31 @@ impl Collection {
         Ok(existed)
     }
 
+    /// One page of this collection's documents (id order) and the total count.
+    pub fn list_documents_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<DocumentRecord>, usize)> {
+        let (raw, total) = self
+            .store
+            .list_documents_page(self.collection_id, offset, limit)?;
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut docs = Vec::with_capacity(raw.len());
+        for (id, data) in raw {
+            let (vec, meta) = self.resolve_document(&inner, &data)?;
+            docs.push((id, vec, meta));
+        }
+        Ok((docs, total))
+    }
+
     /// List all documents in this collection.
     pub fn list_documents(&self) -> Result<Vec<DocumentRecord>> {
         let raw = self.store.list_documents(self.collection_id)?;
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
         let mut docs = Vec::with_capacity(raw.len());
         for (id, data) in raw {
-            let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+            let (vec, meta) = self.resolve_document(&inner, &data)?;
             docs.push((id, vec, meta));
         }
         Ok(docs)
@@ -1808,7 +1942,14 @@ impl Collection {
         }
 
         // Step 1: Activate query against hard locations (graph-accelerated when ready)
-        let k = inner.config.k.min(inner.locations.len());
+        // Candidates come from a wider set of locations than a read uses: a
+        // document is posted under the locations its write activated, which
+        // (graph-searched, and since migrated) need not be a query's nearest k.
+        // At least n locations: in a plain collection each holds one document,
+        // so k * factor of them would cap the result below n.
+        let k = (inner.config.k * QUERY_CANDIDATE_FACTOR)
+            .max(n)
+            .min(inner.locations.len());
         let (indices, _sims) = read::activate_auto_full(
             query,
             &inner.locations,
@@ -1837,7 +1978,7 @@ impl Collection {
                 .store
                 .get_document_txn(&rtxn, self.collection_id, doc_id)?
             {
-                let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+                let (vec, meta) = self.resolve_document(&inner, &data)?;
                 // Role-scoped when a role is supplied: unbind the stored
                 // superposition by it first, so the score reflects only the
                 // role the query constrained rather than being diluted by
@@ -1948,7 +2089,14 @@ impl Collection {
         // Recall is identical to `query_documents`: activate `query` against
         // the hard locations and take the union of their posting lists. The
         // pairs play no part in choosing candidates — see the doc comment.
-        let k = inner.config.k.min(inner.locations.len());
+        // Candidates come from a wider set of locations than a read uses: a
+        // document is posted under the locations its write activated, which
+        // (graph-searched, and since migrated) need not be a query's nearest k.
+        // At least n locations: in a plain collection each holds one document,
+        // so k * factor of them would cap the result below n.
+        let k = (inner.config.k * QUERY_CANDIDATE_FACTOR)
+            .max(n)
+            .min(inner.locations.len());
         let (indices, _sims) = read::activate_auto_full(
             query,
             &inner.locations,
@@ -2012,7 +2160,7 @@ impl Collection {
             else {
                 continue;
             };
-            let (vec, metadata): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+            let (vec, metadata) = self.resolve_document(&inner, &data)?;
             if vec.len() != d {
                 continue;
             }
@@ -2231,6 +2379,9 @@ impl Collection {
                 self.name, inner.version, expected
             )));
         }
+        // Documents stored by reference would lose their vectors with the
+        // locations this replaces.
+        self.materialize_document_refs(&inner)?;
         inner.version += 1;
 
         // Persist atomically: clear old locations, write new ones
@@ -2391,6 +2542,122 @@ mod tests {
         config.l_0 = 50;
         config.k = 5;
         config
+    }
+
+    fn plain_corpus(
+        dir: &TempDir,
+        n: usize,
+        d: usize,
+    ) -> (Arc<Store>, u32, EAMConfig, Vec<Vec<f64>>) {
+        let store = Arc::new(
+            Store::open_with_precision(dir.path(), 256, crate::config::Precision::F32).unwrap(),
+        );
+        let mut txn = store.write_txn().unwrap();
+        let col_id = store.create_collection(&mut txn, "plain").unwrap();
+        txn.commit().unwrap();
+        let mut config = EAMConfig::new(d).unwrap();
+        config.l_0 = 0;
+        config.competitive = false;
+        let col = Collection::new(col_id, "plain".into(), store.clone(), &config).unwrap();
+        let mut rng = rand::thread_rng();
+        // f32-exact vectors, so a vector read back from the location (f32 on
+        // disk) equals the one written.
+        let vectors: Vec<Vec<f64>> = (0..n)
+            .map(|_| {
+                vec_ops::random_unit_vector(d, &mut rng)
+                    .iter()
+                    .map(|x| *x as f32 as f64)
+                    .collect()
+            })
+            .collect();
+        let items: Vec<(Vec<f64>, Vec<u8>)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.clone(), format!("{{\"i\":{i}}}").into_bytes()))
+            .collect();
+        col.write_batch_with_metadata(&items[..n / 2]).unwrap();
+        for (v, m) in &items[n / 2..] {
+            col.write_with_metadata(v, m).unwrap();
+        }
+        (store, col_id, config, vectors)
+    }
+
+    #[test]
+    fn plain_documents_refer_to_their_locations_and_read_back_exactly() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id, config, vectors) = plain_corpus(&dir, 200, 32);
+        for (doc_id, data) in store.list_documents(col_id).unwrap() {
+            assert!(
+                matches!(
+                    store.decode_document_parts(&data).unwrap().0,
+                    DocVector::Location(_)
+                ),
+                "doc {doc_id} inline"
+            );
+        }
+        // Every read path resolves the reference, also after reopening.
+        let col = Collection::load(col_id, "plain".into(), store.clone(), &config).unwrap();
+        for (i, v) in vectors.iter().enumerate() {
+            let (vec, meta) = col.get_document(i as u64).unwrap().unwrap();
+            assert_eq!(&vec, v);
+            assert_eq!(meta, format!("{{\"i\":{i}}}").into_bytes());
+        }
+        let (page, total) = col.list_documents_page(10, 5).unwrap();
+        assert_eq!(total, 200);
+        assert_eq!(page[0].1, vectors[10]);
+        assert_eq!(col.list_documents().unwrap()[199].1, vectors[199]);
+        let hits = col.query_documents(&vectors[42], 1).unwrap();
+        assert_eq!(hits[0].0, 42);
+        assert!((hits[0].1 - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn plain_query_returns_as_many_documents_as_asked() {
+        let dir = TempDir::new().unwrap();
+        let (_store, _col_id, _config, vectors) = plain_corpus(&dir, 400, 32);
+        let col = Collection::load(_col_id, "plain".into(), _store, &_config).unwrap();
+        // One document per location: k * QUERY_CANDIDATE_FACTOR locations
+        // used to cap the answer well below 300.
+        assert_eq!(col.query_documents(&vectors[0], 300).unwrap().len(), 300);
+    }
+
+    #[test]
+    fn merging_a_plain_collection_keeps_its_documents_vectors() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id, mut config, vectors) = plain_corpus(&dir, 60, 16);
+        config.tau_merge = 0.0; // merge aggressively
+        let col = Collection::load(col_id, "plain".into(), store.clone(), &config).unwrap();
+        col.merge().unwrap();
+        for (doc_id, data) in store.list_documents(col_id).unwrap() {
+            assert!(
+                matches!(
+                    store.decode_document_parts(&data).unwrap().0,
+                    DocVector::Inline(_)
+                ),
+                "doc {doc_id} still a ref"
+            );
+        }
+        for (i, v) in vectors.iter().enumerate() {
+            assert_eq!(&col.get_document(i as u64).unwrap().unwrap().0, v);
+        }
+    }
+
+    #[test]
+    fn competitive_documents_keep_their_own_vectors() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let col = Collection::new(col_id, "test".into(), store.clone(), &test_config()).unwrap();
+        let mut rng = rand::thread_rng();
+        for _ in 0..20 {
+            col.write_with_metadata(&vec_ops::random_unit_vector(16, &mut rng), b"{}")
+                .unwrap();
+        }
+        for (_, data) in store.list_documents(col_id).unwrap() {
+            assert!(matches!(
+                store.decode_document_parts(&data).unwrap().0,
+                DocVector::Inline(_)
+            ));
+        }
     }
 
     fn setup_store(dir: &TempDir) -> (Arc<Store>, u32) {
@@ -3552,6 +3819,130 @@ mod tests {
 
         assert!(col.write_batch_with_metadata(&items).is_err());
         assert_eq!(col.write_with_metadata(&basis_vec(d, 0), b"{}").unwrap(), 0);
+    }
+
+    /// A collection created empty and grown only by writes gets landmarks,
+    /// and they are re-selected as it keeps growing, so writes can take the
+    /// graph path instead of scanning every location (regression: landmarks
+    /// were chosen only on open, leaving a growing collection with none).
+    #[test]
+    fn landmarks_follow_a_collection_grown_by_writes() {
+        use rand::{Rng, SeedableRng};
+
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 32;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "docs".into(), store, &config).unwrap();
+        assert!(
+            col.inner.read().unwrap().landmarks.is_empty(),
+            "starts with none"
+        );
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let vector = |rng: &mut rand::rngs::StdRng| -> Vec<f64> {
+            vec_ops::normalize(
+                &(0..d)
+                    .map(|_| rng.gen_range(-1.0..1.0))
+                    .collect::<Vec<f64>>(),
+            )
+        };
+
+        for _ in 0..400 {
+            col.write_with_metadata(&vector(&mut rng), b"{}").unwrap();
+        }
+
+        let (landmarks, at, len) = {
+            let inner = col.inner.read().unwrap();
+            (
+                inner.landmarks.clone(),
+                inner.landmarks_at,
+                inner.locations.len(),
+            )
+        };
+        assert_eq!(
+            landmarks.len(),
+            config.num_landmarks.min(len),
+            "a grown collection has a full set"
+        );
+        assert!(landmarks.iter().all(|&i| i < len));
+
+        // Grow well past 25%: they are selected again.
+        let items: Vec<(Vec<f64>, Vec<u8>)> = (0..2_000)
+            .map(|_| (vector(&mut rng), b"{}".to_vec()))
+            .collect();
+        col.write_batch_with_metadata(&items).unwrap();
+        let inner = col.inner.read().unwrap();
+        assert!(inner.locations.len() > len);
+        assert!(inner.landmarks_at > at, "re-selected after growth");
+        assert!(inner.landmarks.iter().all(|&i| i < inner.locations.len()));
+    }
+
+    /// Paging an f32 collection decodes its documents at f32 (regression: the
+    /// paged listing decoded every store as f64).
+    #[test]
+    fn paging_reads_f32_documents() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(
+            Store::open_with_precision(dir.path(), 64, crate::config::Precision::F32).unwrap(),
+        );
+        let col_id = {
+            let mut txn = store.write_txn().unwrap();
+            let id = store.create_collection(&mut txn, "docs").unwrap();
+            txn.commit().unwrap();
+            id
+        };
+        let mut config = EAMConfig::new(4).unwrap();
+        config.precision = crate::config::Precision::F32;
+        let col = Collection::new(col_id, "docs".into(), store, &config).unwrap();
+        col.write_with_metadata(&[0.5, 0.25, 0.0, 1.0], br#"{"i":0}"#)
+            .unwrap();
+
+        let (docs, total) = col.list_documents_page(0, 10).unwrap();
+        assert_eq!(total, 1);
+        assert_eq!(docs[0].1, vec![0.5, 0.25, 0.0, 1.0]);
+        assert_eq!(docs[0].2, br#"{"i":0}"#.to_vec());
+    }
+
+    /// A stored document is always found by its own vector, also once the
+    /// collection has grown a neighbour graph (regression: reads used the
+    /// approximate graph search and missed ~16% of exact matches).
+    #[test]
+    fn documents_are_found_by_their_own_vector() {
+        use rand::{Rng, SeedableRng};
+
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 64;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "lookup".into(), store, &config).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let keys: Vec<Vec<f64>> = (0..3_000)
+            .map(|_| {
+                vec_ops::normalize(
+                    &(0..d)
+                        .map(|_| rng.gen_range(-1.0..1.0))
+                        .collect::<Vec<f64>>(),
+                )
+            })
+            .collect();
+        let items: Vec<(Vec<f64>, Vec<u8>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), format!(r#"{{"i":{i}}}"#).into_bytes()))
+            .collect();
+        for chunk in items.chunks(500) {
+            col.write_batch_with_metadata(chunk).unwrap();
+        }
+
+        let misses = (0..keys.len())
+            .step_by(7)
+            .filter(|&i| {
+                let hits = col.query_documents(&keys[i], 5).unwrap();
+                !hits.iter().any(|(id, _, _)| *id == i as u64)
+            })
+            .count();
+        assert_eq!(misses, 0, "{misses} keys did not find their own document");
     }
 
     /// Deletion removes a document from retrieval and from every posting

@@ -45,7 +45,11 @@ impl Hive {
         audit: AuditConfig,
     ) -> Result<Self> {
         config.validate()?;
-        let store = Arc::new(Store::open(path, map_size_mb)?);
+        let store = Arc::new(Store::open_with_precision(
+            path,
+            map_size_mb,
+            config.precision,
+        )?);
         let audit = AuditLog::open(&store, audit)?;
 
         Ok(Hive {
@@ -54,6 +58,17 @@ impl Hive {
             audit,
             collections: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Whether commits are synced to disk. See [`Store::set_sync`].
+    pub fn syncs(&self) -> Result<bool> {
+        self.store.syncs()
+    }
+
+    /// Turns per-commit syncing off or back on (syncing what was written
+    /// meanwhile). See [`Store::set_sync`].
+    pub fn set_sync(&self, sync: bool) -> Result<()> {
+        self.store.set_sync(sync)
     }
 
     /// Create a new collection. Returns it if it already exists.

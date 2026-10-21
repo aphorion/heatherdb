@@ -79,10 +79,73 @@ pub struct CompressRequest {
     pub lambda: Option<f64>,
 }
 
+/// `PUT /db/{db}/durability`: whether every commit is synced to disk.
+#[derive(Debug, Deserialize)]
+pub struct DurabilityRequest {
+    pub sync: bool,
+}
+
+#[derive(Debug, Serialize)]
+pub struct DurabilityResponse {
+    pub database: String,
+    pub sync: bool,
+}
+
+/// Vectors come as `vectors` (JSON number arrays) or `vectors_b64` (each
+/// vector's little-endian f64 bytes, base64-encoded: about half the bytes
+/// of JSON numbers and no float parsing), not both.
 #[derive(Debug, Deserialize)]
 pub struct WriteRequest {
+    #[serde(default)]
     pub vectors: Vec<Vec<f64>>,
+    #[serde(default)]
+    pub vectors_b64: Option<Vec<String>>,
     pub metadata: Option<Vec<serde_json::Value>>,
+}
+
+/// The features `/health` advertises, so clients can tell what a server
+/// accepts before sending it.
+pub const FEATURES: &[&str] = &["vectors_b64"];
+
+/// Decodes base64 vectors of little-endian f64 bytes. `field` names the
+/// request field in errors.
+pub fn decode_vectors(encoded: Vec<String>, field: &str) -> Result<Vec<Vec<f64>>, String> {
+    use base64::Engine as _;
+
+    encoded
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(text)
+                .map_err(|e| format!("{field}[{i}] is not valid base64: {e}"))?;
+            if bytes.is_empty() || bytes.len() % 8 != 0 {
+                return Err(format!(
+                    "{field}[{i}] must be a whole number of little-endian f64 values (8 bytes each), got {} bytes",
+                    bytes.len()
+                ));
+            }
+            // The length is a multiple of 8 (checked above), so nothing remains.
+            let (values, _) = bytes.as_chunks::<8>();
+            Ok(values.iter().map(|b| f64::from_le_bytes(*b)).collect())
+        })
+        .collect()
+}
+
+/// Takes `b64` in place of `json` if it was sent: an error if both were.
+pub fn resolve_vectors(
+    json: &mut Vec<Vec<f64>>,
+    b64: Option<Vec<String>>,
+    field: &str,
+) -> Result<(), String> {
+    match b64 {
+        None => Ok(()),
+        Some(_) if !json.is_empty() => Err(format!("send {field} or {field}_b64, not both")),
+        Some(encoded) => {
+            *json = decode_vectors(encoded, &format!("{field}_b64"))?;
+            Ok(())
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -188,6 +251,18 @@ pub struct StatsResponse {
 #[derive(Debug, Serialize)]
 pub struct HealthResponse {
     pub status: String,
+    pub version: &'static str,
+    pub features: &'static [&'static str],
+}
+
+impl HealthResponse {
+    pub fn ok() -> Self {
+        HealthResponse {
+            status: "ok".to_string(),
+            version: env!("CARGO_PKG_VERSION"),
+            features: FEATURES,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -231,6 +306,12 @@ pub struct EamConfigOverride {
     pub neighbor_cap: Option<usize>,
     pub num_landmarks: Option<usize>,
     pub l_0: Option<usize>,
+    /// `false` makes every collection a plain store: writes append without
+    /// competitive learning (no activation, merge or migration). For
+    /// evidence that is listed or fetched by id, not searched by similarity.
+    pub competitive: Option<bool>,
+    /// `"f32"` stores vectors in half the space (math stays f64).
+    pub precision: Option<heather_db::Precision>,
 }
 
 #[derive(Debug, Serialize)]
@@ -240,6 +321,9 @@ pub struct DatabaseInfo {
     pub dimension: usize,
     pub map_size_mb: usize,
     pub collections: usize,
+    /// `false`: a plain store (see `EamConfigOverride::competitive`).
+    pub competitive: bool,
+    pub precision: heather_db::Precision,
 }
 
 #[derive(Debug, Serialize)]
@@ -250,6 +334,15 @@ pub struct ListDatabasesResponse {
 #[derive(Debug, Serialize)]
 pub struct DropDatabaseResponse {
     pub dropped: bool,
+    /// Deleted for good rather than moved to `_trash/` (`?purge=true`).
+    pub purged: bool,
+}
+
+/// `DELETE /db/{db}?purge=true`.
+#[derive(Debug, Default, Deserialize)]
+pub struct DropDatabaseQuery {
+    #[serde(default)]
+    pub purge: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -345,6 +438,15 @@ pub struct DeleteDocumentResponse {
 #[derive(Debug, Serialize)]
 pub struct DocumentsResponse {
     pub documents: Vec<DocumentItem>,
+    /// Documents in the collection (all pages).
+    pub total: usize,
+}
+
+/// `GET .../documents?offset=&limit=`: one page, in id order.
+#[derive(Debug, Default, Deserialize)]
+pub struct DocumentsQuery {
+    pub offset: Option<usize>,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -450,8 +552,16 @@ pub struct QueryDocumentsResponse {
 /// algebra (bind / unbind / add / sub) to operate on known operands.
 #[derive(Debug, Deserialize)]
 pub struct BulkLoadRequest {
+    #[serde(default)]
     pub addresses: Vec<Vec<f64>>,
+    #[serde(default)]
     pub counters: Vec<Vec<f64>>,
+    /// Base64 little-endian f64 alternatives to `addresses` / `counters`
+    /// (see [`WriteRequest`]).
+    #[serde(default)]
+    pub addresses_b64: Option<Vec<String>>,
+    #[serde(default)]
+    pub counters_b64: Option<Vec<String>>,
     #[serde(default)]
     pub write_counts: Option<Vec<f64>>,
 }
