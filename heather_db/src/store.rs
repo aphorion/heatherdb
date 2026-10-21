@@ -39,6 +39,20 @@ fn metadata_key(collection_id: u32, key: &str) -> Vec<u8> {
     result
 }
 
+/// Marks a document stored by reference to its location. An inline document
+/// starts with its vector's length as a little-endian u64, so these bytes
+/// would claim a vector of over a billion components: never a real one.
+const DOC_REF_MAGIC: [u8; 4] = [0xFF, 0xFE, b'D', b'R'];
+
+/// Where a stored document's vector is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocVector {
+    /// Stored with the document.
+    Inline(Vec<f64>),
+    /// The address of this location of the document's collection.
+    Location(u64),
+}
+
 pub struct Store {
     env: Env,
     /// How vectors are encoded on disk (see [`crate::config::Precision`]).
@@ -300,14 +314,30 @@ impl Store {
     }
 
     // --- Vector encoding (by precision) ---
+    //
+    // A location whose counter equals its address (every write to a plain,
+    // non-competitive collection) is stored with an empty counter and read
+    // back with the address in its place: half the bytes, and at d = 1024
+    // f32 small enough to stay inside a page instead of taking an overflow
+    // page of its own. A counter is never legitimately empty (it has length
+    // d >= 1), so older records, which always carry it, decode unchanged.
 
     fn encode_location(&self, loc: &HardLocation) -> Result<Vec<u8>> {
+        let same = loc.counter == loc.address;
         Ok(match self.precision {
+            Precision::F64 if same => bincode::serialize(&HardLocation {
+                counter: Vec::new(),
+                ..loc.clone()
+            })?,
             Precision::F64 => bincode::serialize(loc)?,
             Precision::F32 => bincode::serialize(&CompactLocation {
                 id: loc.id,
                 address: narrow(&loc.address),
-                counter: narrow(&loc.counter),
+                counter: if same {
+                    Vec::new()
+                } else {
+                    narrow(&loc.counter)
+                },
                 write_count: loc.write_count,
                 neighbors: loc.neighbors.clone(),
                 surprise_mass: loc.surprise_mass,
@@ -316,7 +346,7 @@ impl Store {
     }
 
     fn decode_location(&self, bytes: &[u8]) -> Result<HardLocation> {
-        Ok(match self.precision {
+        let mut loc: HardLocation = match self.precision {
             Precision::F64 => bincode::deserialize(bytes)?,
             Precision::F32 => {
                 let c: CompactLocation = bincode::deserialize(bytes)?;
@@ -329,7 +359,11 @@ impl Store {
                     surprise_mass: c.surprise_mass,
                 }
             }
-        })
+        };
+        if loc.counter.is_empty() {
+            loc.counter = loc.address.clone();
+        }
+        Ok(loc)
     }
 
     /// A document's stored bytes: its vector (at the store's precision) and
@@ -341,13 +375,44 @@ impl Store {
         })
     }
 
-    /// The vector and metadata of a stored document.
+    /// A document whose vector is its location's address (a plain
+    /// collection's write): stored as a reference to the location and the
+    /// metadata, without a third copy of the vector.
+    pub fn encode_document_ref(&self, location_id: u64, metadata: &[u8]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(DOC_REF_MAGIC.len() + 8 + metadata.len());
+        bytes.extend_from_slice(&DOC_REF_MAGIC);
+        bytes.extend_from_slice(&location_id.to_le_bytes());
+        bytes.extend_from_slice(metadata);
+        bytes
+    }
+
+    /// The vector and metadata of a stored document. A document stored by
+    /// reference ([`Self::encode_document_ref`]) has no vector of its own:
+    /// resolve it with [`Self::decode_document_parts`] instead.
     pub fn decode_document(&self, bytes: &[u8]) -> Result<(Vec<f64>, Vec<u8>)> {
+        match self.decode_document_parts(bytes)? {
+            (DocVector::Inline(vector), metadata) => Ok((vector, metadata)),
+            (DocVector::Location(id), _) => Err(HeatherError::Serialization(format!(
+                "document stores its vector by reference to location {id}; resolve it through its collection"
+            ))),
+        }
+    }
+
+    /// A stored document's vector, inline or by reference, and its metadata.
+    pub fn decode_document_parts(&self, bytes: &[u8]) -> Result<(DocVector, Vec<u8>)> {
+        if bytes.len() >= DOC_REF_MAGIC.len() + 8 && bytes[..DOC_REF_MAGIC.len()] == DOC_REF_MAGIC {
+            let at = DOC_REF_MAGIC.len();
+            let id = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
+            return Ok((DocVector::Location(id), bytes[at + 8..].to_vec()));
+        }
         Ok(match self.precision {
-            Precision::F64 => bincode::deserialize(bytes)?,
+            Precision::F64 => {
+                let (vector, metadata): (Vec<f64>, Vec<u8>) = bincode::deserialize(bytes)?;
+                (DocVector::Inline(vector), metadata)
+            }
             Precision::F32 => {
                 let (vector, metadata): (Vec<f32>, Vec<u8>) = bincode::deserialize(bytes)?;
-                (widen(&vector), metadata)
+                (DocVector::Inline(widen(&vector)), metadata)
             }
         })
     }
@@ -704,6 +769,52 @@ impl Store {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn a_location_whose_counter_is_its_address_is_stored_once_and_reads_back() {
+        for precision in [Precision::F32, Precision::F64] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let store = Store::open_with_precision(dir.path(), 64, precision).unwrap();
+            let address: Vec<f64> = (0..1024).map(|i| (i as f32 * 0.001) as f64).collect();
+            let mut plain = HardLocation::new(LocationId(7), address.clone());
+            plain.counter = address.clone();
+            let mut learned = plain.clone();
+            learned.counter[3] = 2.0; // f32-exact, so the round trip compares equal
+            let plain_bytes = store.encode_location(&plain).unwrap();
+            let learned_bytes = store.encode_location(&learned).unwrap();
+            assert!(
+                plain_bytes.len() * 2 < learned_bytes.len() + 64,
+                "{precision:?}: {} vs {}",
+                plain_bytes.len(),
+                learned_bytes.len()
+            );
+            assert_eq!(
+                store.decode_location(&plain_bytes).unwrap().counter,
+                address
+            );
+            assert_eq!(
+                store.decode_location(&learned_bytes).unwrap().counter,
+                learned.counter
+            );
+        }
+    }
+
+    #[test]
+    fn document_references_are_never_mistaken_for_inline_documents() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open_with_precision(dir.path(), 64, Precision::F32).unwrap();
+        let r = store.encode_document_ref(99, b"{\"a\":1}");
+        assert_eq!(
+            store.decode_document_parts(&r).unwrap(),
+            (DocVector::Location(99), b"{\"a\":1}".to_vec())
+        );
+        assert!(store.decode_document(&r).is_err());
+        let inline = store.encode_document(&[0.5, -0.25], b"{}").unwrap();
+        assert_eq!(
+            store.decode_document_parts(&inline).unwrap(),
+            (DocVector::Inline(vec![0.5, -0.25]), b"{}".to_vec())
+        );
+    }
 
     #[test]
     fn test_store_roundtrip() {
