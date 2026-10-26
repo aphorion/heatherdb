@@ -122,6 +122,7 @@ heather_db/               # Engine library
     write.rs              # Competitive learning, splits, merges, the MDL gate
     read.rs               # Activation, the Hopfield loop, graph search
     merge.rs              # KNN merge with posting-list migration
+    nearest.rs            # Nearest neighbours for merges: exact, projected k-d search
     config.rs             # EAMConfig
     db_config.rs          # Per-database persisted config (dimension, EAM knobs)
     store.rs              # LMDB persistence
