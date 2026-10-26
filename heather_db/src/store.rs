@@ -18,6 +18,14 @@ fn location_key(collection_id: u32, location_id: u64) -> [u8; 12] {
 }
 
 /// 4-byte prefix for scanning all locations in a collection.
+/// The record id in a `[collection_id 4B | id 8B BE]` key (0 if malformed).
+fn key_id(key: &[u8]) -> u64 {
+    key.get(4..12)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_be_bytes)
+        .unwrap_or(0)
+}
+
 fn collection_prefix(collection_id: u32) -> [u8; 4] {
     collection_id.to_be_bytes()
 }
@@ -299,6 +307,80 @@ impl Store {
             }
         }
         Ok(locations)
+    }
+
+    /// Decodes every stored location and document of a collection and
+    /// counts what is current, legacy, corrupt or unsupported (see
+    /// [`crate::verify`]). Reads only.
+    pub fn verify_collection(
+        &self,
+        name: &str,
+        collection_id: u32,
+    ) -> Result<crate::verify::CollectionReport> {
+        use crate::codec::{self, Format};
+        use crate::verify::{CollectionReport, MAX_PROBLEMS, RecordCounts};
+
+        fn count<T>(
+            counts: &mut RecordCounts,
+            problems: &mut Vec<String>,
+            what: &str,
+            id: u64,
+            bytes: &[u8],
+            decoded: Result<T>,
+        ) {
+            match decoded {
+                Ok(_) => match codec::format(bytes) {
+                    Ok(Format::Legacy) => counts.legacy += 1,
+                    _ => counts.current += 1,
+                },
+                Err(e) => {
+                    match e {
+                        HeatherError::UnsupportedFormat(_) => counts.unsupported += 1,
+                        _ => counts.corrupt += 1,
+                    }
+                    if problems.len() < MAX_PROBLEMS {
+                        problems.push(format!("{what} {id}: {e}"));
+                    }
+                }
+            }
+        }
+
+        let rtxn = self.env.read_txn()?;
+        let prefix = collection_prefix(collection_id);
+        let mut report = CollectionReport {
+            collection: name.to_string(),
+            locations: RecordCounts::default(),
+            documents: RecordCounts::default(),
+            problems: Vec::new(),
+        };
+
+        for result in self.locations_db.prefix_iter(&rtxn, &prefix)? {
+            let (key, value) = result?;
+            let id = key_id(key);
+            let decoded = codec::decode_location(value, self.precision);
+            count(
+                &mut report.locations,
+                &mut report.problems,
+                "location",
+                id,
+                value,
+                decoded,
+            );
+        }
+        for result in self.documents_db.prefix_iter(&rtxn, &prefix)? {
+            let (key, value) = result?;
+            let id = key_id(key);
+            let decoded = codec::decode_document(value, self.precision);
+            count(
+                &mut report.documents,
+                &mut report.problems,
+                "document",
+                id,
+                value,
+                decoded,
+            );
+        }
+        Ok(report)
     }
 
     /// For reads that serve many records: a record that does not decode
