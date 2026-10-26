@@ -60,6 +60,17 @@ impl Hive {
         })
     }
 
+    /// Whether commits are synced to disk. See [`Store::set_sync`].
+    pub fn syncs(&self) -> Result<bool> {
+        self.store.syncs()
+    }
+
+    /// Turns per-commit syncing off or back on (syncing what was written
+    /// meanwhile). See [`Store::set_sync`].
+    pub fn set_sync(&self, sync: bool) -> Result<()> {
+        self.store.set_sync(sync)
+    }
+
     /// Create a new collection. Returns it if it already exists.
     pub fn create_collection(&self, name: &str) -> Result<Arc<Collection>> {
         // Check in-memory cache first

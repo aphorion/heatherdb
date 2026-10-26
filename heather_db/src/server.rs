@@ -305,6 +305,15 @@ impl Server {
     /// Refuses to drop the default database to avoid the foot-gun where
     /// legacy routes silently start 404'ing.
     pub fn drop_database(&self, name: &str) -> Result<bool> {
+        self.drop_database_with(name, false)
+    }
+
+    /// Drops a database like [`Self::drop_database`]; with `purge` its
+    /// directory is then deleted from `_trash/` instead of kept there, for
+    /// data that will never be recovered (it can be rebuilt, or is
+    /// scratch). The move to `_trash/` still comes first, so the database is
+    /// unmounted atomically before anything is deleted.
+    pub fn drop_database_with(&self, name: &str, purge: bool) -> Result<bool> {
         if name == DEFAULT_DB {
             return Err(HeatherError::InvalidInput(
                 "cannot drop the default database (rename or restart with empty data dir)".into(),
@@ -346,6 +355,12 @@ impl Server {
         let mut last_err = None;
         for _ in 0..40 {
             match std::fs::rename(&dir, &trashed) {
+                Ok(()) if purge => {
+                    std::fs::remove_dir_all(&trashed).map_err(|e| {
+                        HeatherError::Storage(format!("purge {}: {e}", trashed.display()))
+                    })?;
+                    return Ok(true);
+                }
                 Ok(()) => return Ok(true),
                 Err(e) => {
                     last_err = Some(e);
@@ -471,6 +486,45 @@ mod tests {
         let dropped = server.drop_database("memoria").unwrap();
         assert!(dropped);
         assert!(server.database("memoria").is_none());
+    }
+
+    /// A plain drop keeps the database in `_trash/`; a purge leaves nothing.
+    #[test]
+    fn purge_deletes_instead_of_trashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(dir.path(), 64).unwrap();
+        let trash = |prefix: &str| -> usize {
+            std::fs::read_dir(dir.path().join("_trash"))
+                .map(|entries| {
+                    entries
+                        .filter(|e| {
+                            e.as_ref()
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(prefix)
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+
+        server
+            .create_database(DbConfig::new("kept", 8).unwrap())
+            .unwrap();
+        assert!(server.drop_database_with("kept", false).unwrap());
+        assert_eq!(trash("kept-"), 1);
+
+        server
+            .create_database(DbConfig::new("scratch", 8).unwrap())
+            .unwrap();
+        assert!(server.drop_database_with("scratch", true).unwrap());
+        assert_eq!(trash("scratch-"), 0);
+        assert!(!server.database_path("scratch").exists());
+        assert!(server.database("scratch").is_none());
+
+        // Dropping what is not there is still `false`, purge or not.
+        assert!(!server.drop_database_with("scratch", true).unwrap());
     }
 
     #[test]

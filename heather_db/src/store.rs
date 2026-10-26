@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, FlagSetMode, RoTxn, RwTxn};
 
 use crate::config::Precision;
 use crate::error::{HeatherError, Result};
@@ -70,7 +70,40 @@ fn widen(v: &[f32]) -> Vec<f64> {
     v.iter().map(|&x| f64::from(x)).collect()
 }
 
+/// A stored document: its id and its serialised (vector, metadata).
+pub type RawDocument = (u64, Vec<u8>);
+
 impl Store {
+    /// Whether every commit is synced to disk (the default).
+    pub fn syncs(&self) -> Result<bool> {
+        Ok(self.env.get_flags()? & EnvFlags::NO_SYNC.bits() == 0)
+    }
+
+    /// Turns per-commit syncing off (`false`) or back on (`true`).
+    ///
+    /// Without it (LMDB `NO_SYNC`) commits reach the OS but not the disk:
+    /// much faster where a sync is slow (macOS `F_FULLFSYNC`), but a system
+    /// crash (not a process crash) can lose recent commits or, on file
+    /// systems that reorder writes, corrupt the database. For data that can
+    /// be rebuilt, such as a memory replayed from a stream. Turning it back on
+    /// syncs everything written in between before returning. LMDB keeps the
+    /// flag on the open environment, not in the file, so a restarted server
+    /// syncs again.
+    pub fn set_sync(&self, sync: bool) -> Result<()> {
+        let mode = if sync {
+            FlagSetMode::Disable
+        } else {
+            FlagSetMode::Enable
+        };
+        // SAFETY: NO_SYNC only changes when commits are flushed, not their
+        // contents; the risk is the documented crash window above.
+        unsafe { self.env.set_flags(EnvFlags::NO_SYNC, mode)? };
+        if sync {
+            self.env.force_sync()?;
+        }
+        Ok(())
+    }
+
     /// Opens a store that keeps vectors in f64.
     pub fn open(path: &Path, map_size_mb: usize) -> Result<Self> {
         Self::open_with_precision(path, map_size_mb, Precision::F64)
@@ -370,6 +403,31 @@ impl Store {
         let key = document_key(collection_id, write_index);
         let val = self.documents_db.get(txn, &key)?;
         Ok(val.map(|v| v.to_vec()))
+    }
+
+    /// One page of a collection's documents in id order, and how many there
+    /// are in all. Only the page's values are copied.
+    pub fn list_documents_page(
+        &self,
+        collection_id: u32,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<RawDocument>, usize)> {
+        let rtxn = self.env.read_txn()?;
+        let prefix = collection_prefix(collection_id);
+        let mut docs = Vec::with_capacity(limit.min(1024));
+        let mut total = 0;
+        for result in self.documents_db.prefix_iter(&rtxn, &prefix)? {
+            let (key, value) = result?;
+            if total >= offset && docs.len() < limit {
+                let idx_bytes: [u8; 8] = key[4..12].try_into().map_err(|_| {
+                    HeatherError::Storage("invalid document key length".to_string())
+                })?;
+                docs.push((u64::from_be_bytes(idx_bytes), value.to_vec()));
+            }
+            total += 1;
+        }
+        Ok((docs, total))
     }
 
     pub fn list_documents(&self, collection_id: u32) -> Result<Vec<(u64, Vec<u8>)>> {
@@ -874,5 +932,25 @@ mod precision_tests {
         );
         assert_eq!(back.address, rounded);
         assert_eq!(back.counter, rounded);
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    /// Syncing is on by default and can be turned off and back on. (LMDB
+    /// keeps the flag on the open environment, not in the file, so a new
+    /// process syncs again; heed reuses an environment still open in this
+    /// process, so that part cannot be shown here.)
+    #[test]
+    fn sync_can_be_turned_off_and_back_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path(), 16).unwrap();
+        assert!(store.syncs().unwrap());
+        store.set_sync(false).unwrap();
+        assert!(!store.syncs().unwrap());
+        store.set_sync(true).unwrap();
+        assert!(store.syncs().unwrap());
     }
 }
