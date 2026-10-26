@@ -15,8 +15,9 @@ splits, address migration. Legacy: `POST /collections/{name}/write`.
 
 | Field | Type | Notes |
 |---|---|---|
-| `vectors` | array of arrays | *required*, non-empty. Each must match the database's dimension |
-| `metadata` | array of JSON values | Optional. Length must equal `vectors` |
+| `vectors` | array of arrays | Each must match the database's dimension. *Required* unless `vectors_b64` is sent |
+| `vectors_b64` | array of strings | Instead of `vectors`: each vector's little-endian f64 bytes, base64-encoded (standard alphabet, padded). About half the bytes of JSON numbers and no float parsing. Send one of the two, not both |
+| `metadata` | array of JSON values | Optional. Length must equal the number of vectors |
 
 ```bash
 curl -u admin:pw -X POST \
@@ -34,8 +35,9 @@ transaction) and the response is just a count:
 ```
 
 With metadata each vector also becomes a retrievable
-[document](documents.md), written one at a time, and the response carries the
-assigned ids:
+[document](documents.md). The adaptive writes run in order, exactly as
+one-by-one writes would, but the whole request is persisted in one LMDB
+transaction; the response carries the assigned ids:
 
 ```json
 { "count": 2, "ids": [17, 18] }
@@ -43,7 +45,7 @@ assigned ids:
 
 | Status | Cause |
 |---|---|
-| `400 Bad Request` | empty `vectors`, a dimension mismatch, a `metadata`/`vectors` length mismatch, or metadata that will not serialise as JSON |
+| `400 Bad Request` | no vectors, both `vectors` and `vectors_b64`, a `vectors_b64` entry that is not base64 of whole f64 values, a dimension mismatch, a `metadata`/`vectors` length mismatch, or metadata that will not serialise as JSON |
 | `413 Payload Too Large` | body over `--max-body-size` (default 2 MiB) |
 | `500 Internal Server Error` | the collection could not be opened, or a storage failure |
 
@@ -58,6 +60,7 @@ operands. Legacy: `POST /collections/{name}/bulk_load`.
 |---|---|---|
 | `addresses` | array of arrays | *required*, non-empty. Each of length `d` |
 | `counters` | array of arrays | *required*. Same length as `addresses`, each of length `d` |
+| `addresses_b64`, `counters_b64` | arrays of strings | Instead of `addresses` / `counters`: base64 little-endian f64 rows, as `vectors_b64` on `write` |
 | `write_counts` | array of floats | Optional. Same length as `addresses`. Defaults to `1.0` each |
 
 ```bash

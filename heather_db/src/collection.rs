@@ -249,6 +249,9 @@ pub(crate) struct EAMInner {
     pub(crate) doc_next_id: u64,
     /// Cached landmark indices for graph search entry points
     pub(crate) landmarks: Vec<usize>,
+    /// How many locations there were when `landmarks` was last selected
+    /// (see [`EAMInner::refresh_landmarks`]).
+    pub(crate) landmarks_at: usize,
     /// Flat LocationId → index lookup array for O(1) graph traversal
     pub(crate) id_lookup: Vec<u32>,
     /// Contiguous [L × D] address matrix for cache-friendly brute-force activation.
@@ -265,7 +268,30 @@ impl EAMInner {
     pub(crate) fn rebuild_graph_cache(&mut self) {
         self.id_lookup = read::build_id_lookup(&self.locations);
         self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
+        self.landmarks_at = self.locations.len();
         self.rebuild_address_matrix();
+    }
+
+    /// Re-selects landmarks as the collection grows.
+    ///
+    /// Writes take the graph path only with landmarks to enter it from
+    /// ([`read::activate_auto`]). Landmarks used to be chosen only when a
+    /// collection was opened (and by compress / merge / snapshot loads), so a
+    /// collection created empty and grown by writes kept none for the life
+    /// of the process, and every write scanned every location: O(N·d) per
+    /// vector, slower with each write. They are now re-selected while the
+    /// collection has fewer than `num_landmarks` locations' worth, and again
+    /// after each 25% of growth (at least 256 locations), which keeps the
+    /// O(N log N) selection amortised.
+    pub(crate) fn refresh_landmarks(&mut self) {
+        let len = self.locations.len();
+        let wanted = self.config.num_landmarks.min(len);
+        let grown = len >= self.landmarks_at + (self.landmarks_at / 4).max(256);
+
+        if self.config.num_landmarks > 0 && (self.landmarks.len() < wanted || grown) {
+            self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
+            self.landmarks_at = len;
+        }
     }
 
     /// Rebuild address matrix from locations.
@@ -286,12 +312,14 @@ impl EAMInner {
         }
     }
 
-    /// Append addresses for newly added locations.
+    /// Append addresses for newly added locations (and refresh landmarks
+    /// as the collection grows).
     pub(crate) fn append_addresses(&mut self, start_idx: usize) {
         for i in start_idx..self.locations.len() {
             self.address_matrix
                 .extend_from_slice(&self.locations[i].address);
         }
+        self.refresh_landmarks();
     }
 
     /// Incremental update after appending new locations.
@@ -313,6 +341,12 @@ pub struct Collection {
     inner: RwLock<EAMInner>,
     store: Arc<Store>,
 }
+
+/// How many times more locations a document query draws candidates from
+/// than a read activates. At 1, about 16% of documents could not be found by
+/// their own vector once writes used the neighbour graph; at 2 none could not
+/// in tests; 4 leaves margin.
+const QUERY_CANDIDATE_FACTOR: usize = 4;
 
 impl Collection {
     /// Create a new collection, initializing with L_0 random locations.
@@ -361,6 +395,7 @@ impl Collection {
             address_matrix.extend_from_slice(&loc.address);
         }
 
+        let landmarks_at = locations.len();
         Ok(Collection {
             collection_id,
             name,
@@ -370,6 +405,7 @@ impl Collection {
                 next_id,
                 eta,
                 doc_next_id: 0,
+                landmarks_at,
                 landmarks,
                 id_lookup,
                 address_matrix,
@@ -424,6 +460,7 @@ impl Collection {
             address_matrix.extend_from_slice(&loc.address);
         }
 
+        let landmarks_at = locations.len();
         Ok(Collection {
             collection_id,
             name,
@@ -433,6 +470,7 @@ impl Collection {
                 next_id,
                 eta,
                 doc_next_id,
+                landmarks_at,
                 landmarks,
                 id_lookup,
                 address_matrix,
@@ -1831,7 +1869,10 @@ impl Collection {
         }
 
         // Step 1: Activate query against hard locations (graph-accelerated when ready)
-        let k = inner.config.k.min(inner.locations.len());
+        // Candidates come from a wider set of locations than a read uses: a
+        // document is posted under the locations its write activated, which
+        // (graph-searched, and since migrated) need not be a query's nearest k.
+        let k = (inner.config.k * QUERY_CANDIDATE_FACTOR).min(inner.locations.len());
         let (indices, _sims) = read::activate_auto_full(
             query,
             &inner.locations,
@@ -1974,7 +2015,10 @@ impl Collection {
         // Recall is identical to `query_documents`: activate `query` against
         // the hard locations and take the union of their posting lists. The
         // pairs play no part in choosing candidates — see the doc comment.
-        let k = inner.config.k.min(inner.locations.len());
+        // Candidates come from a wider set of locations than a read uses: a
+        // document is posted under the locations its write activated, which
+        // (graph-searched, and since migrated) need not be a query's nearest k.
+        let k = (inner.config.k * QUERY_CANDIDATE_FACTOR).min(inner.locations.len());
         let (indices, _sims) = read::activate_auto_full(
             query,
             &inner.locations,
@@ -3762,6 +3806,104 @@ mod tests {
             (1, 1, 1)
         );
         assert!(report.problems.iter().any(|p| p.starts_with("document 1:")));
+    }
+
+    /// A collection created empty and grown only by writes gets landmarks,
+    /// and they are re-selected as it keeps growing, so writes can take the
+    /// graph path instead of scanning every location (regression: landmarks
+    /// were chosen only on open, leaving a growing collection with none).
+    #[test]
+    fn landmarks_follow_a_collection_grown_by_writes() {
+        use rand::{Rng, SeedableRng};
+
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 32;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "docs".into(), store, &config).unwrap();
+        assert!(
+            col.inner.read().unwrap().landmarks.is_empty(),
+            "starts with none"
+        );
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let vector = |rng: &mut rand::rngs::StdRng| -> Vec<f64> {
+            vec_ops::normalize(
+                &(0..d)
+                    .map(|_| rng.gen_range(-1.0..1.0))
+                    .collect::<Vec<f64>>(),
+            )
+        };
+
+        for _ in 0..400 {
+            col.write_with_metadata(&vector(&mut rng), b"{}").unwrap();
+        }
+
+        let (landmarks, at, len) = {
+            let inner = col.inner.read().unwrap();
+            (
+                inner.landmarks.clone(),
+                inner.landmarks_at,
+                inner.locations.len(),
+            )
+        };
+        assert_eq!(
+            landmarks.len(),
+            config.num_landmarks.min(len),
+            "a grown collection has a full set"
+        );
+        assert!(landmarks.iter().all(|&i| i < len));
+
+        // Grow well past 25%: they are selected again.
+        let items: Vec<(Vec<f64>, Vec<u8>)> = (0..2_000)
+            .map(|_| (vector(&mut rng), b"{}".to_vec()))
+            .collect();
+        col.write_batch_with_metadata(&items).unwrap();
+        let inner = col.inner.read().unwrap();
+        assert!(inner.locations.len() > len);
+        assert!(inner.landmarks_at > at, "re-selected after growth");
+        assert!(inner.landmarks.iter().all(|&i| i < inner.locations.len()));
+    }
+
+    /// A stored document is always found by its own vector, also once the
+    /// collection has grown a neighbour graph (regression: reads used the
+    /// approximate graph search and missed ~16% of exact matches).
+    #[test]
+    fn documents_are_found_by_their_own_vector() {
+        use rand::{Rng, SeedableRng};
+
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 64;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "lookup".into(), store, &config).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let keys: Vec<Vec<f64>> = (0..3_000)
+            .map(|_| {
+                vec_ops::normalize(
+                    &(0..d)
+                        .map(|_| rng.gen_range(-1.0..1.0))
+                        .collect::<Vec<f64>>(),
+                )
+            })
+            .collect();
+        let items: Vec<(Vec<f64>, Vec<u8>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), format!(r#"{{"i":{i}}}"#).into_bytes()))
+            .collect();
+        for chunk in items.chunks(500) {
+            col.write_batch_with_metadata(chunk).unwrap();
+        }
+
+        let misses = (0..keys.len())
+            .step_by(7)
+            .filter(|&i| {
+                let hits = col.query_documents(&keys[i], 5).unwrap();
+                !hits.iter().any(|(id, _, _)| *id == i as u64)
+            })
+            .count();
+        assert_eq!(misses, 0, "{misses} keys did not find their own document");
     }
 
     /// Deletion removes a document from retrieval and from every posting

@@ -370,6 +370,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
     // Scoped /db/{db}/collections/... and /db/{db}/algebra/...
     let db_scoped_router = Router::new()
         .route("/db/{db}/collections", post(routes_db::create_collection))
+        .route(
+            "/db/{db}/durability",
+            get(routes_db::get_durability).put(routes_db::set_durability),
+        )
         .route("/db/{db}/collections", get(routes_db::list_collections))
         .route(
             "/db/{db}/collections/{name}",
