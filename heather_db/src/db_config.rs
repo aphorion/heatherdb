@@ -16,6 +16,10 @@ use crate::error::{HeatherError, Result};
 /// commits more than what's actually written; the map size is a ceiling.
 pub const DEFAULT_MAP_SIZE_MB: usize = 4096;
 
+/// The database format this HeatherDB writes, and the newest it mounts.
+/// `1`: records in the self-describing, checksummed envelope (`codec`).
+pub const FORMAT_VERSION: u32 = 1;
+
 /// What a database needs to know about itself across restarts.
 ///
 /// Persisted as TOML for human-readability — `cat db.toml` should explain
@@ -39,6 +43,13 @@ pub struct DbConfig {
     /// dreams only when an operator opts it in via `db.toml`.
     #[serde(default)]
     pub dream: DreamConfig,
+
+    /// The on-disk format the database's records may use (see
+    /// [`crate::codec`]): `0` for databases from before the record envelope.
+    /// A HeatherDB refuses to mount a database whose format is newer than
+    /// [`FORMAT_VERSION`] instead of misreading it.
+    #[serde(default)]
+    pub format_version: u32,
 
     /// Access logging. Default: **enabled** — unlike `dream`, this is a
     /// security control, so it is on unless an operator explicitly turns it
@@ -153,6 +164,7 @@ impl DbConfig {
             eam: EAMConfig::new(dimension)?,
             map_size_mb: DEFAULT_MAP_SIZE_MB,
             dream: DreamConfig::default(),
+            format_version: FORMAT_VERSION,
             audit: AuditConfig::default(),
         })
     }

@@ -9,6 +9,7 @@ mod routes;
 mod routes_db;
 mod tokens;
 mod users;
+mod verify;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -137,6 +138,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: backup::SnapshotCmd,
     },
+    /// Check every stored record for damage (offline: stop the server first).
+    Verify {
+        /// Only this database.
+        #[arg(long)]
+        db: Option<String>,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 async fn shutdown_signal() {
@@ -182,6 +192,7 @@ fn main() -> std::process::ExitCode {
             Cmd::Backup { cmd } => backup::run_backup(&data_dir, cmd),
             Cmd::Restore { cmd } => backup::run_restore(&data_dir, cmd),
             Cmd::Snapshot { cmd } => backup::run_snapshot(&data_dir, cmd),
+            Cmd::Verify { db, json } => verify::run(&data_dir, db.as_deref(), *json),
         };
     }
 
@@ -227,6 +238,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+
+    for (name, reason) in server.refused_databases() {
+        tracing::warn!(database = %name, "Not mounted: {reason}");
+    }
 
     let databases = server.databases().unwrap_or_default();
     tracing::info!(

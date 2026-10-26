@@ -324,6 +324,12 @@ pub struct DatabaseInfo {
     /// `false`: a plain store (see `EamConfigOverride::competitive`).
     pub competitive: bool,
     pub precision: heather_db::Precision,
+    /// The on-disk format version (`heather_db::FORMAT_VERSION` for new
+    /// databases).
+    pub format_version: u32,
+    /// Records reads skipped since the database was opened because they did
+    /// not decode; non-zero means something is corrupt (`heather verify`).
+    pub skipped_records: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -440,6 +446,9 @@ pub struct DocumentsResponse {
     pub documents: Vec<DocumentItem>,
     /// Documents in the collection (all pages).
     pub total: usize,
+    /// Documents of this page left out because they did not decode
+    /// (corrupt, or written by a newer HeatherDB). The rest are served.
+    pub skipped: usize,
 }
 
 /// `GET .../documents?offset=&limit=`: one page, in id order.

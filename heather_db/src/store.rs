@@ -18,6 +18,14 @@ fn location_key(collection_id: u32, location_id: u64) -> [u8; 12] {
 }
 
 /// 4-byte prefix for scanning all locations in a collection.
+/// The record id in a `[collection_id 4B | id 8B BE]` key (0 if malformed).
+fn key_id(key: &[u8]) -> u64 {
+    key.get(4..12)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_be_bytes)
+        .unwrap_or(0)
+}
+
 fn collection_prefix(collection_id: u32) -> [u8; 4] {
     collection_id.to_be_bytes()
 }
@@ -39,22 +47,10 @@ fn metadata_key(collection_id: u32, key: &str) -> Vec<u8> {
     result
 }
 
-/// Marks a document stored by reference to its location. An inline document
-/// starts with its vector's length as a little-endian u64, so these bytes
-/// would claim a vector of over a billion components: never a real one.
-const DOC_REF_MAGIC: [u8; 4] = [0xFF, 0xFE, b'D', b'R'];
-
-/// Where a stored document's vector is.
-#[derive(Debug, Clone, PartialEq)]
-pub enum DocVector {
-    /// Stored with the document.
-    Inline(Vec<f64>),
-    /// The address of this location of the document's collection.
-    Location(u64),
-}
-
 pub struct Store {
     env: Env,
+    /// Records tolerant reads skipped because they did not decode.
+    skipped: std::sync::atomic::AtomicU64,
     /// How vectors are encoded on disk (see [`crate::config::Precision`]).
     precision: Precision,
     registry_db: Database<Bytes, Bytes>,
@@ -63,25 +59,6 @@ pub struct Store {
     documents_db: Database<Bytes, Bytes>,
     doc_index_db: Database<Bytes, Bytes>,
     audit_db: Database<Bytes, Bytes>,
-}
-
-/// A [`HardLocation`] with f32 vectors, as an f32 store keeps it.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CompactLocation {
-    id: LocationId,
-    address: Vec<f32>,
-    counter: Vec<f32>,
-    write_count: f64,
-    neighbors: Vec<u64>,
-    surprise_mass: f64,
-}
-
-fn narrow(v: &[f64]) -> Vec<f32> {
-    v.iter().map(|&x| x as f32).collect()
-}
-
-fn widen(v: &[f32]) -> Vec<f64> {
-    v.iter().map(|&x| f64::from(x)).collect()
 }
 
 /// A stored document: its id and its serialised (vector, metadata).
@@ -151,6 +128,7 @@ impl Store {
 
         Ok(Store {
             env,
+            skipped: std::sync::atomic::AtomicU64::new(0),
             precision,
             registry_db,
             locations_db,
@@ -290,6 +268,20 @@ impl Store {
         Ok(())
     }
 
+    /// Stores raw bytes as a location (tests: simulating damage).
+    #[cfg(test)]
+    pub(crate) fn put_raw_location(
+        &self,
+        txn: &mut RwTxn,
+        collection_id: u32,
+        location_id: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.locations_db
+            .put(txn, &location_key(collection_id, location_id), bytes)?;
+        Ok(())
+    }
+
     pub fn delete_location(
         &self,
         txn: &mut RwTxn,
@@ -308,113 +300,134 @@ impl Store {
         let iter = self.locations_db.prefix_iter(&rtxn, &prefix)?;
         for result in iter {
             let (_key, value) = result?;
-            locations.push(self.decode_location(value)?);
+            // A location that does not decode is skipped (and counted), so
+            // one bad record cannot keep the collection from opening.
+            if let Some(loc) = self.tolerate(self.decode_location(value))? {
+                locations.push(loc);
+            }
         }
         Ok(locations)
     }
 
+    /// Decodes every stored location and document of a collection and
+    /// counts what is current, legacy, corrupt or unsupported (see
+    /// [`crate::verify`]). Reads only.
+    pub fn verify_collection(
+        &self,
+        name: &str,
+        collection_id: u32,
+    ) -> Result<crate::verify::CollectionReport> {
+        use crate::codec::{self, Format};
+        use crate::verify::{CollectionReport, MAX_PROBLEMS, RecordCounts};
+
+        fn count<T>(
+            counts: &mut RecordCounts,
+            problems: &mut Vec<String>,
+            what: &str,
+            id: u64,
+            bytes: &[u8],
+            decoded: Result<T>,
+        ) {
+            match decoded {
+                Ok(_) => match codec::format(bytes) {
+                    Ok(Format::Legacy) => counts.legacy += 1,
+                    _ => counts.current += 1,
+                },
+                Err(e) => {
+                    match e {
+                        HeatherError::UnsupportedFormat(_) => counts.unsupported += 1,
+                        _ => counts.corrupt += 1,
+                    }
+                    if problems.len() < MAX_PROBLEMS {
+                        problems.push(format!("{what} {id}: {e}"));
+                    }
+                }
+            }
+        }
+
+        let rtxn = self.env.read_txn()?;
+        let prefix = collection_prefix(collection_id);
+        let mut report = CollectionReport {
+            collection: name.to_string(),
+            locations: RecordCounts::default(),
+            documents: RecordCounts::default(),
+            problems: Vec::new(),
+        };
+
+        for result in self.locations_db.prefix_iter(&rtxn, &prefix)? {
+            let (key, value) = result?;
+            let id = key_id(key);
+            let decoded = codec::decode_location(value, self.precision);
+            count(
+                &mut report.locations,
+                &mut report.problems,
+                "location",
+                id,
+                value,
+                decoded,
+            );
+        }
+        for result in self.documents_db.prefix_iter(&rtxn, &prefix)? {
+            let (key, value) = result?;
+            let id = key_id(key);
+            let decoded = codec::decode_document(value, self.precision);
+            count(
+                &mut report.documents,
+                &mut report.problems,
+                "document",
+                id,
+                value,
+                decoded,
+            );
+        }
+        Ok(report)
+    }
+
+    /// For reads that serve many records: a record that does not decode
+    /// ([`HeatherError::Corrupt`] or [`HeatherError::UnsupportedFormat`]) is
+    /// counted and skipped (`Ok(None)`) instead of failing the read. Storage
+    /// errors still fail it.
+    pub fn tolerate<T>(&self, decoded: Result<T>) -> Result<Option<T>> {
+        match decoded {
+            Ok(v) => Ok(Some(v)),
+            Err(HeatherError::Corrupt(_) | HeatherError::UnsupportedFormat(_)) => {
+                self.skipped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Records skipped by tolerant reads since the store was opened.
+    pub fn skipped_records(&self) -> u64 {
+        self.skipped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     // --- Vector encoding (by precision) ---
-    //
-    // A location whose counter equals its address (every write to a plain,
-    // non-competitive collection) is stored with an empty counter and read
-    // back with the address in its place: half the bytes, and at d = 1024
-    // f32 small enough to stay inside a page instead of taking an overflow
-    // page of its own. A counter is never legitimately empty (it has length
-    // d >= 1), so older records, which always carry it, decode unchanged.
 
     fn encode_location(&self, loc: &HardLocation) -> Result<Vec<u8>> {
-        let same = loc.counter == loc.address;
-        Ok(match self.precision {
-            Precision::F64 if same => bincode::serialize(&HardLocation {
-                counter: Vec::new(),
-                ..loc.clone()
-            })?,
-            Precision::F64 => bincode::serialize(loc)?,
-            Precision::F32 => bincode::serialize(&CompactLocation {
-                id: loc.id,
-                address: narrow(&loc.address),
-                counter: if same {
-                    Vec::new()
-                } else {
-                    narrow(&loc.counter)
-                },
-                write_count: loc.write_count,
-                neighbors: loc.neighbors.clone(),
-                surprise_mass: loc.surprise_mass,
-            })?,
-        })
+        Ok(crate::codec::encode_location(loc, self.precision))
     }
 
     fn decode_location(&self, bytes: &[u8]) -> Result<HardLocation> {
-        let mut loc: HardLocation = match self.precision {
-            Precision::F64 => bincode::deserialize(bytes)?,
-            Precision::F32 => {
-                let c: CompactLocation = bincode::deserialize(bytes)?;
-                HardLocation {
-                    id: c.id,
-                    address: widen(&c.address),
-                    counter: widen(&c.counter),
-                    write_count: c.write_count,
-                    neighbors: c.neighbors,
-                    surprise_mass: c.surprise_mass,
-                }
-            }
-        };
-        if loc.counter.is_empty() {
-            loc.counter = loc.address.clone();
-        }
-        Ok(loc)
+        crate::codec::decode_location(bytes, self.precision)
     }
 
     /// A document's stored bytes: its vector (at the store's precision) and
-    /// its metadata.
+    /// its metadata, in the record envelope (see [`crate::codec`]).
     pub fn encode_document(&self, vector: &[f64], metadata: &[u8]) -> Result<Vec<u8>> {
-        Ok(match self.precision {
-            Precision::F64 => bincode::serialize(&(vector, metadata))?,
-            Precision::F32 => bincode::serialize(&(narrow(vector), metadata))?,
-        })
+        Ok(crate::codec::encode_document(
+            vector,
+            metadata,
+            self.precision,
+        ))
     }
 
-    /// A document whose vector is its location's address (a plain
-    /// collection's write): stored as a reference to the location and the
-    /// metadata, without a third copy of the vector.
-    pub fn encode_document_ref(&self, location_id: u64, metadata: &[u8]) -> Vec<u8> {
-        let mut bytes = Vec::with_capacity(DOC_REF_MAGIC.len() + 8 + metadata.len());
-        bytes.extend_from_slice(&DOC_REF_MAGIC);
-        bytes.extend_from_slice(&location_id.to_le_bytes());
-        bytes.extend_from_slice(metadata);
-        bytes
-    }
-
-    /// The vector and metadata of a stored document. A document stored by
-    /// reference ([`Self::encode_document_ref`]) has no vector of its own:
-    /// resolve it with [`Self::decode_document_parts`] instead.
+    /// The vector and metadata of a stored document. A value that does not
+    /// decode is [`HeatherError::Corrupt`].
     pub fn decode_document(&self, bytes: &[u8]) -> Result<(Vec<f64>, Vec<u8>)> {
-        match self.decode_document_parts(bytes)? {
-            (DocVector::Inline(vector), metadata) => Ok((vector, metadata)),
-            (DocVector::Location(id), _) => Err(HeatherError::Serialization(format!(
-                "document stores its vector by reference to location {id}; resolve it through its collection"
-            ))),
-        }
-    }
-
-    /// A stored document's vector, inline or by reference, and its metadata.
-    pub fn decode_document_parts(&self, bytes: &[u8]) -> Result<(DocVector, Vec<u8>)> {
-        if bytes.len() >= DOC_REF_MAGIC.len() + 8 && bytes[..DOC_REF_MAGIC.len()] == DOC_REF_MAGIC {
-            let at = DOC_REF_MAGIC.len();
-            let id = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
-            return Ok((DocVector::Location(id), bytes[at + 8..].to_vec()));
-        }
-        Ok(match self.precision {
-            Precision::F64 => {
-                let (vector, metadata): (Vec<f64>, Vec<u8>) = bincode::deserialize(bytes)?;
-                (DocVector::Inline(vector), metadata)
-            }
-            Precision::F32 => {
-                let (vector, metadata): (Vec<f32>, Vec<u8>) = bincode::deserialize(bytes)?;
-                (DocVector::Inline(widen(&vector)), metadata)
-            }
-        })
+        crate::codec::decode_document(bytes, self.precision)
     }
 
     // --- Metadata operations (collection-scoped) ---
@@ -771,52 +784,6 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn a_location_whose_counter_is_its_address_is_stored_once_and_reads_back() {
-        for precision in [Precision::F32, Precision::F64] {
-            let dir = tempfile::TempDir::new().unwrap();
-            let store = Store::open_with_precision(dir.path(), 64, precision).unwrap();
-            let address: Vec<f64> = (0..1024).map(|i| (i as f32 * 0.001) as f64).collect();
-            let mut plain = HardLocation::new(LocationId(7), address.clone());
-            plain.counter = address.clone();
-            let mut learned = plain.clone();
-            learned.counter[3] = 2.0; // f32-exact, so the round trip compares equal
-            let plain_bytes = store.encode_location(&plain).unwrap();
-            let learned_bytes = store.encode_location(&learned).unwrap();
-            assert!(
-                plain_bytes.len() * 2 < learned_bytes.len() + 64,
-                "{precision:?}: {} vs {}",
-                plain_bytes.len(),
-                learned_bytes.len()
-            );
-            assert_eq!(
-                store.decode_location(&plain_bytes).unwrap().counter,
-                address
-            );
-            assert_eq!(
-                store.decode_location(&learned_bytes).unwrap().counter,
-                learned.counter
-            );
-        }
-    }
-
-    #[test]
-    fn document_references_are_never_mistaken_for_inline_documents() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = Store::open_with_precision(dir.path(), 64, Precision::F32).unwrap();
-        let r = store.encode_document_ref(99, b"{\"a\":1}");
-        assert_eq!(
-            store.decode_document_parts(&r).unwrap(),
-            (DocVector::Location(99), b"{\"a\":1}".to_vec())
-        );
-        assert!(store.decode_document(&r).is_err());
-        let inline = store.encode_document(&[0.5, -0.25], b"{}").unwrap();
-        assert_eq!(
-            store.decode_document_parts(&inline).unwrap(),
-            (DocVector::Inline(vec![0.5, -0.25]), b"{}".to_vec())
-        );
-    }
-
-    #[test]
     fn test_store_roundtrip() {
         let dir = TempDir::new().unwrap();
         let store = Store::open(dir.path(), 256).unwrap();
@@ -997,26 +964,6 @@ mod tests {
 }
 
 #[cfg(test)]
-mod sync_tests {
-    use super::*;
-
-    /// Syncing is on by default and can be turned off and back on. (LMDB
-    /// keeps the flag on the open environment, not in the file, so a new
-    /// process syncs again; heed reuses an environment still open in this
-    /// process, so that part cannot be shown here.)
-    #[test]
-    fn sync_can_be_turned_off_and_back_on() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let store = Store::open(dir.path(), 16).unwrap();
-        assert!(store.syncs().unwrap());
-        store.set_sync(false).unwrap();
-        assert!(!store.syncs().unwrap());
-        store.set_sync(true).unwrap();
-        assert!(store.syncs().unwrap());
-    }
-}
-
-#[cfg(test)]
 mod precision_tests {
     use super::*;
 
@@ -1063,5 +1010,25 @@ mod precision_tests {
         );
         assert_eq!(back.address, rounded);
         assert_eq!(back.counter, rounded);
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    /// Syncing is on by default and can be turned off and back on. (LMDB
+    /// keeps the flag on the open environment, not in the file, so a new
+    /// process syncs again; heed reuses an environment still open in this
+    /// process, so that part cannot be shown here.)
+    #[test]
+    fn sync_can_be_turned_off_and_back_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path(), 16).unwrap();
+        assert!(store.syncs().unwrap());
+        store.set_sync(false).unwrap();
+        assert!(!store.syncs().unwrap());
+        store.set_sync(true).unwrap();
+        assert!(store.syncs().unwrap());
     }
 }

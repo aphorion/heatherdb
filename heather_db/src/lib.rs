@@ -34,6 +34,7 @@
 //! reads acquire a shared lock, writes acquire an exclusive lock.
 
 pub mod audit;
+pub mod codec;
 pub mod collection;
 pub mod config;
 pub mod db_config;
@@ -45,6 +46,7 @@ pub mod read;
 pub mod server;
 pub mod store;
 pub mod vec_ops;
+pub mod verify;
 pub mod write;
 
 pub use audit::{AuditConfig, AuditLog, AuditQuery, AuditRecord, AuditVisibility, query_hash};
@@ -53,7 +55,9 @@ pub use collection::{
     MultiRoleResults, ReadStrategy, RoleCleanup,
 };
 pub use config::{EAMConfig, Precision};
-pub use db_config::{DEFAULT_MAP_SIZE_MB, DbConfig, DreamConfig, DreamMode, validate_db_name};
+pub use db_config::{
+    DEFAULT_MAP_SIZE_MB, DbConfig, DreamConfig, DreamMode, FORMAT_VERSION, validate_db_name,
+};
 pub use error::HeatherError;
 pub use hive::Hive;
 pub use location::{HardLocation, LocationId};

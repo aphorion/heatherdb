@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::config::EAMConfig;
-use crate::db_config::{DEFAULT_MAP_SIZE_MB, DbConfig, validate_db_name};
+use crate::db_config::{DEFAULT_MAP_SIZE_MB, DbConfig, FORMAT_VERSION, validate_db_name};
 use crate::error::{HeatherError, Result};
 use crate::hive::Hive;
 
@@ -90,6 +90,9 @@ pub struct Server {
     /// `name → Arc<Hive>`. Read-heavy: handlers acquire a read lock,
     /// look up the Arc, and drop the lock before doing any work.
     inner: RwLock<HashMap<String, Arc<Hive>>>,
+    /// Databases found on disk but not mounted, with why (a format newer
+    /// than this HeatherDB reads).
+    refused: RwLock<HashMap<String, String>>,
     /// Held exclusively for the Server's lifetime; see [`try_acquire_engine_lock`].
     _engine_lock: std::fs::File,
 }
@@ -166,6 +169,7 @@ impl Server {
             root: root.to_path_buf(),
             default_dimension,
             inner: RwLock::new(HashMap::new()),
+            refused: RwLock::new(HashMap::new()),
             _engine_lock: engine_lock,
         };
 
@@ -193,7 +197,31 @@ impl Server {
             if !cfg_path.exists() {
                 continue;
             }
-            let cfg = DbConfig::load(&cfg_path)?;
+            let mut cfg = DbConfig::load(&cfg_path)?;
+
+            // A newer format is refused, not misread; the other databases
+            // still mount.
+            if cfg.format_version > FORMAT_VERSION {
+                let reason = format!(
+                    "database {name} uses format {} but this HeatherDB reads up to {FORMAT_VERSION}; \
+                     upgrade HeatherDB to open it",
+                    cfg.format_version
+                );
+                server
+                    .refused
+                    .write()
+                    .map_err(|_| HeatherError::LockPoisoned)?
+                    .insert(name, reason);
+                continue;
+            }
+
+            // Older databases are read as they are; what is written from now
+            // on uses the current record format, so say so.
+            if cfg.format_version < FORMAT_VERSION {
+                cfg.format_version = FORMAT_VERSION;
+                cfg.save(&cfg_path)?;
+            }
+
             let hive = open_hive_for(&server.root, &cfg)?;
             server
                 .inner
@@ -374,6 +402,20 @@ impl Server {
             trashed.display(),
             last_err.expect("loop runs at least once")
         )))
+    }
+
+    /// Why a database on disk was not mounted, if it was refused (its
+    /// format is newer than this HeatherDB reads).
+    pub fn refused(&self, name: &str) -> Option<String> {
+        self.refused.read().ok()?.get(name).cloned()
+    }
+
+    /// Every refused database and why.
+    pub fn refused_databases(&self) -> Vec<(String, String)> {
+        self.refused
+            .read()
+            .map(|r| r.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
     }
 
     /// Default dimension that was used to seed the default DB on this run.
@@ -657,5 +699,49 @@ mod tests {
         let cols_b = b.list_collections().unwrap();
         assert!(cols_a.contains(&"shared".to_string()));
         assert!(!cols_b.contains(&"shared".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    /// A database in a newer format than this HeatherDB is refused (and
+    /// says why) while the others mount; an older one is mounted and marked
+    /// current.
+    #[test]
+    fn newer_formats_are_refused_older_ones_upgraded() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let server = Server::open(dir.path(), 8).unwrap();
+            for name in ["future", "past", "now"] {
+                server
+                    .create_database(DbConfig::new(name, 8).unwrap())
+                    .unwrap();
+            }
+        }
+        let set = |name: &str, version: u32| {
+            let path = dir.path().join("db").join(name).join("db.toml");
+            let mut cfg = DbConfig::load(&path).unwrap();
+            cfg.format_version = version;
+            cfg.save(&path).unwrap();
+        };
+        set("future", FORMAT_VERSION + 1);
+        set("past", 0);
+
+        let server = Server::open(dir.path(), 8).unwrap();
+        assert!(server.database("future").is_none());
+        assert!(
+            server
+                .refused("future")
+                .unwrap()
+                .contains("upgrade HeatherDB")
+        );
+        assert!(server.database("now").is_some());
+        assert!(server.database("past").is_some());
+        assert_eq!(
+            server.database_config("past").unwrap().format_version,
+            FORMAT_VERSION
+        );
     }
 }
