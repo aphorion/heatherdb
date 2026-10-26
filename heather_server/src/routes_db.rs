@@ -476,12 +476,13 @@ pub async fn batch_analyze(
 pub async fn get_documents(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
+    query: axum::extract::Query<DocumentsQuery>,
 ) -> Response {
     let hive = match resolve_db(&server, &db_name) {
         Ok(h) => h,
         Err(r) => return r,
     };
-    routes::get_documents(State(hive), Path(col)).await
+    routes::get_documents(State(hive), Path(col), query).await
 }
 
 pub async fn get_document(
