@@ -185,19 +185,25 @@ pub fn activate_subset(
     (indices, similarities)
 }
 
-/// Auto-select best activation method: graph → SoA brute-force → scattered brute-force.
+/// Activation for reads: the exact k nearest locations, by a scan of the
+/// contiguous address matrix (or of the locations when it is empty).
+///
+/// Reads never use the neighbour graph. Graph search is approximate: on a
+/// collection of 9,742 random 256-dimension keys it missed the exact match
+/// for 16% of lookups, so a stored record could not be found by its own
+/// vector. Writes still use it (`activate_auto`), where an approximate
+/// neighbour only changes which location learns. The scan is one pass over
+/// the matrix: about a millisecond at that size.
 pub fn activate_auto_full(
     query: &[f64],
     locations: &[HardLocation],
     k: usize,
-    landmarks: &[usize],
-    id_lookup: &[u32],
+    _landmarks: &[usize],
+    _id_lookup: &[u32],
     address_matrix: &[f64],
     d: usize,
 ) -> (Vec<usize>, Vec<f64>) {
-    if is_graph_ready(locations, k) && !landmarks.is_empty() {
-        graph_activate(query, locations, k, landmarks, id_lookup)
-    } else if !address_matrix.is_empty() {
+    if !address_matrix.is_empty() {
         activate_soa(query, address_matrix, d, k)
     } else {
         activate(query, locations, k)

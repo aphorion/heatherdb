@@ -111,10 +111,17 @@ curl -u admin:pw -X DELETE http://localhost:6380/db/movies
 ```
 
 ```json
-{ "dropped": true }
+{ "dropped": true, "purged": false }
 ```
 
 `{"dropped": false}` when the database was not mounted.
+
+With `?purge=true` the database is deleted for good instead of kept in
+`_trash/` (it is still moved there first, so it is unmounted atomically):
+`{"dropped": true, "purged": true}`. Use it for data you will never
+recover, such as scratch databases or ones rebuilt from a log; trash is
+never emptied automatically, so repeated drops of large databases fill the
+disk. Without it, `purged` is `false`.
 
 | Status | Cause |
 |---|---|
@@ -122,3 +129,60 @@ curl -u admin:pw -X DELETE http://localhost:6380/db/movies
 | `403 Forbidden` | the caller is scoped to a different database, or the target is `default`, which cannot be dropped (the legacy routes target it) |
 
 See also [Backup and restore](../how-to/backup-and-restore.md).
+
+### GET /db/{db}/durability
+
+Whether the database syncs every commit to disk.
+
+Auth: Basic or Bearer, root or `Database(db)`.
+
+Request body: no body.
+
+```bash
+curl -u admin:pw http://localhost:6380/db/movies/durability
+```
+
+```json
+{ "database": "movies", "sync": true }
+```
+
+| Status | Cause |
+|---|---|
+| `403 Forbidden` | the caller is scoped to a different database |
+| `404 Not Found` | no such database |
+
+### PUT /db/{db}/durability
+
+Stops or restarts syncing every commit to disk. By default each commit is
+synced (LMDB's default), which is what makes a write durable, and on
+macOS it is a full device flush (`F_FULLFSYNC`) that can dominate write
+time. `{"sync": false}` lets commits reach the operating system without
+waiting for the disk (LMDB `NO_SYNC`): much faster bulk loads, at the cost
+that a **system** crash (not a server crash) can lose recent commits, or
+corrupt the database on file systems that reorder writes. Use it for data
+you can rebuild, such as a memory replayed from a log, and turn it back on
+when the load is done: `{"sync": true}` flushes everything written
+meanwhile before it answers.
+
+The setting is not persisted: a restarted server syncs every commit again.
+
+Auth: Basic or Bearer, root or `Database(db)`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `sync` | boolean | *required* |
+
+```bash
+curl -u admin:pw -X PUT http://localhost:6380/db/movies/durability \
+  -H 'content-type: application/json' -d '{"sync": false}'
+```
+
+```json
+{ "database": "movies", "sync": false }
+```
+
+| Status | Cause |
+|---|---|
+| `403 Forbidden` | the caller is scoped to a different database |
+| `404 Not Found` | no such database |
+| `500 Internal Server Error` | the flag could not be changed or the flush failed |

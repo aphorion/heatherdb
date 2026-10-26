@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
@@ -36,10 +36,7 @@ pub async fn ready(Extension(server): Extension<Arc<Server>>) -> Response {
     .await;
 
     match result {
-        Ok(Ok(())) => Json(HealthResponse {
-            status: "ok".to_string(),
-        })
-        .into_response(),
+        Ok(Ok(())) => Json(HealthResponse::ok()).into_response(),
         Ok(Err(e)) => err(StatusCode::SERVICE_UNAVAILABLE, e),
         Err(e) => err(StatusCode::SERVICE_UNAVAILABLE, e),
     }
@@ -198,9 +195,22 @@ pub async fn get_database(
 pub async fn drop_database(
     Extension(server): Extension<Arc<Server>>,
     Path(db_name): Path<String>,
+    Query(query): Query<DropDatabaseQuery>,
 ) -> Response {
-    match server.drop_database(&db_name) {
-        Ok(dropped) => Json(DropDatabaseResponse { dropped }).into_response(),
+    // Purging deletes the directory, which for a large database takes a
+    // while: off the async runtime.
+    let purge = query.purge;
+    let result = tokio::task::spawn_blocking(move || server.drop_database_with(&db_name, purge))
+        .await
+        .map_err(|e| heather_db::HeatherError::Storage(e.to_string()))
+        .and_then(|r| r);
+
+    match result {
+        Ok(dropped) => Json(DropDatabaseResponse {
+            dropped,
+            purged: dropped && purge,
+        })
+        .into_response(),
         Err(e) => {
             let s = e.to_string();
             if s.contains("default") {
@@ -329,6 +339,56 @@ pub async fn bulk_load(
         Err(r) => return r,
     };
     routes::bulk_load(State(hive), Path(col), Json(req)).await
+}
+
+/// `GET /db/{db}/durability`: whether the database syncs every commit.
+pub async fn get_durability(
+    Extension(server): Extension<Arc<Server>>,
+    Path(db_name): Path<String>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    match hive.syncs() {
+        Ok(sync) => Json(DurabilityResponse {
+            database: db_name,
+            sync,
+        })
+        .into_response(),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// `PUT /db/{db}/durability` `{"sync": false}` stops syncing every commit
+/// to disk (fast bulk loads of data that can be rebuilt); `{"sync": true}`
+/// syncs again, flushing everything written meanwhile before it answers.
+/// Not persisted: a restarted server syncs. See `Store::set_sync`.
+pub async fn set_durability(
+    Extension(server): Extension<Arc<Server>>,
+    Path(db_name): Path<String>,
+    Json(req): Json<DurabilityRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    let result =
+        tokio::task::spawn_blocking(move || hive.set_sync(req.sync).and_then(|()| hive.syncs()))
+            .await;
+
+    match result {
+        Ok(Ok(sync)) => {
+            tracing::info!(database = %db_name, sync, "Durability changed");
+            Json(DurabilityResponse {
+                database: db_name,
+                sync,
+            })
+            .into_response()
+        }
+        Ok(Err(e)) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
 }
 
 pub async fn stats(
@@ -601,6 +661,7 @@ mod audit_tests {
                         .collect(),
                 ),
                 vectors,
+                vectors_b64: None,
             }),
         )
         .await;
@@ -670,5 +731,111 @@ mod audit_tests {
         assert_eq!(entries[0].route, "read");
         assert_eq!(entries[0].status, 400);
         assert_eq!(entries[0].result_count, 0);
+    }
+}
+
+#[cfg(test)]
+mod durability_tests {
+    use super::*;
+
+    async fn body_json(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    /// A database syncs by default; it can stop and start again, and the
+    /// state reads back. Writes made while it did not sync are kept.
+    #[tokio::test]
+    async fn durability_turns_off_and_back_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+        server
+            .create_database(DbConfig::new("replay", 4).unwrap())
+            .unwrap();
+        let get = || get_durability(Extension(server.clone()), Path("replay".into()));
+        let set = |sync: bool| {
+            set_durability(
+                Extension(server.clone()),
+                Path("replay".into()),
+                Json(DurabilityRequest { sync }),
+            )
+        };
+
+        assert_eq!(body_json(get().await).await.1["sync"], true);
+        assert_eq!(body_json(set(false).await).await.1["sync"], false);
+        assert_eq!(body_json(get().await).await.1["sync"], false);
+
+        let hive = resolve_db(&server, "replay").unwrap();
+        let col = hive.get_or_create_collection("c").unwrap();
+        col.write_with_metadata(&[1.0, 0.0, 0.0, 0.0], b"{}")
+            .unwrap();
+
+        let (status, body) = body_json(set(true).await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body,
+            serde_json::json!({"database": "replay", "sync": true})
+        );
+        assert!(col.get_document(0).unwrap().is_some());
+
+        let missing = get_durability(Extension(server.clone()), Path("nope".into())).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// `?purge=true` deletes the database for good and says so; without it
+    /// the drop keeps the database in `_trash/` as before.
+    #[tokio::test]
+    async fn drop_purges_on_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+        for name in ["kept", "scratch"] {
+            server
+                .create_database(DbConfig::new(name, 4).unwrap())
+                .unwrap();
+        }
+
+        let kept = drop_database(
+            Extension(server.clone()),
+            Path("kept".into()),
+            Query(DropDatabaseQuery::default()),
+        )
+        .await;
+        assert_eq!(
+            body_json(kept).await,
+            serde_json::json!({"dropped": true, "purged": false})
+        );
+
+        let purged = drop_database(
+            Extension(server.clone()),
+            Path("scratch".into()),
+            Query(DropDatabaseQuery { purge: true }),
+        )
+        .await;
+        assert_eq!(
+            body_json(purged).await,
+            serde_json::json!({"dropped": true, "purged": true})
+        );
+
+        let trashed: Vec<String> = std::fs::read_dir(dir.path().join("_trash"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(trashed.len(), 1);
+        assert!(trashed[0].starts_with("kept-"));
     }
 }
