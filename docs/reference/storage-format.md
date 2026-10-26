@@ -12,7 +12,7 @@ self-describing envelope (`heather_db::codec`):
 |---|---|---|
 | 0 | 4 | magic `FF FE 48 44` (`FF FE "HD"`) |
 | 4 | 1 | record version (currently `1`) |
-| 5 | 1 | kind: `1` location, `2` document |
+| 5 | 1 | kind: `1` location, `2` document, `3` plain location, `4` document reference |
 | 6 | 1 | precision of the vectors: `0` f64, `1` f32 |
 | 7 | 1 | reserved, `0` |
 | 8 | 4 | payload length, u32 little-endian |
@@ -23,6 +23,17 @@ Payloads are explicit little-endian layouts, one per record version:
 
 - **location v1**: `id u64 · d u32 · address[d] · counter[d] · write_count f64 · surprise_mass f64 · n u32 · neighbors u64[n]`
 - **document v1**: `d u32 · vector[d] · metadata length u32 · metadata bytes`
+- **plain location v1**: `id u64 · d u32 · address[d] · write_count f64 · surprise_mass f64 · n u32 · neighbors u64[n]`
+- **document reference v1**: `location id u64 · metadata length u32 · metadata bytes`
+
+A plain (non-competitive) write stores its vector once. Its location's
+counter equals its address, so the location is written as a **plain
+location**, without the counter, and reads back with the address in its
+place. Its document is written as a **document reference**: the id of that
+location instead of another copy of the vector, which reads back as the
+location's address. Merging, compressing and loading a snapshot change or
+remove locations, so they first rewrite any referencing documents with
+their own vectors.
 
 Vectors are f64 or f32 as the header says, so a record decodes the same
 whatever the reader assumes. New fields go into a new record version with
@@ -34,7 +45,8 @@ decoded the old way, at the database's precision.
 
 ## When a record is wrong
 
-- A checksum mismatch, a truncated payload or an impossible length is a
+- A checksum mismatch, a truncated payload, an impossible length, or a
+  document reference to a location that does not exist is a
   **corrupt record** (`HeatherError::Corrupt`). Decoding never panics and never
   allocates more than the record's own size.
 - A record version newer than the server reads is an **unsupported format**
