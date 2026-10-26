@@ -112,10 +112,17 @@ Capacity per location adapts: `max((k−1)·⌈ln L⌉, 2k)`. The logarithmic te
 supplies the long-range links that make the graph navigable in `O(log L)` hops;
 the `2k` floor keeps it connected while `L` is small.
 
-Reads use it once it is worth using — at least 100 locations and an average
-neighbour count of at least `k/2`. Below that, brute-force activation over a
-contiguous address matrix is faster than pointer-chasing, and the engine uses
-that instead.
+Activation does not search it. Graph search is approximate, and both reads and
+writes need the exact `k` nearest locations: a read that misses can fail to
+find a record by its own vector, and a write that misses its nearest location
+spawns a new one instead of joining it. On the demo's word-pair lexicon, writes
+through the graph made 53,394 locations where exact writes made 19,030.
+
+So activation scans every location. Reads scan a contiguous f64 address
+matrix. Writes scan an f32 copy of it, which is about twice as fast, and
+re-rank the locations the f32 rounding could have misordered (about `k` of
+them) in f64. The rounding error has a known bound, so the result is the same
+`k` an f64 scan finds.
 
 Graph search is a single greedy probe: enter at the landmark (one of the 32
 most-written locations) closest to the query, then descend through neighbour

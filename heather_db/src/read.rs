@@ -191,9 +191,9 @@ pub fn activate_subset(
 /// Reads never use the neighbour graph. Graph search is approximate: on a
 /// collection of 9,742 random 256-dimension keys it missed the exact match
 /// for 16% of lookups, so a stored record could not be found by its own
-/// vector. Writes still use it (`activate_auto`), where an approximate
-/// neighbour only changes which location learns. The scan is one pass over
-/// the matrix: about a millisecond at that size.
+/// vector. Writes do not use it either: there a missed neighbour changes
+/// what the memory learns (see `write::adaptive_write_two`). The scan is one
+/// pass over the matrix: about a millisecond at that size.
 pub fn activate_auto_full(
     query: &[f64],
     locations: &[HardLocation],
