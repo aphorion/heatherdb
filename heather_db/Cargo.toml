@@ -57,3 +57,7 @@ harness = false
 [[bench]]
 name = "graph_search"
 harness = false
+
+[[bench]]
+name = "knn_merge"
+harness = false

@@ -2,6 +2,7 @@ use rayon::prelude::*;
 
 use crate::config::EAMConfig;
 use crate::location::HardLocation;
+use crate::nearest;
 use crate::vec_ops;
 
 /// Result of a merge operation.
@@ -17,10 +18,8 @@ pub struct MergeResult {
 /// KNN merge: find nearest neighbor pairs above tau_merge, merge them.
 /// Process highest-similarity pairs first, skip already-merged locations.
 ///
-/// The nearest-neighbor pass is the O(N²·d) hot spot. We precompute
-/// norms once (so the inner kernel is a raw dot product, not the
-/// three-traversal `cosine_similarity`) and parallelise the outer
-/// loop with rayon.
+/// Finding each location's nearest neighbour is the hot spot; see
+/// [`crate::nearest`] for how it avoids comparing every pair.
 pub fn knn_merge(locations: &mut Vec<HardLocation>, config: &EAMConfig) -> MergeResult {
     let n = locations.len();
     if n < 2 {
@@ -41,36 +40,10 @@ pub fn knn_merge(locations: &mut Vec<HardLocation>, config: &EAMConfig) -> Merge
         .collect();
 
     let tau = config.tau_merge;
-    let pairs_unsorted: Vec<(usize, usize, f64)> = (0..n)
-        .into_par_iter()
-        .filter_map(|i| {
-            let ni = norms[i];
-            if ni < 1e-12 {
-                return None;
-            }
-            let addr_i = &locations[i].address;
-            let mut best_j = usize::MAX;
-            let mut best_sim = f64::NEG_INFINITY;
-            for (j, loc_j) in locations.iter().enumerate() {
-                if i == j {
-                    continue;
-                }
-                let nj = norms[j];
-                if nj < 1e-12 {
-                    continue;
-                }
-                let sim = vec_ops::dot(addr_i, &loc_j.address) / (ni * nj);
-                if sim > best_sim {
-                    best_sim = sim;
-                    best_j = j;
-                }
-            }
-            if best_j != usize::MAX && best_sim > tau {
-                Some((i, best_j, best_sim))
-            } else {
-                None
-            }
-        })
+    let pairs_unsorted: Vec<(usize, usize, f64)> = nearest::nearest_neighbors(locations, &norms)
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, nn)| nn.filter(|&(_, sim)| sim > tau).map(|(j, sim)| (i, j, sim)))
         .collect();
 
     let mut pairs = pairs_unsorted;
