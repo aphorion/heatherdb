@@ -274,12 +274,11 @@ impl EAMInner {
 
     /// Re-selects landmarks as the collection grows.
     ///
-    /// Writes take the graph path only with landmarks to enter it from
-    /// ([`read::activate_auto`]). Landmarks used to be chosen only when a
-    /// collection was opened (and by compress / merge / snapshot loads), so a
-    /// collection created empty and grown by writes kept none for the life
-    /// of the process, and every write scanned every location: O(N·d) per
-    /// vector, slower with each write. They are now re-selected while the
+    /// Landmarks are where graph search ([`read::graph_activate`]) enters the
+    /// neighbour graph. They used to be chosen only when a collection was
+    /// opened (and by compress / merge / snapshot loads), so a collection
+    /// created empty and grown by writes kept none for the life of the
+    /// process. They are now re-selected while the
     /// collection has fewer than `num_landmarks` locations' worth, and again
     /// after each 25% of growth (at least 256 locations), which keeps the
     /// O(N log N) selection amortised.
@@ -4044,9 +4043,9 @@ mod tests {
     }
 
     /// A collection created empty and grown only by writes gets landmarks,
-    /// and they are re-selected as it keeps growing, so writes can take the
-    /// graph path instead of scanning every location (regression: landmarks
-    /// were chosen only on open, leaving a growing collection with none).
+    /// and they are re-selected as it keeps growing, so graph search has
+    /// entry points (regression: landmarks were chosen only on open, leaving
+    /// a growing collection with none).
     #[test]
     fn landmarks_follow_a_collection_grown_by_writes() {
         use rand::{Rng, SeedableRng};

@@ -100,8 +100,8 @@ pub fn adaptive_write_two(
     eta: f64,
     next_id: &mut u64,
     rng: &mut impl Rng,
-    landmarks: &[usize],
-    id_lookup: &[u32],
+    _landmarks: &[usize],
+    _id_lookup: &[u32],
     opts: WriteOpts,
 ) -> WriteResult {
     // Non-competitive mode: verbatim streaming append. Store the address
@@ -126,8 +126,12 @@ pub fn adaptive_write_two(
     let k = config.k.min(locations.len());
 
     // ── Phase 1: Select ─────────────────────────────────────────────
-    // k-nearest via graph search (falls back to SoA/brute force when graph is young).
-    let (indices, sims) = read::activate_auto(address, locations, k, landmarks, id_lookup);
+    // The exact k nearest locations. Not graph search: it is approximate, and
+    // a missed neighbour here changes what the memory learns. On the demo
+    // lexicon (41,400 writes, d = 128) it missed the nearest location on 98%
+    // of writes, so most writes saw nothing close enough and spawned a new
+    // location instead of joining one: 53,394 locations against 19,030.
+    let (indices, sims) = read::activate(address, locations, k);
 
     if indices.is_empty() {
         // Cold start: the index is empty (data-seeded, l_0 == 0). Seed the first
@@ -449,6 +453,57 @@ fn dedup_new_locations(new_locations: &mut Vec<HardLocation>, config: &EAMConfig
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write activates its exact nearest locations even when a neighbour
+    /// graph and landmarks exist (regression: writes took the approximate
+    /// graph path, missed the nearest location, and spawned new ones).
+    #[test]
+    fn writes_activate_the_exact_nearest_despite_a_graph() {
+        use rand::SeedableRng;
+
+        let d = 32;
+        let n = 400;
+        let config = EAMConfig::new(d).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut locations: Vec<HardLocation> = (0..n)
+            .map(|i| {
+                let v: Vec<f64> = (0..d).map(|_| rng.gen_range(-1.0..1.0)).collect();
+                HardLocation::new(LocationId(i as u64), vec_ops::normalize(&v))
+            })
+            .collect();
+        // A graph that is "ready" (enough neighbours per location) but links
+        // each location only to the next few ids, unrelated to geometry.
+        for (i, loc) in locations.iter_mut().enumerate() {
+            loc.neighbors = (1..=config.k as u64)
+                .map(|o| (i as u64 + o) % n as u64)
+                .collect();
+        }
+        assert!(read::is_graph_ready(&locations, config.k));
+        let landmarks = vec![0];
+        let id_lookup = read::build_id_lookup(&locations);
+
+        let target = 257;
+        let input = locations[target].address.clone();
+        let mut next_id = n as u64;
+        let result = adaptive_write(
+            &input,
+            &mut locations,
+            &config,
+            0.01,
+            &mut next_id,
+            &mut rng,
+            &landmarks,
+            &id_lookup,
+        );
+        assert!(
+            result.modified_indices.contains(&target),
+            "the location the input is identical to was not activated"
+        );
+        assert!(
+            result.new_locations.is_empty(),
+            "spawned instead of joining"
+        );
+    }
 
     #[test]
     fn test_basic_write() {
