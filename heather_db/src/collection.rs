@@ -1536,7 +1536,7 @@ impl Collection {
         }
 
         // Persist document (vector + metadata)
-        let doc_data = bincode::serialize(&(input.to_vec(), metadata.to_vec()))?;
+        let doc_data = self.store.encode_document(input, metadata)?;
         self.store
             .put_document(&mut txn, self.collection_id, doc_id, &doc_data)?;
 
@@ -1674,7 +1674,7 @@ impl Collection {
 
             documents.push((
                 doc_id,
-                bincode::serialize(&(input.to_vec(), metadata.as_ref().to_vec()))?,
+                self.store.encode_document(input, metadata.as_ref())?,
             ));
         }
 
@@ -1723,7 +1723,7 @@ impl Collection {
     pub fn get_document(&self, write_index: u64) -> Result<Option<(Vec<f64>, Vec<u8>)>> {
         match self.store.get_document(self.collection_id, write_index)? {
             Some(data) => {
-                let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+                let (vec, meta) = self.store.decode_document(&data)?;
                 Ok(Some((vec, meta)))
             }
             None => Ok(None),
@@ -1781,7 +1781,7 @@ impl Collection {
             .list_documents_page(self.collection_id, offset, limit)?;
         let mut docs = Vec::with_capacity(raw.len());
         for (id, data) in raw {
-            let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+            let (vec, meta) = self.store.decode_document(&data)?;
             docs.push((id, vec, meta));
         }
         Ok((docs, total))
@@ -1792,7 +1792,7 @@ impl Collection {
         let raw = self.store.list_documents(self.collection_id)?;
         let mut docs = Vec::with_capacity(raw.len());
         for (id, data) in raw {
-            let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+            let (vec, meta) = self.store.decode_document(&data)?;
             docs.push((id, vec, meta));
         }
         Ok(docs)
@@ -1895,7 +1895,7 @@ impl Collection {
                 .store
                 .get_document_txn(&rtxn, self.collection_id, doc_id)?
             {
-                let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+                let (vec, meta) = self.store.decode_document(&data)?;
                 // Role-scoped when a role is supplied: unbind the stored
                 // superposition by it first, so the score reflects only the
                 // role the query constrained rather than being diluted by
@@ -2073,7 +2073,7 @@ impl Collection {
             else {
                 continue;
             };
-            let (vec, metadata): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+            let (vec, metadata) = self.store.decode_document(&data)?;
             if vec.len() != d {
                 continue;
             }

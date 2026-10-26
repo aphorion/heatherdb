@@ -96,6 +96,8 @@ pub async fn list_databases(Extension(server): Extension<Arc<Server>>) -> Respon
             dimension,
             map_size_mb: cfg.map_size_mb,
             collections,
+            competitive: cfg.eam.competitive,
+            precision: cfg.eam.precision,
         });
     }
     Json(ListDatabasesResponse { databases }).into_response()
@@ -131,6 +133,12 @@ pub async fn create_database(
         if let Some(v) = o.l_0 {
             cfg.eam.l_0 = v;
         }
+        if let Some(v) = o.competitive {
+            cfg.eam.competitive = v;
+        }
+        if let Some(v) = o.precision {
+            cfg.eam.precision = v;
+        }
         if let Err(e) = cfg.eam.validate() {
             return err(StatusCode::BAD_REQUEST, e);
         }
@@ -146,6 +154,8 @@ pub async fn create_database(
                     dimension,
                     map_size_mb: c.map_size_mb,
                     collections: 0,
+                    competitive: c.eam.competitive,
+                    precision: c.eam.precision,
                 })
                 .into_response()
             }
@@ -188,6 +198,8 @@ pub async fn get_database(
         dimension,
         map_size_mb: cfg.map_size_mb,
         collections,
+        competitive: cfg.eam.competitive,
+        precision: cfg.eam.precision,
     })
     .into_response()
 }
@@ -731,6 +743,60 @@ mod audit_tests {
         assert_eq!(entries[0].route, "read");
         assert_eq!(entries[0].status, 400);
         assert_eq!(entries[0].result_count, 0);
+    }
+}
+
+#[cfg(test)]
+mod plain_compact_tests {
+    use super::*;
+
+    /// A database created with `competitive: false` and `precision: "f32"`
+    /// reports both, keeps them across a restart, and stores one location
+    /// per write (no competitive learning).
+    #[tokio::test]
+    async fn plain_f32_databases_are_created_and_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+            let req: CreateDatabaseRequest = serde_json::from_value(serde_json::json!({
+                "name": "evidence", "dimension": 8,
+                "eam": {"competitive": false, "precision": "f32"}
+            }))
+            .unwrap();
+            let resp = create_database(Extension(server.clone()), Json(req)).await;
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(body["competitive"], false);
+            assert_eq!(body["precision"], "f32");
+
+            let hive = resolve_db(&server, "evidence").unwrap();
+            let col = hive.get_or_create_collection("docs").unwrap();
+            for i in 0..5 {
+                let mut v = vec![0.0; 8];
+                v[0] = 1.0;
+                v[1] = i as f64 * 0.01;
+                col.write_with_metadata(&v, b"{}").unwrap();
+            }
+            assert_eq!(
+                col.num_locations().unwrap(),
+                5,
+                "plain: one location per write"
+            );
+        }
+
+        let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+        let cfg = server.database_config("evidence").unwrap();
+        assert!(!cfg.eam.competitive);
+        assert_eq!(cfg.eam.precision, heather_db::Precision::F32);
+        let hive = resolve_db(&server, "evidence").unwrap();
+        let col = hive.get_or_create_collection("docs").unwrap();
+        let (v, _) = col.get_document(4).unwrap().unwrap();
+        assert!((v[1] - 0.04).abs() < 1e-6);
+        let (page, total) = col.list_documents_page(3, 2).unwrap();
+        assert_eq!((page.len(), total), (2, 5));
+        assert!((page[1].1[1] - 0.04).abs() < 1e-6);
     }
 }
 
