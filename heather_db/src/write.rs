@@ -2,7 +2,7 @@ use rand::Rng;
 
 use crate::config::{EAMConfig, engram_bits, surprise_bits};
 use crate::location::{HardLocation, LocationId};
-use crate::read;
+use crate::scan::{self, Scan};
 use crate::vec_ops;
 
 /// Result of a write operation, including any new locations created by splits.
@@ -65,8 +65,7 @@ pub fn adaptive_write(
     eta: f64,
     next_id: &mut u64,
     rng: &mut impl Rng,
-    landmarks: &[usize],
-    id_lookup: &[u32],
+    scan: &Scan,
 ) -> WriteResult {
     adaptive_write_two(
         input,
@@ -76,8 +75,7 @@ pub fn adaptive_write(
         eta,
         next_id,
         rng,
-        landmarks,
-        id_lookup,
+        scan,
         WriteOpts::default(),
     )
 }
@@ -100,8 +98,7 @@ pub fn adaptive_write_two(
     eta: f64,
     next_id: &mut u64,
     rng: &mut impl Rng,
-    _landmarks: &[usize],
-    _id_lookup: &[u32],
+    scan: &Scan,
     opts: WriteOpts,
 ) -> WriteResult {
     // Non-competitive mode: verbatim streaming append. Store the address
@@ -131,7 +128,8 @@ pub fn adaptive_write_two(
     // lexicon (41,400 writes, d = 128) it missed the nearest location on 98%
     // of writes, so most writes saw nothing close enough and spawned a new
     // location instead of joining one: 53,394 locations against 19,030.
-    let (indices, sims) = read::activate(address, locations, k);
+    // An f32 scan finds the candidates and the f64 dot ranks them (see scan).
+    let (indices, sims) = scan::nearest(address, locations, k, scan);
 
     if indices.is_empty() {
         // Cold start: the index is empty (data-seeded, l_0 == 0). Seed the first
@@ -454,11 +452,11 @@ fn dedup_new_locations(new_locations: &mut Vec<HardLocation>, config: &EAMConfig
 mod tests {
     use super::*;
 
-    /// A write activates its exact nearest locations even when a neighbour
-    /// graph and landmarks exist (regression: writes took the approximate
-    /// graph path, missed the nearest location, and spawned new ones).
+    /// A write activates its exact nearest locations when it searches the
+    /// f32 matrix (regression: writes took the approximate graph path,
+    /// missed the nearest location, and spawned new ones).
     #[test]
-    fn writes_activate_the_exact_nearest_despite_a_graph() {
+    fn writes_activate_the_exact_nearest() {
         use rand::SeedableRng;
 
         let d = 32;
@@ -471,16 +469,10 @@ mod tests {
                 HardLocation::new(LocationId(i as u64), vec_ops::normalize(&v))
             })
             .collect();
-        // A graph that is "ready" (enough neighbours per location) but links
-        // each location only to the next few ids, unrelated to geometry.
-        for (i, loc) in locations.iter_mut().enumerate() {
-            loc.neighbors = (1..=config.k as u64)
-                .map(|o| (i as u64 + o) % n as u64)
-                .collect();
-        }
-        assert!(read::is_graph_ready(&locations, config.k));
-        let landmarks = vec![0];
-        let id_lookup = read::build_id_lookup(&locations);
+        let matrix: Vec<f32> = locations
+            .iter()
+            .flat_map(|l| scan::to_f32(&l.address))
+            .collect();
 
         let target = 257;
         let input = locations[target].address.clone();
@@ -492,8 +484,10 @@ mod tests {
             0.01,
             &mut next_id,
             &mut rng,
-            &landmarks,
-            &id_lookup,
+            &Scan {
+                matrix: &matrix,
+                max_norm: 1.0 + 1e-12,
+            },
         );
         assert!(
             result.modified_indices.contains(&target),
@@ -524,8 +518,7 @@ mod tests {
             0.01,
             &mut next_id,
             &mut rng,
-            &[],
-            &[],
+            &Scan::default(),
         );
         assert!(!result.modified_indices.is_empty());
         // Location 0 should have received the most weight
@@ -559,8 +552,7 @@ mod tests {
                 0.01,
                 &mut next_id,
                 &mut rng,
-                &[],
-                &[],
+                &Scan::default(),
             );
             for loc in r.new_locations {
                 locations.push(loc);
@@ -606,8 +598,7 @@ mod tests {
                 0.01,
                 &mut next_id,
                 &mut rng,
-                &[],
-                &[],
+                &Scan::default(),
             );
             if !r.new_locations.is_empty() {
                 split = true;
@@ -639,8 +630,7 @@ mod tests {
             0.01,
             &mut next_id,
             &mut rng,
-            &[],
-            &[],
+            &Scan::default(),
         );
         // Should have created at least one new location (novelty split)
         assert!(!result.new_locations.is_empty());

@@ -9,6 +9,7 @@ use crate::location::{HardLocation, LocationId};
 use crate::merge;
 use crate::read;
 pub use crate::read::{ActivatedLocation, AttentionContributor, AttentionTrace, ReadTrace};
+use crate::scan;
 use crate::store::{DocVector, Store};
 use crate::vec_ops;
 use crate::write;
@@ -257,10 +258,35 @@ pub(crate) struct EAMInner {
     /// Contiguous [L × D] address matrix for cache-friendly brute-force activation.
     /// Row i = `locations[i].address`. Updated incrementally on writes.
     pub(crate) address_matrix: Vec<f64>,
+    /// `address_matrix` in f32, for writes' k-nearest search (see [`scan`]).
+    pub(crate) matrix32: Vec<f32>,
+    /// An upper bound on the norm of every row of `matrix32`.
+    pub(crate) max_norm: f64,
     /// In-process mutation counter. Bumped on every write-locked mutation;
     /// lets snapshot→load_snapshot cycles detect concurrent writes. Not
     /// persisted — resets to 0 on load.
     pub(crate) version: u64,
+}
+
+/// The f32 copy of these locations' addresses (see [`scan`]) and an upper
+/// bound on their norms.
+fn f32_rows(locations: &[HardLocation]) -> (Vec<f32>, f64) {
+    let mut rows =
+        Vec::with_capacity(locations.len() * locations.first().map_or(0, |l| l.address.len()));
+    let mut max_norm: f64 = 0.0;
+    for loc in locations {
+        rows.extend(loc.address.iter().map(|&a| a as f32));
+        max_norm = max_norm.max(vec_ops::l2_norm(&loc.address));
+    }
+    (rows, max_norm)
+}
+
+/// What a write searches for its k nearest locations (see [`scan`]).
+fn write_scan(matrix32: &[f32], max_norm: f64) -> scan::Scan<'_> {
+    scan::Scan {
+        matrix: matrix32,
+        max_norm,
+    }
 }
 
 impl EAMInner {
@@ -300,6 +326,7 @@ impl EAMInner {
         for loc in &self.locations {
             self.address_matrix.extend_from_slice(&loc.address);
         }
+        (self.matrix32, self.max_norm) = f32_rows(&self.locations);
     }
 
     /// Sync specific rows of the address matrix after address migration.
@@ -307,7 +334,12 @@ impl EAMInner {
         let d = self.config.d;
         for &idx in indices {
             let start = idx * d;
-            self.address_matrix[start..start + d].copy_from_slice(&self.locations[idx].address);
+            let address = &self.locations[idx].address;
+            self.address_matrix[start..start + d].copy_from_slice(address);
+            for (x, &a) in self.matrix32[start..start + d].iter_mut().zip(address) {
+                *x = a as f32;
+            }
+            self.max_norm = self.max_norm.max(vec_ops::l2_norm(address));
         }
     }
 
@@ -315,8 +347,10 @@ impl EAMInner {
     /// as the collection grows).
     pub(crate) fn append_addresses(&mut self, start_idx: usize) {
         for i in start_idx..self.locations.len() {
-            self.address_matrix
-                .extend_from_slice(&self.locations[i].address);
+            let address = &self.locations[i].address;
+            self.address_matrix.extend_from_slice(address);
+            self.matrix32.extend(address.iter().map(|&a| a as f32));
+            self.max_norm = self.max_norm.max(vec_ops::l2_norm(address));
         }
         self.refresh_landmarks();
     }
@@ -420,6 +454,7 @@ impl Collection {
         }
 
         let landmarks_at = locations.len();
+        let (matrix32, max_norm) = f32_rows(&locations);
         Ok(Collection {
             collection_id,
             name,
@@ -433,6 +468,8 @@ impl Collection {
                 landmarks,
                 id_lookup,
                 address_matrix,
+                matrix32,
+                max_norm,
                 version: 0,
             }),
             store,
@@ -485,6 +522,7 @@ impl Collection {
         }
 
         let landmarks_at = locations.len();
+        let (matrix32, max_norm) = f32_rows(&locations);
         Ok(Collection {
             collection_id,
             name,
@@ -498,6 +536,8 @@ impl Collection {
                 landmarks,
                 id_lookup,
                 address_matrix,
+                matrix32,
+                max_norm,
                 version: 0,
             }),
             store,
@@ -536,12 +576,18 @@ impl Collection {
                 ref mut locations,
                 ref mut next_id,
                 ref mut eta,
-                ref landmarks,
-                ref id_lookup,
+                ref matrix32,
+                max_norm,
                 ..
             } = *inner;
             let r = write::adaptive_write(
-                input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                input,
+                locations,
+                config,
+                *eta,
+                next_id,
+                &mut rng,
+                &write_scan(matrix32, max_norm),
             );
             *eta = r.eta;
             r
@@ -622,12 +668,19 @@ impl Collection {
                 ref mut locations,
                 ref mut next_id,
                 ref mut eta,
-                ref landmarks,
-                ref id_lookup,
+                ref matrix32,
+                max_norm,
                 ..
             } = *inner;
             let r = write::adaptive_write_two(
-                address, counter, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                address,
+                counter,
+                locations,
+                config,
+                *eta,
+                next_id,
+                &mut rng,
+                &write_scan(matrix32, max_norm),
                 opts,
             );
             *eta = r.eta;
@@ -702,12 +755,18 @@ impl Collection {
                     ref mut locations,
                     ref mut next_id,
                     ref mut eta,
-                    ref landmarks,
-                    ref id_lookup,
+                    ref matrix32,
+                    max_norm,
                     ..
                 } = *inner;
                 let r = write::adaptive_write(
-                    input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                    input,
+                    locations,
+                    config,
+                    *eta,
+                    next_id,
+                    &mut rng,
+                    &write_scan(matrix32, max_norm),
                 );
                 *eta = r.eta;
                 r
@@ -1517,12 +1576,18 @@ impl Collection {
                 ref mut locations,
                 ref mut next_id,
                 ref mut eta,
-                ref landmarks,
-                ref id_lookup,
+                ref matrix32,
+                max_norm,
                 ..
             } = *inner;
             let r = write::adaptive_write(
-                input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                input,
+                locations,
+                config,
+                *eta,
+                next_id,
+                &mut rng,
+                &write_scan(matrix32, max_norm),
             );
             *eta = r.eta;
             r
@@ -1666,12 +1731,18 @@ impl Collection {
                     ref mut locations,
                     ref mut next_id,
                     ref mut eta,
-                    ref landmarks,
-                    ref id_lookup,
+                    ref matrix32,
+                    max_norm,
                     ..
                 } = *inner;
                 let r = write::adaptive_write(
-                    input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                    input,
+                    locations,
+                    config,
+                    *eta,
+                    next_id,
+                    &mut rng,
+                    &write_scan(matrix32, max_norm),
                 );
                 *eta = r.eta;
                 r

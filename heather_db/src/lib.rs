@@ -43,6 +43,7 @@ pub mod hive;
 pub mod location;
 pub mod merge;
 pub mod read;
+pub mod scan;
 pub mod server;
 pub mod store;
 pub mod vec_ops;
