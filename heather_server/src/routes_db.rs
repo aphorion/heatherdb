@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use axum::Json;
-use axum::extract::{Extension, Path, State};
+use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 
@@ -195,9 +195,22 @@ pub async fn get_database(
 pub async fn drop_database(
     Extension(server): Extension<Arc<Server>>,
     Path(db_name): Path<String>,
+    Query(query): Query<DropDatabaseQuery>,
 ) -> Response {
-    match server.drop_database(&db_name) {
-        Ok(dropped) => Json(DropDatabaseResponse { dropped }).into_response(),
+    // Purging deletes the directory, which for a large database takes a
+    // while: off the async runtime.
+    let purge = query.purge;
+    let result = tokio::task::spawn_blocking(move || server.drop_database_with(&db_name, purge))
+        .await
+        .map_err(|e| heather_db::HeatherError::Storage(e.to_string()))
+        .and_then(|r| r);
+
+    match result {
+        Ok(dropped) => Json(DropDatabaseResponse {
+            dropped,
+            purged: dropped && purge,
+        })
+        .into_response(),
         Err(e) => {
             let s = e.to_string();
             if s.contains("default") {
@@ -667,5 +680,59 @@ mod audit_tests {
         assert_eq!(entries[0].route, "read");
         assert_eq!(entries[0].status, 400);
         assert_eq!(entries[0].result_count, 0);
+    }
+}
+
+#[cfg(test)]
+mod drop_tests {
+    use super::*;
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// `?purge=true` deletes the database for good and says so; without it
+    /// the drop keeps the database in `_trash/` as before.
+    #[tokio::test]
+    async fn drop_purges_on_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+        for name in ["kept", "scratch"] {
+            server
+                .create_database(DbConfig::new(name, 4).unwrap())
+                .unwrap();
+        }
+
+        let kept = drop_database(
+            Extension(server.clone()),
+            Path("kept".into()),
+            Query(DropDatabaseQuery::default()),
+        )
+        .await;
+        assert_eq!(
+            body_json(kept).await,
+            serde_json::json!({"dropped": true, "purged": false})
+        );
+
+        let purged = drop_database(
+            Extension(server.clone()),
+            Path("scratch".into()),
+            Query(DropDatabaseQuery { purge: true }),
+        )
+        .await;
+        assert_eq!(
+            body_json(purged).await,
+            serde_json::json!({"dropped": true, "purged": true})
+        );
+
+        let trashed: Vec<String> = std::fs::read_dir(dir.path().join("_trash"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(trashed.len(), 1);
+        assert!(trashed[0].starts_with("kept-"));
     }
 }

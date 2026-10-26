@@ -313,6 +313,15 @@ pub struct ListDatabasesResponse {
 #[derive(Debug, Serialize)]
 pub struct DropDatabaseResponse {
     pub dropped: bool,
+    /// Deleted for good rather than moved to `_trash/` (`?purge=true`).
+    pub purged: bool,
+}
+
+/// `DELETE /db/{db}?purge=true`.
+#[derive(Debug, Default, Deserialize)]
+pub struct DropDatabaseQuery {
+    #[serde(default)]
+    pub purge: bool,
 }
 
 #[derive(Debug, Serialize)]
