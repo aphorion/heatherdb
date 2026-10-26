@@ -60,6 +60,12 @@ impl Hive {
         })
     }
 
+    /// Records reads skipped since the database was opened because they did
+    /// not decode (see [`Store::tolerate`]).
+    pub fn skipped_records(&self) -> u64 {
+        self.store.skipped_records()
+    }
+
     /// Whether commits are synced to disk. See [`Store::set_sync`].
     pub fn syncs(&self) -> Result<bool> {
         self.store.syncs()

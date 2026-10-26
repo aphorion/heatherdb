@@ -49,15 +49,13 @@ pub async fn ready(Extension(server): Extension<Arc<Server>>) -> Response {
 // boxing here would only add an indirection that is unwrapped one frame up.
 #[allow(clippy::result_large_err)]
 fn resolve_db(server: &Arc<Server>, name: &str) -> Result<Arc<Hive>, Response> {
-    server.database(name).ok_or_else(|| {
-        (
-            StatusCode::NOT_FOUND,
-            Json(ErrorResponse {
-                error: format!("database not found: {name}"),
-            }),
-        )
-            .into_response()
-    })
+    server
+        .database(name)
+        .ok_or_else(|| match server.refused(name) {
+            // On disk, but in a format this HeatherDB does not read.
+            Some(reason) => err(StatusCode::CONFLICT, reason),
+            None => err(StatusCode::NOT_FOUND, format!("database not found: {name}")),
+        })
 }
 
 fn err(status: StatusCode, msg: impl ToString) -> Response {
@@ -98,6 +96,11 @@ pub async fn list_databases(Extension(server): Extension<Arc<Server>>) -> Respon
             collections,
             competitive: cfg.eam.competitive,
             precision: cfg.eam.precision,
+            format_version: cfg.format_version,
+            skipped_records: server
+                .database(&name)
+                .map(|h| h.skipped_records())
+                .unwrap_or(0),
         });
     }
     Json(ListDatabasesResponse { databases }).into_response()
@@ -156,6 +159,8 @@ pub async fn create_database(
                     collections: 0,
                     competitive: c.eam.competitive,
                     precision: c.eam.precision,
+                    format_version: c.format_version,
+                    skipped_records: 0,
                 })
                 .into_response()
             }
@@ -192,6 +197,10 @@ pub async fn get_database(
         .map(|v| v.len())
         .unwrap_or(0);
     let dimension = cfg.dimension();
+    let skipped_records = server
+        .database(&db_name)
+        .map(|h| h.skipped_records())
+        .unwrap_or(0);
     Json(DatabaseInfo {
         name: cfg.name,
         created_at: cfg.created_at,
@@ -200,6 +209,8 @@ pub async fn get_database(
         collections,
         competitive: cfg.eam.competitive,
         precision: cfg.eam.precision,
+        format_version: cfg.format_version,
+        skipped_records,
     })
     .into_response()
 }
@@ -794,8 +805,8 @@ mod plain_compact_tests {
         let col = hive.get_or_create_collection("docs").unwrap();
         let (v, _) = col.get_document(4).unwrap().unwrap();
         assert!((v[1] - 0.04).abs() < 1e-6);
-        let (page, total) = col.list_documents_page(3, 2).unwrap();
-        assert_eq!((page.len(), total), (2, 5));
+        let (page, total, skipped) = col.list_documents_page(3, 2).unwrap();
+        assert_eq!((page.len(), total, skipped), (2, 5, 0));
         assert!((page[1].1[1] - 0.04).abs() < 1e-6);
     }
 }
@@ -903,5 +914,37 @@ mod drop_tests {
             .collect();
         assert_eq!(trashed.len(), 1);
         assert!(trashed[0].starts_with("kept-"));
+    }
+}
+
+#[cfg(test)]
+mod refused_tests {
+    use super::*;
+
+    /// A database on disk in a newer format answers 409 with why, not 404.
+    #[tokio::test]
+    async fn refused_databases_answer_conflict_with_the_reason() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let server = Server::open(dir.path(), 4).unwrap();
+            server
+                .create_database(DbConfig::new("future", 4).unwrap())
+                .unwrap();
+        }
+        let path = dir.path().join("db").join("future").join("db.toml");
+        let mut cfg = DbConfig::load(&path).unwrap();
+        cfg.format_version = heather_db::FORMAT_VERSION + 1;
+        cfg.save(&path).unwrap();
+
+        let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+        let resp = list_collections(Extension(server.clone()), Path("future".into())).await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8_lossy(&bytes).contains("upgrade HeatherDB"));
+
+        let missing = list_collections(Extension(server), Path("nope".into())).await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 }

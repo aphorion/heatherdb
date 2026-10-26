@@ -1053,17 +1053,13 @@ pub async fn get_documents(
     };
 
     // Paged with ?limit= (and ?offset=); the whole collection otherwise.
-    let result = tokio::task::spawn_blocking(move || match query.limit {
-        Some(limit) => col.list_documents_page(query.offset.unwrap_or(0), limit),
-        None => col.list_documents().map(|d| {
-            let n = d.len();
-            (d, n)
-        }),
+    let result = tokio::task::spawn_blocking(move || {
+        col.list_documents_page(query.offset.unwrap_or(0), query.limit.unwrap_or(usize::MAX))
     })
     .await;
 
     match result {
-        Ok(Ok((docs, total))) => {
+        Ok(Ok((docs, total, skipped))) => {
             let documents: Vec<DocumentItem> = docs
                 .into_iter()
                 .filter_map(|(id, _vec, meta)| {
@@ -1072,7 +1068,12 @@ pub async fn get_documents(
                         .map(|metadata| DocumentItem { id, metadata })
                 })
                 .collect();
-            Json(DocumentsResponse { documents, total }).into_response()
+            Json(DocumentsResponse {
+                documents,
+                total,
+                skipped,
+            })
+            .into_response()
         }
         Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),

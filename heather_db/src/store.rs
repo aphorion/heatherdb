@@ -41,6 +41,8 @@ fn metadata_key(collection_id: u32, key: &str) -> Vec<u8> {
 
 pub struct Store {
     env: Env,
+    /// Records tolerant reads skipped because they did not decode.
+    skipped: std::sync::atomic::AtomicU64,
     /// How vectors are encoded on disk (see [`crate::config::Precision`]).
     precision: Precision,
     registry_db: Database<Bytes, Bytes>,
@@ -49,25 +51,6 @@ pub struct Store {
     documents_db: Database<Bytes, Bytes>,
     doc_index_db: Database<Bytes, Bytes>,
     audit_db: Database<Bytes, Bytes>,
-}
-
-/// A [`HardLocation`] with f32 vectors, as an f32 store keeps it.
-#[derive(serde::Serialize, serde::Deserialize)]
-struct CompactLocation {
-    id: LocationId,
-    address: Vec<f32>,
-    counter: Vec<f32>,
-    write_count: f64,
-    neighbors: Vec<u64>,
-    surprise_mass: f64,
-}
-
-fn narrow(v: &[f64]) -> Vec<f32> {
-    v.iter().map(|&x| x as f32).collect()
-}
-
-fn widen(v: &[f32]) -> Vec<f64> {
-    v.iter().map(|&x| f64::from(x)).collect()
 }
 
 /// A stored document: its id and its serialised (vector, metadata).
@@ -137,6 +120,7 @@ impl Store {
 
         Ok(Store {
             env,
+            skipped: std::sync::atomic::AtomicU64::new(0),
             precision,
             registry_db,
             locations_db,
@@ -276,6 +260,20 @@ impl Store {
         Ok(())
     }
 
+    /// Stores raw bytes as a location (tests: simulating damage).
+    #[cfg(test)]
+    pub(crate) fn put_raw_location(
+        &self,
+        txn: &mut RwTxn,
+        collection_id: u32,
+        location_id: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.locations_db
+            .put(txn, &location_key(collection_id, location_id), bytes)?;
+        Ok(())
+    }
+
     pub fn delete_location(
         &self,
         txn: &mut RwTxn,
@@ -294,62 +292,60 @@ impl Store {
         let iter = self.locations_db.prefix_iter(&rtxn, &prefix)?;
         for result in iter {
             let (_key, value) = result?;
-            locations.push(self.decode_location(value)?);
+            // A location that does not decode is skipped (and counted), so
+            // one bad record cannot keep the collection from opening.
+            if let Some(loc) = self.tolerate(self.decode_location(value))? {
+                locations.push(loc);
+            }
         }
         Ok(locations)
+    }
+
+    /// For reads that serve many records: a record that does not decode
+    /// ([`HeatherError::Corrupt`] or [`HeatherError::UnsupportedFormat`]) is
+    /// counted and skipped (`Ok(None)`) instead of failing the read. Storage
+    /// errors still fail it.
+    pub fn tolerate<T>(&self, decoded: Result<T>) -> Result<Option<T>> {
+        match decoded {
+            Ok(v) => Ok(Some(v)),
+            Err(HeatherError::Corrupt(_) | HeatherError::UnsupportedFormat(_)) => {
+                self.skipped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Records skipped by tolerant reads since the store was opened.
+    pub fn skipped_records(&self) -> u64 {
+        self.skipped.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     // --- Vector encoding (by precision) ---
 
     fn encode_location(&self, loc: &HardLocation) -> Result<Vec<u8>> {
-        Ok(match self.precision {
-            Precision::F64 => bincode::serialize(loc)?,
-            Precision::F32 => bincode::serialize(&CompactLocation {
-                id: loc.id,
-                address: narrow(&loc.address),
-                counter: narrow(&loc.counter),
-                write_count: loc.write_count,
-                neighbors: loc.neighbors.clone(),
-                surprise_mass: loc.surprise_mass,
-            })?,
-        })
+        Ok(crate::codec::encode_location(loc, self.precision))
     }
 
     fn decode_location(&self, bytes: &[u8]) -> Result<HardLocation> {
-        Ok(match self.precision {
-            Precision::F64 => bincode::deserialize(bytes)?,
-            Precision::F32 => {
-                let c: CompactLocation = bincode::deserialize(bytes)?;
-                HardLocation {
-                    id: c.id,
-                    address: widen(&c.address),
-                    counter: widen(&c.counter),
-                    write_count: c.write_count,
-                    neighbors: c.neighbors,
-                    surprise_mass: c.surprise_mass,
-                }
-            }
-        })
+        crate::codec::decode_location(bytes, self.precision)
     }
 
     /// A document's stored bytes: its vector (at the store's precision) and
-    /// its metadata.
+    /// its metadata, in the record envelope (see [`crate::codec`]).
     pub fn encode_document(&self, vector: &[f64], metadata: &[u8]) -> Result<Vec<u8>> {
-        Ok(match self.precision {
-            Precision::F64 => bincode::serialize(&(vector, metadata))?,
-            Precision::F32 => bincode::serialize(&(narrow(vector), metadata))?,
-        })
+        Ok(crate::codec::encode_document(
+            vector,
+            metadata,
+            self.precision,
+        ))
     }
 
-    /// The vector and metadata of a stored document.
+    /// The vector and metadata of a stored document. A value that does not
+    /// decode is [`HeatherError::Corrupt`].
     pub fn decode_document(&self, bytes: &[u8]) -> Result<(Vec<f64>, Vec<u8>)> {
-        Ok(match self.precision {
-            Precision::F64 => bincode::deserialize(bytes)?,
-            Precision::F32 => {
-                let (vector, metadata): (Vec<f32>, Vec<u8>) = bincode::deserialize(bytes)?;
-                (widen(&vector), metadata)
-            }
-        })
+        crate::codec::decode_document(bytes, self.precision)
     }
 
     // --- Metadata operations (collection-scoped) ---
