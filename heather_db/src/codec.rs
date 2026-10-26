@@ -6,7 +6,8 @@
 //! offset  size  field
 //!      0     4  magic           FF FE 'H' 'D'
 //!      4     1  record version  1
-//!      5     1  kind            1 = location, 2 = document
+//!      5     1  kind            1 = location, 2 = document,
+//!                                 3 = plain location, 4 = document reference
 //!      6     1  precision       0 = f64, 1 = f32 (of the vectors)
 //!      7     1  reserved        0
 //!      8     4  payload length  u32 LE
@@ -20,7 +21,20 @@
 //! location v1: id u64 | d u32 | address [d] | counter [d] | write_count f64
 //!              | surprise_mass f64 | n u32 | neighbors u64 [n]
 //! document v1: d u32 | vector [d] | metadata length u32 | metadata bytes
+//!
+//! plain location v1:     id u64 | d u32 | address [d] | write_count f64
+//!                        | surprise_mass f64 | n u32 | neighbors u64 [n]
+//! document reference v1: location id u64 | metadata length u32
+//!                        | metadata bytes
 //! ```
+//!
+//! A plain location is a location whose counter equals its address (every
+//! write to a plain, non-competitive collection): the counter is not stored
+//! and reads back as the address. A document reference is a document whose
+//! vector is that of a location of its collection, stored by the location's
+//! id instead of another copy; its collection resolves it
+//! ([`DocVector::Location`]). Together they keep a plain write's vector once
+//! instead of three times.
 //!
 //! Vectors are f64 or f32 as the header says, so a reader never relies on
 //! how the store was opened; an unknown record version is refused instead
@@ -44,6 +58,17 @@ const HEADER_LEN: usize = 16;
 
 const KIND_LOCATION: u8 = 1;
 const KIND_DOCUMENT: u8 = 2;
+const KIND_PLAIN_LOCATION: u8 = 3;
+const KIND_DOCUMENT_REF: u8 = 4;
+
+/// Where a stored document's vector is.
+#[derive(Debug, Clone, PartialEq)]
+pub enum DocVector {
+    /// Stored with the document.
+    Inline(Vec<f64>),
+    /// The address of this location of the document's collection.
+    Location(u64),
+}
 
 /// What a stored value is, as far as its bytes say.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,19 +105,29 @@ pub fn encode_location(loc: &HardLocation, precision: Precision) -> Vec<u8> {
         loc.counter.len(),
         "a location's address and counter have the same length"
     );
-    let mut p =
-        Vec::with_capacity(8 + 4 + 2 * d * width(precision) + 16 + 4 + 8 * loc.neighbors.len());
+    let plain = loc.counter == loc.address;
+    let vectors = if plain { 1 } else { 2 };
+    let mut p = Vec::with_capacity(
+        8 + 4 + vectors * d * width(precision) + 16 + 4 + 8 * loc.neighbors.len(),
+    );
     p.extend_from_slice(&loc.id.0.to_le_bytes());
     p.extend_from_slice(&len_u32(d).to_le_bytes());
     put_floats(&mut p, &loc.address, precision);
-    put_floats(&mut p, &loc.counter, precision);
+    if !plain {
+        put_floats(&mut p, &loc.counter, precision);
+    }
     p.extend_from_slice(&loc.write_count.to_le_bytes());
     p.extend_from_slice(&loc.surprise_mass.to_le_bytes());
     p.extend_from_slice(&len_u32(loc.neighbors.len()).to_le_bytes());
     for n in &loc.neighbors {
         p.extend_from_slice(&n.to_le_bytes());
     }
-    envelope(KIND_LOCATION, precision, p)
+    let kind = if plain {
+        KIND_PLAIN_LOCATION
+    } else {
+        KIND_LOCATION
+    };
+    envelope(kind, precision, p)
 }
 
 /// Decodes a location; `legacy` is the precision legacy values were
@@ -101,12 +136,16 @@ pub fn decode_location(bytes: &[u8], legacy: Precision) -> Result<HardLocation> 
     match format(bytes)? {
         Format::Legacy => legacy_location(bytes, legacy),
         Format::Enveloped { .. } => {
-            let (precision, payload) = open(bytes, KIND_LOCATION)?;
+            let (kind, precision, payload) = open(bytes, &[KIND_LOCATION, KIND_PLAIN_LOCATION])?;
             let mut r = Reader::new(payload);
             let id = LocationId(r.u64()?);
             let d = r.u32()? as usize;
             let address = r.floats(d, precision)?;
-            let counter = r.floats(d, precision)?;
+            let counter = if kind == KIND_PLAIN_LOCATION {
+                address.clone()
+            } else {
+                r.floats(d, precision)?
+            };
             let write_count = r.f64()?;
             let surprise_mass = r.f64()?;
             let n = r.u32()? as usize;
@@ -133,16 +172,46 @@ pub fn encode_document(vector: &[f64], metadata: &[u8], precision: Precision) ->
     envelope(KIND_DOCUMENT, precision, p)
 }
 
+/// A document whose vector is the address of location `location_id` of its
+/// collection: stored as a reference and the metadata, without the vector.
+/// `precision` is the store's (a reference holds no vector of its own).
+pub fn encode_document_ref(location_id: u64, metadata: &[u8], precision: Precision) -> Vec<u8> {
+    let mut p = Vec::with_capacity(8 + 4 + metadata.len());
+    p.extend_from_slice(&location_id.to_le_bytes());
+    p.extend_from_slice(&len_u32(metadata.len()).to_le_bytes());
+    p.extend_from_slice(metadata);
+    envelope(KIND_DOCUMENT_REF, precision, p)
+}
+
 /// Decodes a document into its vector and metadata; `legacy` as for
-/// [`decode_location`].
+/// [`decode_location`]. A document reference has no vector of its own and is
+/// an error here: read it with [`decode_document_parts`] and resolve it.
 pub fn decode_document(bytes: &[u8], legacy: Precision) -> Result<(Vec<f64>, Vec<u8>)> {
+    match decode_document_parts(bytes, legacy)? {
+        (DocVector::Inline(vector), metadata) => Ok((vector, metadata)),
+        (DocVector::Location(id), _) => Err(HeatherError::Serialization(format!(
+            "document refers to location {id} for its vector; resolve it through its collection"
+        ))),
+    }
+}
+
+/// Decodes a document into its vector (inline, or a reference to a location)
+/// and metadata; `legacy` as for [`decode_location`].
+pub fn decode_document_parts(bytes: &[u8], legacy: Precision) -> Result<(DocVector, Vec<u8>)> {
     match format(bytes)? {
-        Format::Legacy => legacy_document(bytes, legacy),
+        Format::Legacy => {
+            let (vector, metadata) = legacy_document(bytes, legacy)?;
+            Ok((DocVector::Inline(vector), metadata))
+        }
         Format::Enveloped { .. } => {
-            let (precision, payload) = open(bytes, KIND_DOCUMENT)?;
+            let (kind, precision, payload) = open(bytes, &[KIND_DOCUMENT, KIND_DOCUMENT_REF])?;
             let mut r = Reader::new(payload);
-            let d = r.u32()? as usize;
-            let vector = r.floats(d, precision)?;
+            let vector = if kind == KIND_DOCUMENT_REF {
+                DocVector::Location(r.u64()?)
+            } else {
+                let d = r.u32()? as usize;
+                DocVector::Inline(r.floats(d, precision)?)
+            };
             let m = r.u32()? as usize;
             let metadata = r.bytes(m)?.to_vec();
             r.finish()?;
@@ -166,8 +235,9 @@ fn envelope(kind: u8, precision: Precision, payload: Vec<u8>) -> Vec<u8> {
     out
 }
 
-/// Checks an enveloped value and returns its precision and payload.
-fn open(bytes: &[u8], kind: u8) -> Result<(Precision, &[u8])> {
+/// Checks an enveloped value, which must be one of `kinds`, and returns its
+/// kind, precision and payload.
+fn open<'a>(bytes: &'a [u8], kinds: &[u8]) -> Result<(u8, Precision, &'a [u8])> {
     let version = bytes[4];
     if version == 0 || version > RECORD_VERSION {
         return Err(HeatherError::UnsupportedFormat(format!(
@@ -175,11 +245,11 @@ fn open(bytes: &[u8], kind: u8) -> Result<(Precision, &[u8])> {
              it was written by a newer HeatherDB"
         )));
     }
-    if bytes[5] != kind {
+    let kind = bytes[5];
+    if !kinds.contains(&kind) {
         return Err(corrupt(&format!(
-            "expected a {} record, found kind {}",
-            kind_name(kind),
-            bytes[5]
+            "expected a {} record, found kind {kind}",
+            kind_name(kinds[0])
         )));
     }
     let precision = precision_from(bytes[6])?;
@@ -195,13 +265,15 @@ fn open(bytes: &[u8], kind: u8) -> Result<(Precision, &[u8])> {
     if crc32fast::hash(payload) != crc {
         return Err(corrupt("checksum mismatch"));
     }
-    Ok((precision, payload))
+    Ok((kind, precision, payload))
 }
 
 fn kind_name(kind: u8) -> &'static str {
     match kind {
         KIND_LOCATION => "location",
         KIND_DOCUMENT => "document",
+        KIND_PLAIN_LOCATION => "plain location",
+        KIND_DOCUMENT_REF => "document reference",
         _ => "unknown",
     }
 }
@@ -450,6 +522,43 @@ mod tests {
         );
     }
 
+    /// A location whose counter is its address is stored once and reads back
+    /// whole; a document reference reads back as the location it names, and
+    /// is an error where an inline vector is required.
+    #[test]
+    fn plain_locations_and_document_references_round_trip() {
+        let mut loc = location();
+        loc.counter = loc.address.clone();
+        let plain = encode_location(&loc, Precision::F64);
+        assert!(
+            plain.len() + 8 * loc.address.len()
+                == encode_location(&location(), Precision::F64).len()
+        );
+        assert!(same(
+            &decode_location(&plain, Precision::F64).unwrap(),
+            &loc
+        ));
+
+        let r = encode_document_ref(7, b"{}", Precision::F32);
+        assert_eq!(
+            decode_document_parts(&r, Precision::F64).unwrap(),
+            (DocVector::Location(7), b"{}".to_vec())
+        );
+        assert!(matches!(
+            decode_document(&r, Precision::F64),
+            Err(HeatherError::Serialization(_))
+        ));
+        // Neither is the other's kind.
+        assert!(matches!(
+            decode_location(&r, Precision::F64),
+            Err(HeatherError::Corrupt(_))
+        ));
+        assert!(matches!(
+            decode_document_parts(&plain, Precision::F64),
+            Err(HeatherError::Corrupt(_))
+        ));
+    }
+
     /// The header says the precision, so a record reads correctly whatever
     /// precision the reader assumes for legacy values.
     #[test]
@@ -555,6 +664,10 @@ mod golden {
     const DOCUMENT_F64: &str = "fffe484401020000270000000625d7ff03000000000000000000e03f000000000000d03f000000000000f0bf070000007b2269223a317d";
     const DOCUMENT_F32: &str =
         "fffe4844010201001b000000ce427130030000000000003f0000803e000080bf070000007b2269223a317d";
+    const PLAIN_LOCATION_F64: &str = "fffe484401030000580000008c486b9d2a0000000000000004000000000000000000e03f000000000000d0bf000000000000c03f000000000000f03f0000000000000c40000000000000e83f03000000010000000000000007000000000000000900000000000000";
+    const PLAIN_LOCATION_F32: &str = "fffe48440103010048000000a3b71fbc2a00000000000000040000000000003f000080be0000003e0000803f0000000000000c40000000000000e83f03000000010000000000000007000000000000000900000000000000";
+    const DOCUMENT_REF: &str =
+        "fffe484401040000130000009c89a5532a00000000000000070000007b2269223a317d";
     const LEGACY_LOCATION_F64: &str = "2a000000000000000400000000000000000000000000e03f000000000000d0bf000000000000c03f000000000000f03f040000000000000000000000000000400000000000000000000000000000f8bf000000000000d03f0000000000000c400300000000000000010000000000000007000000000000000900000000000000000000000000e83f";
     const LEGACY_DOCUMENT_F64: &str = "0300000000000000000000000000e03f000000000000d03f000000000000f0bf07000000000000007b2269223a317d";
 
@@ -574,6 +687,15 @@ mod golden {
             write_count: 3.5,
             neighbors: vec![1, 7, 9],
             surprise_mass: 0.75,
+        }
+    }
+
+    /// `location()` with its counter equal to its address.
+    fn plain_location() -> HardLocation {
+        let loc = location();
+        HardLocation {
+            counter: loc.address.clone(),
+            ..loc
         }
     }
 
@@ -604,6 +726,18 @@ mod golden {
         let (v, m) = document();
         assert_eq!(encode_document(&v, &m, Precision::F64), bytes(DOCUMENT_F64));
         assert_eq!(encode_document(&v, &m, Precision::F32), bytes(DOCUMENT_F32));
+        assert_eq!(
+            encode_location(&plain_location(), Precision::F64),
+            bytes(PLAIN_LOCATION_F64)
+        );
+        assert_eq!(
+            encode_location(&plain_location(), Precision::F32),
+            bytes(PLAIN_LOCATION_F32)
+        );
+        assert_eq!(
+            encode_document_ref(42, &m, Precision::F64),
+            bytes(DOCUMENT_REF)
+        );
     }
 
     #[test]
@@ -621,6 +755,16 @@ mod golden {
                 document()
             );
         }
+        for hex in [PLAIN_LOCATION_F64, PLAIN_LOCATION_F32] {
+            let loc = decode_location(&bytes(hex), Precision::F64).unwrap();
+            assert_eq!(loc.counter, loc.address);
+            assert_eq!(loc.address, plain_location().address);
+            assert_eq!((loc.id, loc.neighbors), (LocationId(42), vec![1, 7, 9]));
+        }
+        assert_eq!(
+            decode_document_parts(&bytes(DOCUMENT_REF), Precision::F64).unwrap(),
+            (DocVector::Location(42), document().1)
+        );
     }
 
     /// No input makes a decoder panic: random bytes, and every golden record
@@ -635,6 +779,9 @@ mod golden {
             LOCATION_F32,
             DOCUMENT_F64,
             DOCUMENT_F32,
+            PLAIN_LOCATION_F64,
+            PLAIN_LOCATION_F32,
+            DOCUMENT_REF,
             LEGACY_LOCATION_F64,
             LEGACY_DOCUMENT_F64,
         ]
@@ -661,6 +808,7 @@ mod golden {
             for precision in [Precision::F64, Precision::F32] {
                 let _ = decode_location(&input, precision);
                 let _ = decode_document(&input, precision);
+                let _ = decode_document_parts(&input, precision);
                 let _ = format(&input);
             }
         }

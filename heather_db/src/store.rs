@@ -3,6 +3,7 @@ use std::path::Path;
 use heed::types::Bytes;
 use heed::{Database, Env, EnvFlags, EnvOpenOptions, FlagSetMode, RoTxn, RwTxn};
 
+pub use crate::codec::DocVector;
 use crate::config::Precision;
 use crate::error::{HeatherError, Result};
 use crate::location::{HardLocation, LocationId};
@@ -370,7 +371,20 @@ impl Store {
         for result in self.documents_db.prefix_iter(&rtxn, &prefix)? {
             let (key, value) = result?;
             let id = key_id(key);
-            let decoded = codec::decode_document(value, self.precision);
+            // A reference must point at a location of this collection.
+            let decoded = match codec::decode_document_parts(value, self.precision) {
+                Ok((DocVector::Location(at), _))
+                    if self
+                        .locations_db
+                        .get(&rtxn, &location_key(collection_id, at))?
+                        .is_none() =>
+                {
+                    Err(HeatherError::Corrupt(format!(
+                        "refers to location {at}, which does not exist"
+                    )))
+                }
+                other => other,
+            };
             count(
                 &mut report.documents,
                 &mut report.problems,
@@ -424,10 +438,24 @@ impl Store {
         ))
     }
 
+    /// A document whose vector is its location's address (a plain
+    /// collection's write): stored as a reference to the location and the
+    /// metadata, without a third copy of the vector.
+    pub fn encode_document_ref(&self, location_id: u64, metadata: &[u8]) -> Vec<u8> {
+        crate::codec::encode_document_ref(location_id, metadata, self.precision)
+    }
+
     /// The vector and metadata of a stored document. A value that does not
-    /// decode is [`HeatherError::Corrupt`].
+    /// decode is [`HeatherError::Corrupt`]. A document stored by reference
+    /// ([`Self::encode_document_ref`]) has no vector of its own: resolve it
+    /// with [`Self::decode_document_parts`] instead.
     pub fn decode_document(&self, bytes: &[u8]) -> Result<(Vec<f64>, Vec<u8>)> {
         crate::codec::decode_document(bytes, self.precision)
+    }
+
+    /// A stored document's vector, inline or by reference, and its metadata.
+    pub fn decode_document_parts(&self, bytes: &[u8]) -> Result<(DocVector, Vec<u8>)> {
+        crate::codec::decode_document_parts(bytes, self.precision)
     }
 
     // --- Metadata operations (collection-scoped) ---
