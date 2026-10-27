@@ -52,7 +52,15 @@ becomes the first location.
 
 ### Update
 
-One pass over the activated set does two things at once.
+Whether the write joins or spawns is decided first: it joins when its best
+match is at least `tau_split`, and spawns otherwise (see the novelty split
+below). Only a joining write updates existing locations. A spawning write
+touches none of them — the activation weights are relative to the best match,
+so when nothing is close they are not small, and accumulating a novel input
+into its nearest locations would write it into memories it has nothing to do
+with.
+
+For a joining write, one pass over the activated set does two things at once.
 
 **Counter accumulation.** Each activated location adds `wⱼ · counter` to its
 counter and `wⱼ` to its write count. Content is superposed, not appended; this
@@ -74,19 +82,19 @@ move at 10% of that. The global learning rate decays multiplicatively by
 Topology maintenance, which is where the location count actually changes.
 
 **Novelty split.** If the best match was worse than `tau_split`, nothing in the
-memory covers this input, so a new location is spawned from it. It inherits the
-activated set as its initial neighbours.
+memory covers this input, so a new location is spawned from it and nothing else
+changes. It inherits the activated set as its initial neighbours.
 
-**Overload split.** If the winner's write count has passed `tau_overload`, it is
-saturated: a perturbed copy is spawned, and the parent's counter and write
-count are halved between the two. The default `tau_overload` is `max(d/32, 8)`,
-which tracks the measured per-read capacity wall — a location splits *as* it
-reaches the wall rather than well past it.
+**Overload split.** If the write joined and the winner's write count has passed
+`tau_overload`, it is saturated: a perturbed copy is spawned, and the parent's
+counter and write count are halved between the two. The default `tau_overload`
+is `max(d/32, 8)`, which tracks the measured per-read capacity wall — a location
+splits *as* it reaches the wall rather than well past it.
 
-**Local dedup.** If both splits fired and produced near-identical children, they
-are merged. Children are never merged back into existing locations: overload
-children are deliberately near their parent, and novelty children are far from
-everything.
+A write therefore adds at most one location: a novelty child when it spawns, an
+overload child when it joins a saturated winner. Children are never merged back
+into existing locations: overload children are deliberately near their parent,
+and novelty children are far from everything.
 
 ### The MDL gate
 
