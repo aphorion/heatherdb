@@ -2902,7 +2902,9 @@ mod tests {
 
         let mut config = EAMConfig::new(d).unwrap();
         config.l_0 = 8;
-        config.k = 8;
+        // 8 seeds + 4 documents, each document novel enough to spawn its own
+        // location: 12 locations, all of them activated.
+        config.k = 16;
         let col = Collection::new(col_id, "bids".into(), store, &config).unwrap();
 
         let mut rng = rand::thread_rng();
