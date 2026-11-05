@@ -36,7 +36,7 @@ rayon = "1"
 # Auth — argon2id for password hashing (modern PHC-format hashes), base64
 # for parsing HTTP Basic credentials, rand for password generation.
 argon2 = "0.5"
-base64 = "0.22"
+base64 = "0.23"
 rand = "0.8"
 # Backup / restore / snapshot subcommands.
 tar = "0.4"
