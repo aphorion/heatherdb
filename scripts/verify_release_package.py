@@ -77,7 +77,7 @@ def main():
     args = parser.parse_args()
     assert bool(args.archive) != bool(args.binary), 'Choose --archive or --binary'
     with tempfile.TemporaryDirectory(prefix='heather-package-') as temp:
-        root = Path(temp)
+        root = Path(temp).resolve()
         if args.archive:
             archive = args.archive.resolve()
             target = root / 'unpacked'
