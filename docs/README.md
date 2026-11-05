@@ -11,6 +11,10 @@ back up. Those pages are about this software.
 
 If you only read one page, read [Getting started](getting-started.md).
 
+The [1.0 release contract](reference/v1-release-contract.md) defines the
+stable surface and acceptance requirements. The [release audit](releases/v1-audit.md)
+records the checks, evidence and remaining release conditions.
+
 ## Start here
 
 - **[Getting started](getting-started.md)** — install the engine on macOS,

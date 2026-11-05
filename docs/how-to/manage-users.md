@@ -122,8 +122,9 @@ Things to know:
 - **Minting requires Basic auth.** A bearer-authenticated caller gets `403`, so
   a token cannot renew itself without paying Argon2 again.
 - **The TTL is one hour** and is not configurable.
-- **The scope is frozen at mint time.** Changing a user's scope afterwards does
-  not affect tokens already issued — revoke them, or wait for expiry.
+- **User changes invalidate existing tokens.** Deleting a user, rotating its
+  password or changing its scope takes effect on the next bearer request.
+  Mint a new token after a credential or scope change.
 - **Tokens are 32 random bytes, base64url-encoded.** Treat them like passwords:
   do not log them, do not share one across clients.
 - Tokens survive a restart. Expired ones are swept at boot and every 5 minutes.

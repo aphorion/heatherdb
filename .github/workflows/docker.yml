@@ -58,9 +58,15 @@ env:
   DOCKERHUB_IMAGE: aphorion/heatherdb
 
 jobs:
+  validate:
+    uses: ./.github/workflows/release-checks.yml
+    with:
+      version: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+
   # ─── cross-compile the `heather` binary natively per arch ──────────────────
   # No QEMU here: `cross` uses real cross-compilers, same as release.yml.
   build-binaries:
+    needs: validate
     name: cross-build (${{ matrix.arch }})
     runs-on: ubuntu-latest
     strategy:

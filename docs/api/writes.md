@@ -49,6 +49,10 @@ transaction; the response carries the assigned ids:
 | `413 Payload Too Large` | body over `--max-body-size` (default 2 MiB) |
 | `500 Internal Server Error` | the collection could not be opened, or a storage failure |
 
+A rejected write does not leave partial learned state visible. Storage failures
+return `500`; invalid input returns `400`. A disconnected or timed-out client
+must treat the outcome as unknown and must not assume an automatic rollback.
+
 ### POST /db/{db}/collections/{name}/bulk_load
 
 Replace a collection's hard locations atomically with a caller-supplied set.

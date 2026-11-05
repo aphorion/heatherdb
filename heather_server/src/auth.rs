@@ -115,7 +115,16 @@ pub async fn middleware(State(auth): State<AuthState>, req: Request<Body>, next:
         Some(h) if h.starts_with("Bearer ") => {
             let tok = h["Bearer ".len()..].trim().to_string();
             match auth.tokens.as_ref().and_then(|t| t.verify(&tok)) {
-                Some((u, _exp)) => (u, AuthKind::Bearer, Some(tok)),
+                Some((issued, _exp)) => match auth.users.get(&issued.name) {
+                    Some(current)
+                        if current.password_hash == issued.password_hash
+                            && current.created_at == issued.created_at
+                            && current.scope == issued.scope =>
+                    {
+                        (current, AuthKind::Bearer, Some(tok))
+                    }
+                    _ => return deny_401("bearer token user was deleted or credentials changed"),
+                },
                 None => return deny_401("invalid or expired bearer token"),
             }
         }

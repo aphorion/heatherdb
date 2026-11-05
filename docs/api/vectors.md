@@ -1,5 +1,7 @@
 # Vector endpoints
 
+Experimental in 1.0. See the [stability boundary](overview.md#10-stability-boundary).
+
 Stateless vector math: no collection, no database, no persistence. These are
 the only routes with no `/db/{db}` mirror, because they never touch storage.
 

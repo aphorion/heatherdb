@@ -15,9 +15,8 @@
 //! string. They're indistinguishable from random; treat them like
 //! passwords (don't log them, don't share them across clients).
 //!
-//! A token's scope is whatever the minting user had at mint time. If
-//! the user's scope is later changed in the user store, **already-issued
-//! tokens keep the old scope** until they expire or are revoked.
+//! Middleware resolves the current user on every bearer request. Deleting the
+//! user or changing its password or scope invalidates its issued tokens.
 
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -43,14 +43,52 @@ pub const DEFAULT_DB: &str = "default";
 const SERVER_TAG: &str = "server.toml";
 
 /// The data-dir layout this engine build reads and writes. `Server::open`
-/// refuses any other value (pre-1.0 policy: back up and recreate, no
-/// migration shims).
+/// refuses any other value. 1.0 establishes a fresh baseline; future changes
+/// require an explicit compatibility or upgrade procedure.
 const SUPPORTED_LAYOUT: &str = "v0.2";
 
 /// Advisory lock file held (flock-exclusive) for the lifetime of an open
 /// `Server`. Cold backup/restore tooling takes the same lock to refuse
 /// running against a live engine.
 const ENGINE_LOCK: &str = "engine.lock";
+
+#[cfg(test)]
+mod default_restore_tests {
+    use super::*;
+
+    #[test]
+    fn named_database_only_root_gets_a_default_database() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let server = Server::open(dir.path(), 64).unwrap();
+            server
+                .create_database(DbConfig::new("restored", 64).unwrap())
+                .unwrap();
+        }
+        // A per-database snapshot restored into a clean root has this shape.
+        std::fs::remove_dir_all(dir.path().join("db/default")).unwrap();
+        let server = Server::open(dir.path(), 64).unwrap();
+        assert!(server.database("restored").is_some());
+        assert!(server.database(DEFAULT_DB).is_some());
+    }
+
+    #[test]
+    fn refused_default_format_is_not_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _server = Server::open(dir.path(), 64).unwrap();
+        }
+        let file = dir.path().join("db/default/db.toml");
+        let mut cfg = DbConfig::load(&file).unwrap();
+        cfg.format_version = u32::MAX;
+        cfg.save(&file).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        let server = Server::open(dir.path(), 64).unwrap();
+        assert!(server.database(DEFAULT_DB).is_none());
+        assert!(server.refused(DEFAULT_DB).is_some());
+        assert_eq!(before, std::fs::read(file).unwrap());
+    }
+}
 
 /// Try to acquire the exclusive engine lock for a data dir. Returns the
 /// held lock file on success (the lock releases when the file drops) or
@@ -230,13 +268,16 @@ impl Server {
                 .insert(name, Arc::new(hive));
         }
 
-        // If nothing exists yet, lazily create `default` so the legacy
-        // /collections/... routes work out of the box.
+        // A named-database snapshot may be restored into an otherwise empty
+        // root. The HTTP server still needs `default` for its legacy aliases.
+        // Never replace an existing default database refused for its format.
         let needs_default = server
             .inner
             .read()
             .map_err(|_| HeatherError::LockPoisoned)?
-            .is_empty();
+            .get(DEFAULT_DB)
+            .is_none()
+            && server.refused(DEFAULT_DB).is_none();
         if needs_default {
             let mut cfg = DbConfig::new(DEFAULT_DB, default_dimension)?;
             cfg.eam.l_0 = default_l_0;

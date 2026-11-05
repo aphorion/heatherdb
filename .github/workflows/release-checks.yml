@@ -1,0 +1,66 @@
+name: Release checks
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-checks
+      - name: Check package versions
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          cargo metadata --no-deps --format-version 1 > /tmp/metadata.json
+          python3 - <<'PY'
+          import json, os
+          packages = json.load(open('/tmp/metadata.json'))['packages']
+          versions = {p['version'] for p in packages if p['name'] in ('heather_db', 'heather_server', 'heather_algebra')}
+          assert len(versions) == 1, versions
+          requested = os.environ['RELEASE_VERSION'].removeprefix('v')
+          if requested:
+              assert versions == {requested}, (versions, requested)
+          PY
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - run: cargo test --workspace --release --locked --no-fail-fast
+      - run: cargo build --release --locked -p heather_server
+      - name: Black-box release acceptance
+        run: python3 scripts/release_acceptance.py --binary target/release/heather --output /tmp/release-acceptance.json
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --document-private-items --locked
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Dependency advisory gate
+        # The retained bincode maintenance notice is documented in the audit;
+        # known vulnerability entries still cause cargo-audit to fail.
+        run: cargo audit
+      - name: Check binary version
+        run: |
+          python3 - <<'PY'
+          import json, subprocess
+          version = next(p['version'] for p in json.load(open('/tmp/metadata.json'))['packages'] if p['name'] == 'heather_server')
+          assert subprocess.check_output(['target/release/heather', '--version'], text=True).strip() == f'heather {version}'
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-acceptance-${{ github.run_id }}
+          path: /tmp/release-acceptance.json

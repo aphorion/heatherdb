@@ -1,5 +1,7 @@
 # Dream endpoint
 
+Experimental in 1.0. See the [stability boundary](overview.md#10-stability-boundary).
+
 On-demand consolidation. One route, and no legacy form — dreaming is
 addressed by database only. See [Dreaming](../explanation/dreaming.md).
 

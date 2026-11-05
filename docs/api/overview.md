@@ -122,3 +122,11 @@ computation. Three caps bound the *result*; `0` disables one
 | Batch queries | `--max-batch-queries` / `HEATHER_MAX_BATCH_QUERIES` | 1 000 | `batch_analyze` |
 
 See [Configuration](../reference/configuration.md) for every knob.
+
+## 1.0 stability boundary
+
+Database operations, collection writes and reads, explicit-temperature attention,
+document APIs, authentication and operational endpoints are covered by the
+[1.0 release contract](../reference/v1-release-contract.md). Algebra and stateless
+vector algebra, automatic attention calibration, and dreaming are experimental.
+Experimental response semantics are outside the 1.x compatibility promise.

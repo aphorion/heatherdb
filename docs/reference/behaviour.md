@@ -4,7 +4,9 @@ Behaviour a caller must know before it bites. The **Loud?** column is the one
 to read first: a loud behaviour returns a status code you can branch on, a
 silent one returns `200` and a plausible-looking result.
 
-`file:line` references are into this repository at `heather_server` 0.3.0.
+Historical `file:line` references identify the implementation areas; line
+numbers may shift. The [1.0 release contract](v1-release-contract.md) defines
+the stable guarantees.
 
 ## Silent — returns 200, does the wrong thing
 
@@ -42,9 +44,18 @@ silent one returns `200` and a plausible-looking result.
 
 | Behaviour | Notes | Source |
 |---|---|---|
-| A session token's scope is frozen at mint. Changing the user's scope in the user store leaves already-issued tokens on the old scope until they expire or are revoked | Revoke explicitly after any scope change | `tokens.rs:18-20` |
+| Deleting a user, changing its password or changing its scope invalidates existing bearer tokens on the next request | Mint a new token using the current credentials | `auth.rs`, `users.rs` |
 | `analyze` reports cosines in `similarity`; `attention` reports raw dot products `Q·Kᵢ` in the same field name | Do not compare the two, and do not threshold one with a constant tuned on the other | `models.rs:109-117` |
 | A read returns a *reconstruction*, which may be a vector nobody ever wrote | This is not a nearest-neighbour index. Fetch documents by id if you need the exact stored bytes | `explanation/associative-memory.md` |
+
+## Failed transactions
+
+A failed write returns an error. Before another operation can observe the
+collection, its cache is restored from committed storage. If that recovery
+also fails, collection operations fail closed until the storage is repaired
+and the engine restarted. Storage failures on the HTTP write route return
+`500`; invalid input returns `400`. A client timeout is an unknown outcome,
+not a rollback acknowledgement.
 
 ## Related
 

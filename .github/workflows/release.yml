@@ -72,9 +72,15 @@ jobs:
           fi
 
   # ─── build matrix: linux (cross) + macOS/Windows (native) ──────────────────
+  validate:
+    needs: prep
+    uses: ./.github/workflows/release-checks.yml
+    with:
+      version: ${{ needs.prep.outputs.version }}
+
   build:
     name: ${{ matrix.label }}
-    needs: prep
+    needs: [prep, validate]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rayon::prelude::*;
 use realfft::num_complex::Complex;
@@ -243,6 +244,8 @@ pub enum ReadStrategy {
 }
 
 pub(crate) struct EAMInner {
+    /// False if recovery from a failed mutation could not read the store.
+    valid: bool,
     pub(crate) config: EAMConfig,
     pub(crate) locations: Vec<HardLocation>,
     pub(crate) next_id: u64,
@@ -382,6 +385,64 @@ pub struct Collection {
     store: Arc<Store>,
 }
 
+/// Hold the collection lock through persistence and recovery. Successful writes
+/// do not copy the collection. An error reloads the last committed state before
+/// releasing the lock; if storage cannot be read, later operations fail closed.
+struct AtomicMutation<'a> {
+    collection: &'a Collection,
+    inner: RwLockWriteGuard<'a, EAMInner>,
+    committed: bool,
+    dirty: bool,
+}
+
+impl AtomicMutation<'_> {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Deref for AtomicMutation<'_> {
+    type Target = EAMInner;
+    fn deref(&self) -> &EAMInner {
+        &self.inner
+    }
+}
+
+impl DerefMut for AtomicMutation<'_> {
+    fn deref_mut(&mut self) -> &mut EAMInner {
+        self.dirty = true;
+        &mut self.inner
+    }
+}
+
+impl Drop for AtomicMutation<'_> {
+    fn drop(&mut self) {
+        if self.committed || !self.dirty {
+            return;
+        }
+        let version = self.inner.version;
+        let recovered = Collection::load(
+            self.collection.collection_id,
+            self.collection.name.clone(),
+            self.collection.store.clone(),
+            &self.inner.config,
+        )
+        .and_then(|loaded| {
+            loaded
+                .inner
+                .into_inner()
+                .map_err(|_| HeatherError::LockPoisoned)
+        });
+        match recovered {
+            Ok(mut restored) => {
+                restored.version = version;
+                *self.inner = restored;
+            }
+            Err(_) => self.inner.valid = false,
+        }
+    }
+}
+
 /// How many times more locations a document query draws candidates from
 /// than a read activates. At 1, about 16% of documents could not be found by
 /// their own vector once writes used the neighbour graph; at 2 none could not
@@ -407,6 +468,35 @@ fn plain_location(
 }
 
 impl Collection {
+    fn read_inner(&self) -> Result<RwLockReadGuard<'_, EAMInner>> {
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        if !inner.valid {
+            return Err(HeatherError::Storage(
+                "collection recovery failed; restart after repairing storage".into(),
+            ));
+        }
+        Ok(inner)
+    }
+
+    fn write_inner(&self) -> Result<RwLockWriteGuard<'_, EAMInner>> {
+        let inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        if !inner.valid {
+            return Err(HeatherError::Storage(
+                "collection recovery failed; restart after repairing storage".into(),
+            ));
+        }
+        Ok(inner)
+    }
+
+    fn atomic_mutation(&self) -> Result<AtomicMutation<'_>> {
+        Ok(AtomicMutation {
+            collection: self,
+            inner: self.write_inner()?,
+            committed: false,
+            dirty: false,
+        })
+    }
+
     /// Create a new collection, initializing with L_0 random locations.
     pub fn new(
         collection_id: u32,
@@ -459,6 +549,7 @@ impl Collection {
             collection_id,
             name,
             inner: RwLock::new(EAMInner {
+                valid: true,
                 config: config.clone(),
                 locations,
                 next_id,
@@ -527,6 +618,7 @@ impl Collection {
             collection_id,
             name,
             inner: RwLock::new(EAMInner {
+                valid: true,
                 config: config.clone(),
                 locations,
                 next_id,
@@ -556,8 +648,7 @@ impl Collection {
     pub fn write(&self, input: &[f64]) -> Result<()> {
         vec_ops::validate_vector(input)?;
 
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
-        inner.version += 1;
+        let mut inner = self.atomic_mutation()?;
 
         if input.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -565,6 +656,8 @@ impl Collection {
                 got: input.len(),
             });
         }
+
+        inner.version += 1;
 
         // No EmptyMemory guard: a data-seeded index (l_0 == 0) starts empty and
         // is seeded by the first write (adaptive_write cold-start).
@@ -632,6 +725,7 @@ impl Collection {
             inner.append_addresses(start);
         }
 
+        inner.commit();
         Ok(())
     }
 
@@ -648,7 +742,7 @@ impl Collection {
         vec_ops::validate_vector(address)?;
         vec_ops::validate_vector(counter)?;
 
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut inner = self.atomic_mutation()?;
 
         if address.len() != inner.config.d || counter.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -660,6 +754,8 @@ impl Collection {
                 },
             });
         }
+
+        inner.version += 1;
 
         let mut rng = rand::thread_rng();
         let result = {
@@ -719,6 +815,7 @@ impl Collection {
             inner.append_addresses(start);
         }
 
+        inner.commit();
         Ok(())
     }
 
@@ -728,8 +825,7 @@ impl Collection {
             vec_ops::validate_vector(input.as_ref())?;
         }
 
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
-        inner.version += 1;
+        let mut inner = self.atomic_mutation()?;
 
         // No EmptyMemory guard: data-seeded index is seeded by the first write.
 
@@ -742,6 +838,8 @@ impl Collection {
                 });
             }
         }
+
+        inner.version += 1;
 
         let mut rng = rand::thread_rng();
         let mut all_modified = std::collections::HashSet::new();
@@ -820,6 +918,7 @@ impl Collection {
 
         txn.commit()?;
 
+        inner.commit();
         Ok(())
     }
 
@@ -828,7 +927,7 @@ impl Collection {
     pub fn read(&self, query: &[f64], strategy: ReadStrategy) -> Result<Vec<f64>> {
         vec_ops::validate_vector(query)?;
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         if query.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -917,7 +1016,7 @@ impl Collection {
     ) -> Result<AttentionTrace> {
         vec_ops::validate_vector(query)?;
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         Self::check_query(&inner, query)?;
 
@@ -943,7 +1042,7 @@ impl Collection {
         barred: &[usize],
     ) -> Result<AttentionTrace> {
         vec_ops::validate_vector(query)?;
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Self::check_query(&inner, query)?;
 
         let barred: std::collections::HashSet<usize> = barred.iter().copied().collect();
@@ -1091,7 +1190,7 @@ impl Collection {
             )));
         }
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         queries
             .par_iter()
@@ -1110,7 +1209,7 @@ impl Collection {
     /// [`read_attention_traced`](Self::read_attention_traced)'s activation.
     pub fn top_location(&self, query: &[f64]) -> Result<usize> {
         vec_ops::validate_vector(query)?;
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Self::check_query(&inner, query)?;
         Self::top_location_locked(&inner, query)
     }
@@ -1121,7 +1220,7 @@ impl Collection {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         queries
             .par_iter()
             .map(|query| {
@@ -1156,7 +1255,7 @@ impl Collection {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         queries
             .par_iter()
             .map(|query| {
@@ -1181,7 +1280,7 @@ impl Collection {
     /// Returns `(β*, DL*)`. The neighbour lists are β-independent, so the sweep
     /// computes them once.
     pub fn calibrate_beta(&self, betas: &[f64]) -> Result<(f64, f64)> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         let n = inner.locations.len();
         if n < 2 {
             return Ok((inner.config.beta, 0.0));
@@ -1263,7 +1362,7 @@ impl Collection {
     pub fn read_attention_mdl_traced(&self, query: &[f64]) -> Result<(AttentionTrace, f64)> {
         vec_ops::validate_vector(query)?;
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         if query.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -1336,7 +1435,7 @@ impl Collection {
     /// Run KNN merge to consolidate similar locations.
     /// Migrates document index posting lists from removed locations to survivors.
     pub fn merge(&self) -> Result<usize> {
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut inner = self.atomic_mutation()?;
         self.materialize_document_refs(&inner)?;
         inner.version += 1;
         let EAMInner {
@@ -1386,6 +1485,7 @@ impl Collection {
             inner.rebuild_graph_cache();
         }
 
+        inner.commit();
         Ok(result.merge_count)
     }
 
@@ -1394,7 +1494,7 @@ impl Collection {
     /// encode each of the W writes as which location it selects (the data). This is
     /// the engine's native entropy readout; compression lowers it.
     pub fn description_length(&self, kappa: f64) -> Result<f64> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         let l = inner.locations.len().max(1) as f64;
         let w: f64 = inner
             .locations
@@ -1411,7 +1511,7 @@ impl Collection {
     /// auto-calibrates how many locations its data actually warrants. Compression is
     /// the native objective; the location count is the emergent result.
     pub fn compress(&self, kappa: f64, lambda: f64) -> Result<CompressResult> {
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut inner = self.atomic_mutation()?;
         self.materialize_document_refs(&inner)?;
         let w: f64 = inner
             .locations
@@ -1516,6 +1616,7 @@ impl Collection {
             inner.rebuild_graph_cache();
         }
 
+        inner.commit();
         Ok(CompressResult {
             locations_before,
             locations_after,
@@ -1527,7 +1628,7 @@ impl Collection {
 
     /// Flush all locations to persistent storage.
     pub fn flush(&self) -> Result<()> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         let mut txn = self.store.write_txn()?;
         for loc in &inner.locations {
@@ -1555,8 +1656,7 @@ impl Collection {
     pub fn write_with_metadata(&self, input: &[f64], metadata: &[u8]) -> Result<u64> {
         vec_ops::validate_vector(input)?;
 
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
-        inner.version += 1;
+        let mut inner = self.atomic_mutation()?;
 
         if input.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -1564,6 +1664,8 @@ impl Collection {
                 got: input.len(),
             });
         }
+
+        inner.version += 1;
 
         // No EmptyMemory guard: a data-seeded index (l_0 == 0) starts empty and
         // is seeded by the first write (adaptive_write cold-start).
@@ -1674,6 +1776,7 @@ impl Collection {
             inner.append_addresses(start);
         }
 
+        inner.commit();
         Ok(doc_id)
     }
 
@@ -1687,8 +1790,8 @@ impl Collection {
     /// list is rewritten once with all of its new documents, and the whole
     /// request commits once instead of once per vector.
     ///
-    /// As with [`Self::write_batch`], in-memory state is updated before the
-    /// commit; a failed commit leaves it ahead of the store until reload.
+    /// A failed transaction restores the last committed state while holding
+    /// the collection lock, before another reader or writer can observe it.
     pub fn write_batch_with_metadata(
         &self,
         items: &[(impl AsRef<[f64]>, impl AsRef<[u8]>)],
@@ -1697,7 +1800,7 @@ impl Collection {
             vec_ops::validate_vector(input.as_ref())?;
         }
 
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut inner = self.atomic_mutation()?;
 
         let d = inner.config.d;
         for (input, _) in items {
@@ -1827,6 +1930,7 @@ impl Collection {
 
         txn.commit()?;
 
+        inner.commit();
         Ok(documents.into_iter().map(|(id, _)| id).collect())
     }
 
@@ -1834,7 +1938,7 @@ impl Collection {
     pub fn get_document(&self, write_index: u64) -> Result<Option<(Vec<f64>, Vec<u8>)>> {
         match self.store.get_document(self.collection_id, write_index)? {
             Some(data) => {
-                let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+                let inner = self.read_inner()?;
                 Ok(Some(self.resolve_document(&inner, &data)?))
             }
             None => Ok(None),
@@ -1885,7 +1989,7 @@ impl Collection {
 
     /// The ids of this collection's hard locations, in storage order.
     pub fn location_ids(&self) -> Result<Vec<u64>> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Ok(inner.locations.iter().map(|l| l.id.0).collect())
     }
 
@@ -1914,7 +2018,7 @@ impl Collection {
     /// that may need to be destroyed, so the unit of erasure is one the
     /// substrate can actually drop.
     pub fn delete_document(&self, write_index: u64) -> Result<bool> {
-        let _guard = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let _guard = self.write_inner()?;
         let mut txn = self.store.write_txn()?;
         let existed =
             self.store
@@ -1946,7 +2050,7 @@ impl Collection {
     }
 
     fn decode_all(&self, raw: Vec<(u64, Vec<u8>)>) -> Result<(Vec<DocumentRecord>, usize)> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         let mut docs = Vec::with_capacity(raw.len());
         let mut skipped = 0;
         for (id, data) in raw {
@@ -2009,7 +2113,7 @@ impl Collection {
             }
         }
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         if query.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -2142,7 +2246,7 @@ impl Collection {
     ) -> Result<MultiRoleResults> {
         vec_ops::validate_vector(query)?;
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         let d = inner.config.d;
 
         if query.len() != d {
@@ -2296,7 +2400,7 @@ impl Collection {
 
     /// Get current collection statistics.
     pub fn stats(&self) -> Result<EAMStats> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         let total_writes: f64 = inner.locations.iter().map(|l| l.write_count).sum();
         let max_write_count = inner
             .locations
@@ -2340,7 +2444,7 @@ impl Collection {
 
     /// Get summary of all hard locations for UI display.
     pub fn locations_summary(&self) -> Result<Vec<LocationSummary>> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Ok(inner
             .locations
             .iter()
@@ -2370,7 +2474,7 @@ impl Collection {
     ///
     /// Returns None if no writes have occurred.
     pub fn fingerprint(&self) -> Result<Option<Vec<f64>>> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         let total_writes: f64 = inner.locations.iter().map(|l| l.write_count).sum();
         if total_writes < 1e-10 {
@@ -2404,21 +2508,21 @@ impl Collection {
     /// Extract an in-memory snapshot of this collection's EAM state.
     /// The snapshot is fully decoupled from persistence.
     pub fn snapshot(&self) -> Result<(Vec<HardLocation>, EAMConfig)> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Ok((inner.locations.clone(), inner.config.clone()))
     }
 
     /// Like [`snapshot`](Self::snapshot), but also returns the mutation
     /// version, for handing to [`load_snapshot_checked`](Self::load_snapshot_checked).
     pub fn snapshot_versioned(&self) -> Result<(Vec<HardLocation>, EAMConfig, u64)> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Ok((inner.locations.clone(), inner.config.clone(), inner.version))
     }
 
     /// Current mutation version. Bumped on every write-locked mutation
     /// (write, merge, load_snapshot). In-process only — resets on load.
     pub fn version(&self) -> Result<u64> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Ok(inner.version)
     }
 
@@ -2459,7 +2563,7 @@ impl Collection {
             .map(|m| m + 1)
             .unwrap_or(0);
 
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut inner = self.atomic_mutation()?;
         if let Some(expected) = expected_version
             && inner.version != expected
         {
@@ -2504,6 +2608,7 @@ impl Collection {
         inner.next_id = next_id;
         inner.rebuild_graph_cache();
 
+        inner.commit();
         Ok(())
     }
 
@@ -2511,7 +2616,7 @@ impl Collection {
     /// Uses graph-accelerated activation when available.
     pub fn analyze_read(&self, query: &[f64], strategy: ReadStrategy) -> Result<ReadTrace> {
         vec_ops::validate_vector(query)?;
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         if query.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -2618,6 +2723,73 @@ impl Collection {
                 })
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod transaction_recovery_tests {
+    use super::*;
+    use crate::Hive;
+
+    #[test]
+    fn failed_metadata_writes_restore_memory_and_document_ids() {
+        for competitive in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = EAMConfig::new(64).unwrap();
+            config.competitive = competitive;
+            let hive = Hive::open(dir.path(), config, 1).unwrap();
+            let col = hive.get_or_create_collection("rollback").unwrap();
+            let vector = vec![0.125; 64];
+            assert_eq!(col.write_with_metadata(&vector, b"{}").unwrap(), 0);
+            let before = col.snapshot().unwrap().0;
+            let eta = col.stats().unwrap().current_eta;
+            let huge = vec![b'x'; 2 * 1024 * 1024];
+            assert!(col.write_with_metadata(&vector, &huge).is_err());
+            assert!(col.write_batch_with_metadata(&[(&vector, &huge)]).is_err());
+            let after = col.snapshot().unwrap().0;
+            assert_eq!(before.len(), after.len());
+            for (old, new) in before.iter().zip(after.iter()) {
+                assert_eq!(old.address, new.address);
+                assert_eq!(old.counter, new.counter);
+                assert_eq!(old.write_count, new.write_count);
+            }
+            assert_eq!(eta, col.stats().unwrap().current_eta);
+            assert_eq!(col.write_with_metadata(&vector, b"{}").unwrap(), 1);
+            assert!(col.get_document(1).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn vector_write_variants_restore_state_after_map_full() {
+        for variant in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = EAMConfig::new(131_072).unwrap();
+            config.competitive = false;
+            let hive = Hive::open(dir.path(), config, 1).unwrap();
+            let col = hive.get_or_create_collection("rollback").unwrap();
+            let mut vector = vec![0.0; 131_072];
+            vector[0] = 1.0;
+            let error = match variant {
+                0 => col.write(&vector),
+                1 => col.write_two(&vector, &vector, write::WriteOpts::default()),
+                _ => col.write_batch(&[&vector]),
+            };
+            assert!(matches!(error, Err(HeatherError::Storage(_))));
+            assert_eq!(col.stats().unwrap().num_locations, 0);
+            assert_eq!(col.inner.read().unwrap().next_id, 0);
+        }
+    }
+
+    #[test]
+    fn unavailable_recovery_cache_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let hive = Hive::open(dir.path(), EAMConfig::new(8).unwrap(), 1).unwrap();
+        let col = hive.get_or_create_collection("unavailable").unwrap();
+        col.inner.write().unwrap().valid = false;
+        assert!(col.stats().is_err());
+        assert!(col.read(&[1.0; 8], ReadStrategy::HopfieldIter).is_err());
+        assert!(col.write(&[1.0; 8]).is_err());
+        assert!(col.flush().is_err());
     }
 }
 
