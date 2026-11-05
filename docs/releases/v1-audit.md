@@ -135,6 +135,26 @@ guarantee. A novel query still returns a reconstruction: automatic unknown-query
 rejection is not promised. Application-specific recall, occupancy and thresholds
 must be evaluated before adopting either mode.
 
+## Follow-up: competitive learning and discovery calibration
+
+The [competitive-learning evaluation](competitive-learning-evaluation.md)
+tests the intended learning task separately from the individual-pattern recall
+probe above. With unchanged production algorithms, five data seeds show
+improving held-out shared-pattern fidelity, adaptation after pattern drift and
+useful prototype proposals. Balanced fidelity reaches 0.9941 after 1,024
+observations versus 0.8009 for noisy input and 0.9582 for a count-matched
+reservoir. Native iterative reads confirm the effect on their held-out spot
+checks. Standard clustering remains competitive; these results do not establish
+a universal algorithmic advantage.
+
+The discovery calibration covers all planted groups in the tested streams,
+but default competitive proposals include mixed/redundant directions. Independent
+validation rejects the tested structure-free controls; this validation is an
+evaluation layer, not native automatic abstention. The report retains the
+tradeoff between adaptation and old-pattern retention, and does not claim a new
+scientific discovery. Protocol, per-seed results, comparisons and figure links
+are available in the follow-up report.
+
 ## Remaining publication conditions
 
 - Execute the release checks and supported-platform artifact builds in CI.
