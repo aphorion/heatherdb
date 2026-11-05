@@ -1,15 +1,17 @@
 # Choose a memory mode
 
-Choose the policy for what the memory should retain before creating a database.
-The mode applies to every collection in that database.
+Use competitive mode for an adaptive associative memory. Use plain mode when
+each supplied vector should remain a separate, unchanged location. Both modes
+support associative recall; they differ in how writes represent observations.
+The mode applies to every collection in a database.
 
-| Your task | Mode | What a write does |
+| Your requirement | Setting or API | Behaviour |
 |---|---|---|
-| Learn shared patterns from repeated, noisy observations | `competitive: true` (default) | Updates a shared, adaptive representation |
-| Adapt to changing patterns | `competitive: true` | Learns from new observations; earlier patterns may gradually lose influence |
-| Generate candidates for discovering structure | `competitive: true` | Learns patterns to investigate; candidates still need independent validation |
-| Recall individual observations from partial cues | `competitive: false` | Appends each supplied vector as its own location; use attention for associative recall |
-| Keep original evidence alongside adaptive knowledge | Separate databases using both modes | Preserves observations separately from the representation learned from them |
+| Complete patterns from partial cues and learn shared structure | `competitive: true` (default) | Novel patterns receive their own locations; joining writes update shared counters and addresses |
+| Adapt a representation as patterns change | `competitive: true` | Repeated observations update learned content; measure adaptation and retention together |
+| Keep every vector as a separate location | `competitive: false` | Writes append vectors without merging or address migration; attention can recall or combine them |
+| Fetch a document with known identity | Document API, either mode | ID lookup returns the document ID and metadata independently of associative reconstruction |
+| Generate structure-discovery candidates | `competitive: true` | Learned patterns supply candidates that require independent validation |
 
 ## Create an adaptive memory
 
@@ -19,13 +21,16 @@ curl -u admin:pw -X POST http://localhost:6380/db \
   -d '{"name":"knowledge","dimension":128,"eam":{"competitive":true}}'
 ```
 
-Use held-out examples to measure whether new writes improve the shared patterns
-needed by your application. Individual training-example reconstruction is a
-different objective: a useful learned pattern need not reproduce each sample.
-Measure adaptation and retention separately when the data changes. See
-[Learning and graceful forgetting](../explanation/learning-and-graceful-forgetting.md).
+A novel write allocates a location without accumulating its content into existing
+locations. A joining write updates the activated representation. This supports
+both recall of distinct patterns and learning from repeated, related examples.
 
-## Create a memory for individual observations
+Use partial-cue reconstruction to measure recall and independent held-out
+examples to measure shared-pattern learning. Choose read settings using those
+measurements. Competitive mode does not guarantee exact reconstruction of every
+observation, especially when related observations share a representation.
+
+## Create a memory with separate vector locations
 
 ```bash
 curl -u admin:pw -X POST http://localhost:6380/db \
@@ -33,26 +38,31 @@ curl -u admin:pw -X POST http://localhost:6380/db \
   -d '{"name":"episodes","dimension":128,"eam":{"competitive":false}}'
 ```
 
-Plain writes do not merge observations or migrate their addresses. They support
-similarity-based associative recall as well as retaining samples. An attention
-read still weights and blends locations: retention of a vector does not promise
-that every damaged cue will recover it exactly. Evaluate cue damage, interference
-and the attention scale on your own data.
+Plain mode preserves the supplied vectors as individual locations rather than
+learning a shared representation at write time. Attention still weights and
+blends locations: preserving a vector does not guarantee that every damaged cue
+will recover it exactly. Measure cue damage, occupancy and attention scale.
 
-For exact record identity, retain document IDs and metadata. HTTP document lookup
-returns the ID and metadata; do not treat an associative reconstruction as an
-original record or assume that HTTP lookup returns its vector.
+## Choose the result you need
 
-## Use both policies
+An associative read returns a reconstructed vector. It may match an individual
+pattern or represent shared structure; it is not a document identity.
 
-Keep raw episodes in a plain database and write the observations needed for
-learning into a separate competitive database. Record source IDs in your
-application so learned responses can be checked against preserved evidence.
-Neither mode promises unlimited capacity.
+Documents written with metadata retain document records independently of the
+learned locations. Use document IDs for exact ID/metadata lookup or
+`documents/query` for similarity-ranked document results. HTTP ID lookup returns
+the ID and metadata, not the vector. These APIs work with either write mode.
 
-`competitive` is selected at database creation, not per request. To change the
-policy, create another database and replay the source observations. Editing a
-setting cannot reconstruct samples already combined by competitive learning.
+Separate competitive and plain databases are useful when you want both adaptive
+vector locations and an independent non-adaptive vector memory. A second
+database is not required merely to retain document records. Neither policy
+promises unlimited capacity or automatic unknown-query rejection.
+
+`competitive` is selected at database creation, not per request. To choose a
+different representation, create a database and replay source observations.
+Changing a setting cannot reconstruct observations already combined in counters.
 Start with default learning settings; `k=1` is an experimental alternative, not
-a general recommendation. Changing `k` changes the writing neighbourhood as
-well as reads.
+a general recommendation. Changing `k` affects both writing and reading.
+
+See [Learning, recall and graceful forgetting](../explanation/learning-and-graceful-forgetting.md)
+for the measured behaviour and [Read endpoints](../api/reads.md) for read options.

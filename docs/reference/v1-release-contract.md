@@ -56,7 +56,7 @@ advantage over another database.
 | API-03 | Each successful read observes coherent collection state while other clients write. There is no promise of a multi-request transaction. | Concurrent mixed workload; collection-lock and transaction review. |
 | DUR-01 | Default synchronous commits acknowledge only after the storage commit succeeds. A process killed after an acknowledged write can restart and read that record. | Kill/restart acceptance test. Does not substitute for power-loss or filesystem certification. |
 | DUR-02 | Relaxed durability is explicit, observable and documented. It may lose data or corrupt storage after a system crash; switching back to synchronous mode flushes pending changes. Restart restores the documented synchronous default. | Toggle/flush/restart tests. |
-| MEM-01 | Competitive writes adapt memory; plain writes retain individual vectors. Reconstruction may blend memories and is distinct from document lookup. | Separate tests for both modes and both f64/f32 storage precision. |
+| MEM-01 | Both write modes support associative recall. Competitive writes learn adaptive locations; plain writes retain individual vector locations. Reconstruction may blend patterns and is distinct from document identity. | Separate tests for both modes and both f64/f32 storage precision. |
 | MEM-02 | Document deletion removes retrieval and attribution. It does not claim to subtract learned influence. Dimension and storage precision are fixed for an existing database. | Delete/reopen, dimension and configuration tests; documented limits. |
 | MEM-03 | Persisted learning configuration is honoured on reopen. Changes to defaults, normalization, temperature or learning behaviour are called out in release notes and evaluated before release. Exact cross-platform floating-point output is not promised. | Reopen/config tests and associative-quality results with explicit tolerances. |
 | SEC-01 | Authentication is enabled by default. Missing/wrong credentials fail; scoped users cannot access other databases or root management operations. User revocation is effective without restarting the server. | Black-box auth/scoping checks and unit tests. |
@@ -69,11 +69,12 @@ advantage over another database.
 
 ## Benchmark publication
 
-Individual-pattern recall uses plain writes (`competitive=false`) and an
-explicit attention temperature when that is the application requirement.
-Adaptive competitive memory must not be evaluated as if it promised an exact
-archive. Report both modes when comparing their reconstruction behaviour;
-neither mode provides automatic unknown-query rejection.
+Evaluate associative recall in both competitive and plain modes when relevant
+to the application. Competitive writes support pattern completion and adaptive
+shared representations; plain writes preserve each supplied vector as a separate
+location. Report cue damage, read strategy and temperature explicitly. Neither
+mode promises exact reconstruction of every observation or automatic unknown-query
+rejection. Evaluate shared-pattern learning separately on held-out examples.
 
 Record engine revision and source changes, CPU, RAM, OS, Rust version, build
 profile, dimension, learning mode, precision, durability, collection occupancy,

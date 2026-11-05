@@ -8,11 +8,12 @@ reconstruction. A language model still produces the language response; see
 
 ## Choose the retention policy
 
-Use competitive writes for evolving shared knowledge and graceful forgetting
-when facts change. Use plain writes with attention when individual observations
-should remain separately represented. When both matter, preserve episodes and
-source IDs in a plain database and learn shared knowledge in a separate
-competitive database. See [Choose a memory mode](choose-memory-mode.md).
+Use competitive mode for associative completion and evolving shared knowledge.
+Use plain mode when each vector should remain a separate location without
+adaptive updates. Document records written with metadata are retained with
+either mode; use their IDs for exact identity and attribution. Separate databases
+are useful when you need both adaptive and non-adaptive vector memories. See
+[Choose a memory mode](choose-memory-mode.md).
 
 ## The design
 

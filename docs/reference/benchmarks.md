@@ -1,62 +1,90 @@
-# Measured engine benchmarks
+# HeatherDB benchmarks
 
-The [HeatherDB benchmarks page](/heatherdb/benchmarks/) contains the measured results from 5 November 2026, including confidence intervals and the tested machine, engine revision and workloads.
+Measured source revision: `0e08be78b7164b3733f7d60654b73f6a1862ec08`. Binary: `heather 1.0.0`.
+The [benchmark page](/heatherdb/benchmarks/) presents native execution time,
+authenticated HTTP latency, associative recall and shared-pattern learning as
+separate measurements. These are 1.0.0 candidate results.
 
-This run uses the HeatherDB 1.0.0 candidate at audited revision `044324230f3027842350bbdd59f7e5beb98b6cde` on an Apple M4 with 16 GiB RAM, macOS 26.5.1 and Rust 1.97.1. The compiled engine source was unmodified.
+## Native execution time
 
-| Operation | 64 dimensions | 128 dimensions | 384 dimensions |
-|---|---|---|---|
-| Single write, mean | 5.35 ms | 5.30 ms | 5.73 ms |
-| Iterative read, mean | 13.65 µs | 34.00 µs | 122.34 µs |
+Apple M4, 16 GiB RAM, macOS 26.5.1, arm64, Rust 1.97.1; optimized Criterion
+bench profile, synchronous LMDB, f64 vectors and default competitive writes.
 
-At 128 dimensions, 100 vector writes took 15.02 ms in a batch versus 535.41 ms individually, approximately 35.7 times faster in this test. These are total times for 100 vectors, not per-vector latencies.
+| Dimensions | Iterative read mean | Single-write mean |
+|---|---|---|
+| 64 | 17.47 µs | 5.09 ms |
+| 128 | 32.39 µs | 5.23 ms |
+| 384 | 120.07 µs | 5.27 ms |
 
-## Raw evidence
+At 128 dimensions, 100 vectors take 12.46 ms in a batch and
+526.41 ms through individual writes: a
+42.3× ratio of sample means for this workload.
+The totals cover 100 vectors; they are not per-vector latencies.
 
-[Download the full run](/heatherdb/benchmarks/latest.json). It includes Criterion estimates, raw sample times and iteration counts, 95% confidence intervals for the mean, timestamps, hardware details, the engine commit, and SHA-256 hashes of benchmark and configuration source files.
+Each case has 20 Criterion samples, one-second warm-up and two-second target
+measurement, extended when necessary. Inputs are unseeded normalized normal
+vectors. Reads use 200 prefill writes and cycle through 100 queries. Single-write
+cases cycle through 1,000 vectors while the collection continues adapting.
+Batch cases create a collection with 200 prefill writes outside timing; the
+timed closure includes writes and scope teardown. Writes are vector-only;
+metadata-bearing writes are not timed here.
 
-Each case uses 20 Criterion samples, a one-second warm-up, and a two-second target measurement. Slow cases extend this target. Inputs are unseeded random normal vectors normalized to unit length. The read test pre-fills 200 vectors and cycles through 100 queries. The batch comparison pre-fills a new collection with 200 vectors per iteration, outside timing; the timed closure includes writes and scope teardown. Single-write tests repeatedly mutate one collection, cycling through 1,000 vectors.
+Confidence intervals describe uncertainty in the estimated mean, not request
+p95. Native timings exclude HTTP, authentication, JSON and embedding generation.
+These small workloads do not establish sustained throughput or scale limits.
 
-The current default configuration is data-seeded (`l_0=0`), `k=20`, `beta=5`, with at most ten read iterations. It differs from the older README timing configuration. These fresh results replace that historical summary on the website.
+## Authenticated HTTP
+
+64-dimensional plain memory, 32 vectors, synchronous durability, ten warm-ups
+and 100 sequential requests per authentication mode. Each urllib request opens
+a loopback connection; client JSON, transport, server work and authentication
+are included. Basic runs before Bearer on one developer machine.
+
+| Authentication | Mean round trip | Observed request p95 |
+|---|---|---|
+| Basic | 11.095 ms | 12.368 ms |
+| Bearer | 0.249 ms | 0.275 ms |
+
+These observed percentiles are not production guarantees or a concurrent-load
+comparison. [Native and HTTP evidence](../releases/current/v1-benchmarks.json)
+includes source hashes, the executable checksum, estimates and request samples.
+
+## Associative recall
+
+32 seeded random unit patterns, 64 dimensions and 25% coordinate erasure:
+
+| Write mode and readout | Mean cosine to original | Fraction ≥ 0.9 |
+|---|---|---|
+| Competitive, default β=5, iterative | 0.8844 | 59.375% |
+| Competitive, explicit β=50, iterative | 0.8977 | 65.625% |
+| Plain, attention scale=50 | 1.0000 | 100.000% |
+
+Both modes support associative recall. They differ in write representation;
+competitive mode can learn shared patterns, while plain mode keeps each vector
+as its own location. Neither promises exact reconstruction on arbitrary data.
+See the [fixture evidence](../releases/current/v1-acceptance.json) and
+[Choose a memory mode](../how-to/choose-memory-mode.md).
+
+## Shared-pattern learning
+
+The [learning evaluation](../releases/post-merge/competitive-learning-evaluation.md)
+uses independent held-out examples, five data seeds and explicit baselines.
+Default competitive held-out cosine is 0.9941 on its balanced 128-dimensional
+task; a same-count online k-means baseline scores 0.9968. This is a different
+measurement from reconstruction of a particular stored observation. It does
+not establish semantic reasoning, superiority to clustering or automatic
+unknown-query rejection.
 
 ## Reproduce
 
-Clone the [engine repository](https://github.com/aphorion/heatherdb), check out the revision above, then run:
+Check out the recorded revision, build the server and use disposable storage:
 
-```bash
-cargo bench --locked -p heather_db --bench read_latency -- 'read/dimension' --sample-size 20 --warm-up-time 1 --measurement-time 2
-cargo bench --locked -p heather_db --bench write_throughput -- 'write/single' --sample-size 20 --warm-up-time 1 --measurement-time 2
-cargo bench --locked -p heather_db --bench write_throughput -- 'write/batch/(individual|batch)/100$' --sample-size 20 --warm-up-time 1 --measurement-time 2
+```sh
+cargo build --release --locked -p heather_server
+python3 scripts/release_acceptance.py --binary target/release/heather --output /tmp/acceptance.json
+python3 scripts/release_benchmarks.py --binary target/release/heather --output /tmp/benchmarks.json
 ```
 
-The [original audited run](/heatherdb/benchmarks/v1-candidate.json) includes
-native samples and separate authenticated HTTP samples. The engine repository's
-`scripts/release_benchmarks.py` collects that evidence. This is a local release
-candidate measurement; it does not mean published v1 artifacts already exist.
-
-## HTTP and learning results
-
-The website reports the separate sequential HTTP measurements: Basic mean
-10.452 ms, observed p95 10.701 ms; Bearer mean 0.248 ms, observed p95 0.273 ms.
-Each mode uses 100 requests after ten warm-ups, with a new loopback connection
-per request, 64-dimensional plain memory and 32 stored vectors. Basic runs first.
-These include client JSON, transport and authentication, without concurrent load.
-
-[Competitive learning and discovery calibration](../releases/competitive-learning-evaluation.md)
-reports held-out pattern learning, drift and clustering baselines separately
-from execution time. See [Choose a memory mode](../how-to/choose-memory-mode.md)
-for learning versus individual recall and graceful forgetting.
-
-## Scope
-
-HeatherDB is read-optimized and prioritizes read performance over write throughput. Writes update the learned memory and persist the change, placing more work on ingestion. Batch writes amortise transaction costs when ingesting multiple vectors.
-
-These are native Rust calls backed by temporary LMDB storage, not HTTP request timings. They exclude authentication, networking, JSON parsing and input encoding. Confidence intervals describe uncertainty in sample mean estimates, not request-latency percentiles. No concurrent load or sustained-throughput claim is derived from these results.
-
-One run on a developer machine does not establish associative recall quality, large-scale behaviour, general reasoning, or superiority to another database. Evaluate your own data, recall quality and end-to-end workload separately.
-
-## Related
-
-- [Capacity and interference](../explanation/capacity-and-interference.md)
-- [Boundary conditions](../explanation/boundary-conditions.md)
-- [Run it in production](../how-to/production.md)
+Native benchmark commands and file hashes are included in the raw evidence.
+Measure recall, learning, latency and occupancy on the data and settings your
+application requires.

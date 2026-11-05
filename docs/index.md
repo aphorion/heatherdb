@@ -78,8 +78,8 @@ system slightly better at its job, and the millionth does exactly the same
 thing.
 
 Retention is a policy choice. Competitive writes learn shared patterns and can
-adapt to changing data through graceful forgetting. Plain writes retain
-individual observations for associative recall. Preserve evidence separately
+adapt to changing data through graceful forgetting. Both modes support associative recall; plain writes retain
+individual vectors as separate locations. Preserve evidence separately
 when both current knowledge and historical records matter. See
 [Choose a memory mode](how-to/choose-memory-mode.md).
 

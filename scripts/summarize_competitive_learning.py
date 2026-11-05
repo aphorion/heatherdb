@@ -242,7 +242,7 @@ individually retrievable rows.
 |---|---|---|
 {chr(10).join(growth)}
 
-The drift gain starts before any new-pattern observations. For an evolving knowledge policy, this is
+Under a policy that prioritises current patterns, adaptation includes
 graceful forgetting: old-pattern fidelity falls from **{old_before:.4f}** to
 **{old_after:.4f}**. This is updating the learned representation, not preserving
 an immutable episodic archive. Archive requirements need a separate storage
@@ -308,7 +308,7 @@ the null result is not simply an inability to express prototype structure.
 
 ![Discovery calibration](figures/competitive-discovery.png)
 
-## Supported product framing and remaining work
+## Properties and scope
 
 - Supported: competitive writes learn a compressed representation of repeated
   shared structure and can improve prediction on unseen noisy examples.
@@ -322,9 +322,8 @@ the null result is not simply an inability to express prototype structure.
   interpretation and real-data validation. Do not change the default to k=1
   from this one study: its cleaner proposals do not dominate native denoising.
 
-Individual-record recall and learning shared structure are different contracts.
-The earlier random-pattern reconstruction result remains true; this experiment
-provides the missing positive evidence for learning under repeated structure.
+Individual-pattern recall and shared-pattern learning are separate measurements
+of associative memory. Evaluate both when both matter to the application.
 
 ## Evidence and reproduction
 
