@@ -19,9 +19,9 @@ name: Release
 # when it is wanted.
 #
 # Targets:
-#   linux-x86_64-gnu      Linux glibc 2.31+                 (+ .deb, amd64)
+#   linux-x86_64-gnu      Linux glibc 2.39+                 (+ .deb, amd64)
 #   linux-x86_64-musl     Linux static (works on Alpine + everything)
-#   linux-aarch64-gnu     Linux glibc 2.31+, arm64           (+ .deb, arm64)
+#   linux-aarch64-gnu     Linux glibc 2.39+, arm64           (+ .deb, arm64)
 #   linux-aarch64-musl    Linux static, arm64
 #   macos-aarch64         macOS 11+, Apple silicon      (unsigned, see below)
 #   macos-x86_64          macOS 11+, Intel              (unsigned, see below)
@@ -42,6 +42,11 @@ on:
         description: "Version to release (e.g. v0.1.0)"
         required: true
         type: string
+      verify_only:
+        description: Build and smoke-test artifacts without publishing
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write          # needed to create the GitHub Release
@@ -49,6 +54,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: short
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
   CARGO_INCREMENTAL: 0
   # The cargo package to build (-p flag) and the binary file it produces.
   # The crate is named `heather_server` historically; the binary is `heather`.
@@ -113,13 +119,13 @@ jobs:
             strip: false
             deb: false
           - label: macos-aarch64
-            os: macos-14                        # arm64 runner, builds natively
+            os: macos-15                        # arm64 runner, builds natively
             target: aarch64-apple-darwin
             cross: false
             strip: false                        # `cargo build` output is fine unstripped
             deb: false
           - label: macos-x86_64
-            os: macos-14                        # arm64 host, cross-links to x86_64 via the Apple SDK
+            os: macos-15-intel                  # native Intel runner
             target: x86_64-apple-darwin
             cross: false
             strip: false
@@ -275,10 +281,79 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  verify:
+    name: Smoke test (${{ matrix.label }})
+    needs: [prep, build]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { label: linux-x86_64-gnu, os: ubuntu-24.04, deb: true }
+          - { label: linux-x86_64-musl, os: ubuntu-24.04, deb: false }
+          - { label: linux-aarch64-gnu, os: ubuntu-24.04-arm, deb: true }
+          - { label: linux-aarch64-musl, os: ubuntu-24.04-arm, deb: false }
+          - { label: macos-aarch64, os: macos-15, deb: false }
+          - { label: macos-x86_64, os: macos-15-intel, deb: false }
+          - { label: windows-x86_64, os: windows-latest, deb: false }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.label }}
+          path: dist
+      - name: Verify archive checksum and packaged database
+        shell: bash
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os, pathlib, subprocess, sys
+          archives = [p for p in pathlib.Path('dist').iterdir() if p.name.endswith(('.tar.gz', '.zip'))]
+          assert len(archives) == 1, archives
+          archive = archives[0]
+          expected = pathlib.Path(str(archive) + '.sha256').read_text().split()[0]
+          assert hashlib.sha256(archive.read_bytes()).hexdigest() == expected
+          subprocess.run([sys.executable, 'scripts/verify_release_package.py', '--archive', str(archive), '--version', os.environ['VERSION']], check=True)
+          PY
+      - uses: actions/download-artifact@v4
+        if: matrix.deb
+        with:
+          name: ${{ matrix.label }}-deb
+          path: dist
+      - name: Verify Debian installation and service
+        if: matrix.deb
+        shell: bash
+        env:
+          VERSION: ${{ needs.prep.outputs.version }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib, pathlib
+          for deb in pathlib.Path('dist').glob('*.deb'):
+              expected = pathlib.Path(str(deb) + '.sha256').read_text().split()[0]
+              assert hashlib.sha256(deb.read_bytes()).hexdigest() == expected
+          PY
+          sudo dpkg -i dist/*.deb > /tmp/heather-deb-install.log 2>&1
+          getent passwd heatherdb > /dev/null
+          sudo test -s /etc/heatherdb/env
+          python3 scripts/verify_release_package.py --binary /usr/bin/heather --version "$VERSION"
+          sudo systemctl start heatherdb
+          trap 'sudo systemctl stop heatherdb' EXIT
+          for attempt in $(seq 1 100); do
+            if curl -fsS http://127.0.0.1:6380/ready > /dev/null; then exit 0; fi
+            sleep 0.2
+          done
+          exit 1
+
   # ─── publish: collect artifacts, generate one combined SHA file, release ────
   release:
     name: Publish GitHub Release
-    needs: [prep, build]
+    needs: [prep, build, verify]
+    if: github.event_name == 'push' || !inputs.verify_only
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -311,15 +386,20 @@ jobs:
           set -e
           PREV="$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || echo "")"
           {
-            echo "## What's in $VERSION"
-            echo
-            if [ -n "$PREV" ]; then
-              echo "Changes since \`$PREV\`:"
-              echo
-              git log --pretty=format:"- %s (%h)" "$PREV..$VERSION" \
-                | grep -v -e '^- Merge ' -e '^- chore: bump' || true
+            NOTES="docs/releases/${VERSION#v}.md"
+            if [ -f "$NOTES" ]; then
+              cat "$NOTES"
             else
-              echo "Initial release."
+              if [ "$VERSION" = "v1.0.0" ]; then
+                echo "Missing reviewed v1.0.0 release notes" >&2
+                exit 1
+              fi
+              echo "## What's in $VERSION"
+              echo
+              if [ -n "$PREV" ]; then
+                git log --pretty=format:"- %s (%h)" "$PREV..$VERSION" \
+                  | grep -v -e '^- Merge ' -e '^- chore: bump' || true
+              fi
             fi
             echo
             echo "## Downloads"

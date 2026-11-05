@@ -216,6 +216,31 @@ jobs:
           provenance: true
           sbom: true
 
+      - name: Smoke-test published image digest on both architectures
+        if: github.event_name != 'pull_request'
+        env:
+          IMAGE: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("heather_server/Cargo.toml", "rb"))["package"]["version"])')
+          for arch in amd64 arm64; do
+            test "$(docker run --rm --platform linux/$arch "$IMAGE" --version)" = "heather $VERSION"
+            NAME="heather-release-smoke-$arch"
+            docker run --rm -d --name "$NAME" --platform linux/$arch -p 127.0.0.1::6380 -e HEATHER_DIMENSION=8 -e HEATHER_ADMIN_USER=admin -e HEATHER_ADMIN_PASSWORD=package-smoke-password "$IMAGE" > /dev/null
+            trap 'docker rm -f "$NAME" > /dev/null 2>&1 || true' EXIT
+            PORT=$(docker port "$NAME" 6380/tcp | head -1 | sed 's/.*://')
+            READY=false
+            for attempt in $(seq 1 100); do
+              if curl -fsS "http://127.0.0.1:$PORT/ready" > /dev/null; then READY=true; break; fi
+              sleep 0.2
+            done
+            test "$READY" = true
+            curl -fsS -u admin:package-smoke-password -H 'Content-Type: application/json' -d '{"vectors":[[1,0,0,0,0,0,0,0]],"metadata":[{"smoke":true}]}' "http://127.0.0.1:$PORT/collections/smoke/write" > /dev/null
+            curl -fsS -u admin:package-smoke-password "http://127.0.0.1:$PORT/collections/smoke/documents/0" | python3 -c 'import sys,json; assert json.load(sys.stdin)["metadata"]["smoke"] is True'
+            docker rm -f "$NAME" > /dev/null
+            trap - EXIT
+          done
+
       # Keyless cosign signing for non-PR pushes — proves the image came
       # from this repo at this SHA. Skipped on PR (no push to sign).
       - name: Install cosign
