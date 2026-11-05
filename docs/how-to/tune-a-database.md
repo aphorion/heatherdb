@@ -5,7 +5,9 @@ concrete symptom.
 
 Every knob below lives in one place: `$HEATHER_DATA_DIR/db/<name>/db.toml`,
 written when the database is created and re-read on every mount. Set it at
-creation through `POST /db`, or edit the file and restart.
+creation through `POST /db`. Some tuning values can also be edited before a
+restart; dimension, write mode and precision are creation-time choices. See
+[Choose a memory mode](choose-memory-mode.md).
 
 ## Dimension
 
@@ -74,9 +76,12 @@ curl -u admin:pw -X POST http://localhost:6380/db \
 | `num_landmarks` | 32 | graph search enters at a bad starting point | — |
 | `l_0` | 0 | you specifically want a pre-seeded random codebook | leave at 0 — data-seeded is the default |
 
-Only these six are settable over HTTP. The rest (`eta_0`, `lambda`, `eta_min`,
-`tau_split`, `tau_merge`, `gamma`, `tau_damp`, `tau_overload`, `epsilon`,
-`competitive`) are editable in `db.toml`, followed by a restart. See
+These six plus `competitive` and `precision` are accepted in the creation-time
+HTTP `eam` object. Choose write mode and precision when creating the database;
+do not change them by editing an existing database. Other tuning values
+(`eta_0`, `lambda`, `eta_min`, `tau_split`, `tau_merge`, `gamma`, `tau_damp`,
+`tau_overload`, `epsilon`) are editable in `db.toml`, followed by a restart.
+Changing `k` affects the writing neighbourhood as well as reads. See
 [Configuration](../reference/configuration.md#eam-knobs) for what each one
 means and the validation rules between them.
 

@@ -1,6 +1,6 @@
 [Unit]
 Description=HeatherDB — associative-memory database
-Documentation=https://github.com/aphorion/heather-db
+Documentation=https://github.com/aphorion/heatherdb
 After=network-online.target
 Wants=network-online.target
 

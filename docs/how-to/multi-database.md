@@ -9,6 +9,9 @@ file handles. There is no key-prefix multiplexing.
 
 ## When to create a new database
 
+- **You need both adaptive learning and preserved observations.** Use a
+  competitive database for learned patterns and a plain database for episodes.
+  See [Choose a memory mode](choose-memory-mode.md).
 - **You need a different vector dimension.** This is the common reason.
   Dimension is fixed at creation and cannot be changed.
 - **You want independent EAM tuning** — a different `k`, `beta`, or the MDL

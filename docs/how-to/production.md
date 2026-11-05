@@ -14,10 +14,11 @@ a width that disagrees with `db.toml`, and there is no re-dimension command —
 changing it means a new database and a re-ingest. Pick it from the encoder you
 are actually going to use, not from the default.
 
-**Pre-1.0 means no migrations.** There is no migration machinery in the engine,
-so a format change between versions is handled by re-ingesting, not by an
-upgrade path. Read the release notes before moving a version, and keep the
-source data you ingested from for as long as that is true.
+**1.0.0 establishes a fresh baseline.** Migration from 0.x is not supported or
+required. Later 1.x releases must preserve supported data or provide an
+explicit upgrade procedure; unsupported formats are refused rather than
+reinterpreted. Read the [release contract](../reference/v1-release-contract.md)
+and release notes before changing versions, and keep a tested backup.
 
 Everything else — map size, EAM knobs, users, limits — is adjustable later.
 [Tune a database](tune-a-database.md) covers each.

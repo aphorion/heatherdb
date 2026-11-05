@@ -29,7 +29,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "heather_server", about = "HeatherDB server")]
+#[command(name = "heather", version, about = "HeatherDB server")]
 struct Args {
     /// Directory for database storage (root for `db/<name>/...` and the
     /// users.json file).
@@ -252,9 +252,18 @@ async fn serve(args: Args) -> std::process::ExitCode {
     );
 
     let server = Arc::new(server);
-    let default_hive = server
-        .database(DEFAULT_DB)
-        .expect("default database missing immediately after open");
+    let default_hive = match server.database(DEFAULT_DB) {
+        Some(hive) => hive,
+        None => {
+            eprintln!(
+                "error: default database unavailable: {}",
+                server
+                    .refused(DEFAULT_DB)
+                    .unwrap_or_else(|| "not mounted".into())
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
     // Auth — load (or create) the user store.
     let user_store = match users::UserStore::load(&data_dir) {

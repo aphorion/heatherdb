@@ -17,7 +17,7 @@ enabled for the database (as does
 
 ### POST /db/{db}/collections/{name}/read
 
-Recall the stored pattern nearest the query. Legacy:
+Reconstruct a pattern associated with the query. Legacy:
 `POST /collections/{name}/read`.
 
 | Field | Type | Default |
@@ -28,13 +28,16 @@ Recall the stored pattern nearest the query. Legacy:
 `iterative` runs the Hopfield loop to convergence (up to `t_max`); `fast` is a
 single step.
 
-The result is a reconstruction, not a row: similar writes merge into one hard
-location, so a `read` returns the pattern the memory formed from them, not the
-particular vector you wrote. To get a particular item back — one of several
-memories on the same topic, say — write it with `metadata` and use
-[`documents/query`](documents.md#post-dbdbcollectionsnamedocumentsquery),
-which ranks the stored vectors exactly. See
-[Behaviour](../reference/behaviour.md).
+The result is a reconstructed vector. In competitive mode it can complete an
+individual pattern or express shared structure learned from related writes.
+Novel writes receive separate locations; joining writes can combine observations.
+Plain mode keeps each vector as a separate location, but attention can still
+blend them. Read strategy, temperature and data overlap affect reconstruction.
+
+For document identity, use metadata-bearing writes and the document API.
+`documents/{id}` returns the ID and metadata; [`documents/query`](documents.md#post-dbdbcollectionsnamedocumentsquery)
+returns similarity-ranked document results. Neither requires a different write
+mode. See [Choose a memory mode](../how-to/choose-memory-mode.md).
 
 ```bash
 curl -u admin:pw -X POST \

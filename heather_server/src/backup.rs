@@ -274,7 +274,10 @@ fn do_restore(data_dir: &Path, input: &Path, only_db: Option<&str>) -> Result<()
         // traverse) refused outright.
         sanitize_archive_path(&path)?;
         let entry_type = entry.header().entry_type();
-        if !(entry_type.is_file() || entry_type.is_dir()) {
+        // GNU sparse entries are regular files with holes, emitted for LMDB
+        // files by our Linux backup builder. Link and device entries remain
+        // forbidden; tar validates and expands the sparse map when unpacking.
+        if !(entry_type.is_file() || entry_type.is_dir() || entry_type.is_gnu_sparse()) {
             return Err(format!(
                 "refusing to unpack non-regular archive entry: {} ({:?})",
                 path.display(),
@@ -554,6 +557,65 @@ fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restore_accepts_gnu_sparse_files() {
+        // Linux's tar builder emits GNU sparse entries for sparse LMDB files.
+        // Construct one explicitly so this regression also runs on macOS.
+        let temp = tempfile::tempdir().unwrap();
+        let archive = temp.path().join("sparse.tar.gz");
+        let file = fs::File::create(&archive).unwrap();
+        let mut builder = tar::Builder::new(GzEncoder::new(file, Compression::default()));
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_mode(0o600);
+        header.set_size(4);
+        let gnu = header.as_gnu_mut().unwrap();
+        gnu.set_real_size(4100);
+        gnu.sparse[0].set_offset(4096);
+        gnu.sparse[0].set_length(4);
+        builder
+            .append_data(&mut header, "db/default/data/data.mdb", &b"data"[..])
+            .unwrap();
+        builder.into_inner().unwrap().finish().unwrap();
+
+        let destination = temp.path().join("restored");
+        do_restore(&destination, &archive, None).unwrap();
+        let restored = fs::read(destination.join("db/default/data/data.mdb")).unwrap();
+        assert_eq!(restored.len(), 4100);
+        assert!(restored[..4096].iter().all(|byte| *byte == 0));
+        assert_eq!(&restored[4096..], b"data");
+    }
+
+    #[test]
+    fn restore_still_rejects_links_and_special_entries() {
+        for kind in [
+            tar::EntryType::Symlink,
+            tar::EntryType::Link,
+            tar::EntryType::Char,
+            tar::EntryType::Block,
+            tar::EntryType::Fifo,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let archive = temp.path().join("unsafe.tar.gz");
+            let file = fs::File::create(&archive).unwrap();
+            let mut builder = tar::Builder::new(GzEncoder::new(file, Compression::default()));
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(0o600);
+            header.set_size(0);
+            if kind.is_symlink() || kind.is_hard_link() {
+                header.set_link_name("../../outside").unwrap();
+            }
+            builder
+                .append_data(&mut header, "db/unsafe", &b""[..])
+                .unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+            let err = do_restore(&temp.path().join("restored"), &archive, None).unwrap_err();
+            assert!(err.contains("non-regular archive entry"), "{kind:?}: {err}");
+            assert!(!temp.path().join("restored/db/unsafe").exists());
+        }
+    }
 
     #[test]
     fn archive_paths_traversal_rejected() {

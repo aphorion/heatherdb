@@ -1,17 +1,19 @@
 # Build a memory for an agent
 
-Give an agent recall of everything it has said and been told, across sessions,
-without carrying it all in the context window.
+Give an agent associative context across sessions without carrying the entire
+history in its context window. This recipe uses competitive learning: turns
+contribute to a shared representation, rather than guaranteeing exact episode
+reconstruction. A language model still produces the language response; see
+[Pair the memory with a language model](pair-with-an-llm.md).
 
-The conventional stack for this is retrieval-augmented generation: chunk the
-transcript, embed it, put it in a vector index, retrieve top-k by cosine, and
-paste the chunks into the prompt. This replaces the index and the retrieval
-step. The memory superimposes turns rather than filing them, so a partial cue
-completes into a pattern, repeated topics recall more strongly than one-off
-mentions, and the read hands you a confidence number that the retrieval step
-never had. The model still does the language. That division of labour is
-[Pair the memory with a language model](pair-with-an-llm.md); this page is the
-build.
+## Choose the retention policy
+
+Use competitive mode for associative completion and evolving shared knowledge.
+Use plain mode when each vector should remain a separate location without
+adaptive updates. Document records written with metadata are retained with
+either mode; use their IDs for exact identity and attribution. Separate databases
+are useful when you need both adaptive and non-adaptive vector memories. See
+[Choose a memory mode](choose-memory-mode.md).
 
 ## The design
 
@@ -26,20 +28,21 @@ model ([Encode text](encode-text.md), route 1) with the corpus mean subtracted
 turn near 1.0 against every other, and the confidence number this design rests
 on stops carrying signal.
 
-**A pool is one conversation, or one agent.** Capacity is about `d/32` per
-pool, so a shared collection both leaks and interferes — one user's turns
-become another's recall. One collection per conversation for a chat
-assistant, one per agent for a persistent role; route by path,
-`/db/agents/collections/{conversation_id}/...`.
+**A pool is one conversation, or one agent.** Isolate users to avoid mixing
+their evidence. Capacity depends on overlap, allocation and read settings;
+`d/32` is not a total collection-size guarantee. See
+[Capacity and interference](../explanation/capacity-and-interference.md).
+Route collections by `/db/agents/collections/{conversation_id}/...`.
 
 **The answer resolves to text before it reaches a prompt.** A read returns a
 vector; a model cannot read one. Keep a sidecar of turn → vector and resolve
 the reconstruction against it — see
 [Resolve a reconstruction to a thing](resolve-reconstructions.md).
 
-**The abstention rule is a fidelity floor.** When the memory has no attractor
-for the current message, it says so, and the agent proceeds with recent
-context only rather than being handed weak recall it will treat as fact.
+**Calibrate an application abstention rule.** Measure scores on relevant and
+irrelevant held-out queries, then choose a threshold that meets your error
+budget. A weak result is not automatically rejected by native memory. Let the
+agent proceed with recent context when your application gate rejects recall.
 
 ## What to write, and what not to
 
@@ -52,9 +55,8 @@ context only rather than being handed weak recall it will treat as fact.
 
 The last row matters most. An associative read returns a blend under
 competition; a fact you can key on belongs in a table. Writing everything also
-spends capacity: at `d = 384`, a pool holds on the order of a dozen
-well-separated patterns before superposition starts blending them, so what you
-choose *not* to write is the tuning knob you use first.
+spends capacity. Measure interference on your own conversations and split
+unrelated contexts when needed.
 
 Every write here carries metadata, so each turn is also a retrievable
 document. A write without metadata still shapes the memory but is
@@ -220,7 +222,7 @@ settled, which is useful for exploration, but it is drift, not inference.
 
 | Symptom | Change |
 |---|---|
-| Recall blends turns into a plausible non-turn | pool over capacity (`≈ d/32`) — write less, or split per session |
+| Recall blends turns into a plausible non-turn | interference or overly broad activation — measure overlap and read settings, or split per session |
 | Everything recalls at ~0.95 | `d` too high for the turn count, or vectors uncentred |
 | Never abstains | `TAU` derived on a smaller pool than the current one — recalibrate |
 | Cites a superseded decision | write the correction; superposition does not come apart, so nothing is removable |

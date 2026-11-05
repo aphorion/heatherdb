@@ -11,6 +11,10 @@ back up. Those pages are about this software.
 
 If you only read one page, read [Getting started](getting-started.md).
 
+The [1.0 release contract](reference/v1-release-contract.md) defines the
+stable surface and acceptance requirements. The [release audit](releases/v1-audit.md)
+records the checks, evidence and remaining release conditions.
+
 ## Start here
 
 - **[Getting started](getting-started.md)** — install the engine on macOS,
@@ -36,14 +40,16 @@ Nine lessons in order, each turning on one result you produce yourself.
    fidelity as a judgement, and a threshold derived rather than chosen.
 7. **[Know it worked](tutorials/know-it-worked.md)** — a measurement that reads
    1.000 on noise, repaired.
-8. **[It doesn't forget](tutorials/it-doesnt-forget.md)** — a second, unrelated
-   body of data leaves the first intact.
+8. **[Measure retention while learning](tutorials/it-doesnt-forget.md)** — probe
+   an earlier pattern after unrelated writes.
 9. **[Design your own](tutorials/design-your-own.md)** — your data, four
    questions, a working system.
 
 ## Heather — the paradigm
 
 ### Understanding it
+
+- [Learning and graceful forgetting](explanation/learning-and-graceful-forgetting.md) — adaptation and retention as separate objectives.
 
 - [Storage native intelligence](explanation/storage-native-intelligence.md) —
   where intelligence lives, and what changes when it lives in the store.
@@ -91,6 +97,8 @@ Nine lessons in order, each turning on one result you produce yourself.
   dimensions.
 
 ### Working with the memory
+
+- [Choose a memory mode](how-to/choose-memory-mode.md) — adaptive learning, individual recall, or both.
 
 - [Resolve a reconstruction to a thing](how-to/resolve-reconstructions.md) —
   the sidecar store, and why you resolve against the reconstruction.

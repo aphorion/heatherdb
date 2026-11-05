@@ -1,4 +1,4 @@
-# It doesn't forget
+# Measure retention while learning
 
 ## Where you were
 
@@ -10,11 +10,9 @@ Every one of those results came from a store that only ever learned one thing.
 Which raises the question that decides whether any of it survives contact with
 production: what happens when you write something *else*?
 
-For a trained model the answer is well known and unpleasant. Train a network on
-task A, then train it on task B, and performance on A collapses — the weights
-that encoded A are the same weights B is now using. This is [catastrophic
-forgetting](../terms/catastrophic-forgetting.md), and it is why most deployed
-models are frozen at ship time and retrained wholesale later.
+This exercise measures retention under unrelated writes. It does not establish
+that a memory never forgets. When familiar patterns change, gradual loss of old
+pattern fidelity can instead be useful [graceful forgetting](../explanation/learning-and-graceful-forgetting.md).
 
 ## What this lesson shows
 
@@ -104,44 +102,27 @@ after 1200 more, task C      fidelity 0.791   vs pattern 0.992   locations 494
 
 ## What just happened
 
-The answer to the first question went 0.999 → 0.998 → 0.992 while 1600 vectors
-about unrelated subjects were written on top of it. That is the moment: a
-fine-tune would have destroyed it, and here it moved by seven thousandths.
+The example output shows the original pattern's cosine changing from
+0.999 → 0.998 → 0.992 as unrelated observations arrive and the location count
+grows. These are illustrative outputs from this exercise, not a retention
+bound; record your own results for your build and workload.
 
-The mechanism is in the third column. Locations went 99 → 199 → 494. New
-material did not overwrite the capacity holding the old material; it caused new
-capacity to be allocated, alongside. Patterns that never came up again were
-never disturbed, because nothing wrote near them — which is what "learning is
-local" buys you, and what a network's shared weights cannot offer.
-
-Two honest edges.
-
-**Nothing is free.** The store grew — roughly proportionally with genuinely new
-material. This trades disk for retention, which is a trade most systems would
-take, but it is a trade. Watch `num_locations` on collections that ingest
-forever, and see [Tune a database](../how-to/tune-a-database.md) for the
-allocation gate that decides when a new location is justified.
-
-**Interference is not zero.** 0.999 → 0.992 is a real decline, just a
-negligible one at this scale. Data that genuinely *overlaps* older data will
-move it, because that is learning, not forgetting. The distinction matters: the
-memory updates where the world updated, and leaves alone what nobody
-contradicted.
+Local learning and allocation can preserve unrelated patterns while adding new
+ones. Capacity, overlap, write settings and read settings still affect retention.
+A changing pattern is a different test: competitive learning may shift responses
+toward its new form, gradually reducing old-pattern fidelity. For an adaptive
+knowledge policy, that is graceful forgetting. For an archive, preserve the
+observations separately.
 
 ## What you know now
 
-Five lessons, five results, and they compose into one claim:
+Measure the behaviour your application needs: held-out pattern learning,
+retention of unrelated knowledge, adaptation to drift, or individual recall.
+Query-to-response cosine alone is not correctness or calibrated confidence;
+validate any application abstention threshold on independent examples.
 
-1. A read is a **reconstruction that reports its own confidence**.
-2. A write is a **learning step** — there is no training phase, and no moment
-   of not-ready.
-3. Structure **composes without a schema**, and comes back apart on request.
-4. Fidelity is a **judgement**, so detection and abstention need no second model.
-5. New knowledge **does not destroy old knowledge**, so the system can keep
-   learning in production.
-
-The sentence those add up to is the one worth carrying out of this track: this
-is not a search index, it is a memory, and writing to it is the training.
+[Choose a memory mode](../how-to/choose-memory-mode.md) before deciding whether
+shared adaptation or preservation of individual observations is the objective.
 
 ## Clean up
 

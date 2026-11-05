@@ -325,7 +325,14 @@ pub async fn write(
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, collection = %name, "Write failed");
-            error_response(StatusCode::BAD_REQUEST, e)
+            let status = match &e {
+                heather_db::HeatherError::Storage(_)
+                | heather_db::HeatherError::Serialization(_)
+                | heather_db::HeatherError::LockPoisoned => StatusCode::INTERNAL_SERVER_ERROR,
+                heather_db::HeatherError::Conflict(_) => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            error_response(status, e)
         }
         Err(e) => {
             tracing::error!(error = %e, "Write task panicked");

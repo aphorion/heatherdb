@@ -17,9 +17,11 @@ cannot extend its own lifetime without paying the Argon2 cost. Any scope.
 
 Request body: no body.
 
-The token inherits the user's scope *at mint time*; a later scope change does
-not affect tokens already issued. TTL is 1 hour (`tokens::TOKEN_TTL`), not
-configurable. Expired tokens are swept every 5 minutes.
+The token is bound to the user's identity, credentials and scope at mint
+time. Every bearer request checks the current user. Deleting the user or
+changing its password or scope invalidates its existing tokens immediately.
+TTL is 1 hour (`tokens::TOKEN_TTL`), not configurable. Expired tokens are swept
+every 5 minutes.
 
 ```bash
 curl -u alice:pw -X POST http://localhost:6380/auth/token

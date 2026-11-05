@@ -1,9 +1,11 @@
 # How the memory works
 
-HeatherDB is not a key-value store and not a nearest-neighbour index. It stores
+In competitive mode (the default), HeatherDB learns a shared representation. It stores
 patterns distributed across a self-organising network of hard locations and
 reconstructs them from approximate queries. This page explains what that
-actually means mechanically, and what it costs.
+actually means mechanically, and what it costs. Plain writes (`competitive: false`)
+instead retain each vector as its own location. See [Choose a memory mode](../how-to/choose-memory-mode.md)
+for individual recall, adaptive learning and graceful forgetting.
 
 ## Hard locations
 
@@ -15,7 +17,8 @@ The unit of storage is a **hard location**, and it carries three things:
 
 Reading returns *patterns*, which are normalised counters. Routing uses
 addresses. Keeping the two separate is what lets a location move toward the
-data that keeps arriving without losing what it has already stored.
+data that keeps arriving while updating its learned content. Earlier patterns
+can lose influence as the representation adapts.
 
 The number of hard locations is not a setting. It is grown and pruned by the
 write rule, and it is best read as a **diagnostic of data complexity**: 200
