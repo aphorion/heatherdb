@@ -352,7 +352,7 @@ credentials are temporary; no production data or service is used.
 '''
 args.output.write_text(report)
 with args.output.with_suffix('.csv').open('w') as file:
-    writer=csv.writer(file);writer.writerow(['seed','condition','writes','method','cosine_scale50','cosine_scale5','locations','logical_float_payload_bytes'])
+    writer=csv.writer(file,lineterminator='\n');writer.writerow(['seed','condition','writes','method','cosine_scale50','cosine_scale5','locations','logical_float_payload_bytes'])
     for case in r['learning']:
         for method,value in case['measurements'].items():
             writer.writerow([case['seed'],case['condition'],case['writes'],method,value['attention_50_cosine'],value['attention_5_cosine'],value['locations'],value.get('logical_float_payload_bytes')])
