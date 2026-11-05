@@ -9,6 +9,14 @@ verified.** No release tag or remote publication was performed. Platform
 artifact builds and the new release workflow must pass in CI before shipping.
 1.0.0 is a fresh baseline; no migration work from 0.x is required.
 
+## Latest candidate after selected PR integration
+
+PRs #96, #95 and #97 are now merged and reconciled with this candidate.
+The [post-merge audit](post-merge/audit.md) records the new acceptance, learning,
+recall and performance results on `cb88a2d`. Earlier measurements below remain
+attributed to their original revision. Combined GitHub CI, release checks and
+Docker builds pass; no v1.0.0 tag or release has been published.
+
 ## Contract
 
 The [release contract](../reference/v1-release-contract.md) defines stable

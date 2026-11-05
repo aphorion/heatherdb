@@ -140,12 +140,14 @@ old_last=cases('drift')
 old_before=np.mean([x['measurements']['competitive_default']['old_pattern_cosine'] for x in old_first])
 old_after=np.mean([x['measurements']['competitive_default']['old_pattern_cosine'] for x in old_last])
 
+protocol_link = os.path.relpath(Path(__file__).resolve().parents[1] / 'docs/reference/competitive-learning-protocol.md', args.output.parent)
+
 report=f'''# Competitive learning and discovery evaluation
 
 5 November 2026. Tested repository revision `{r['engineCommit']}`;
-binary `{r['binaryVersion']}`. Engine production code is unchanged from the
-audited 1.0.0 candidate. The [protocol](../reference/competitive-learning-protocol.md)
-was frozen before the full run; a one-seed smoke run checked the pipeline.
+binary `{r['binaryVersion']}`. This report describes the tested revision only.
+The [protocol]({protocol_link}) defines the frozen workloads and baselines.
+No production algorithm or default was altered during this evaluation.
 
 ## Finding
 
@@ -326,11 +328,11 @@ provides the missing positive evidence for learning under repeated structure.
 
 ## Evidence and reproduction
 
-- [Frozen protocol](../reference/competitive-learning-protocol.md)
+- [Frozen protocol]({protocol_link})
 - [All checkpoint, baseline, comparison and discovery results](competitive-learning-results.json)
 - Source hashes, executable checksum, package versions, dataset hashes and
   snapshot checksums are included in that JSON. Actual codebooks and score
-  arrays are in `output/competitive-learning-v1/` in the engine checkout;
+  arrays are retained locally at the runner’s `--artifacts` path;
   {len(r['artifacts'])} NPZ artifacts, approximately {sum(x['bytes'] for x in r['artifacts'])/1024**2:.1f} MiB, are retained locally
   rather than committed as generated binary data.
 - Public API overload-split randomness has no exposed seed. Inputs are seeded,
