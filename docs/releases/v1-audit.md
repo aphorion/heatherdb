@@ -156,6 +156,25 @@ tradeoff between adaptation and old-pattern retention
 scientific discovery. Protocol, per-seed results, comparisons and figure links
 are available in the follow-up report.
 
+## Linux CI correction: sparse cold backups
+
+The first release-check run on Linux failed cold restore, although ordinary CI
+passed. The tar builder emits GNU sparse entries for sparse LMDB files on Linux;
+its macOS implementation does not. Restore incorrectly rejected those entries
+as non-regular. A platform-independent sparse-archive regression reproduced the
+error before correction. Restore now accepts GNU sparse files while retaining
+path checks and rejecting links, devices and FIFOs.
+
+Five backup/restore unit tests and all 15 local black-box acceptance checks pass
+after correction, as does clippy. A deliberate cold-restore failure confirms the
+harness reports one failure while the other 14 checks continue independently.
+The harness now includes CLI failure details and startup stderr, restarts the
+primary server after the cold-restore check even on failure, and labels the
+actual operating system in its report. CI retains acceptance JSON on failure.
+Linux release-check and Docker reruns remain required before publication. The
+previous performance evidence remains attributed to its original audited
+revision; this correction changes restore, not the learning or read/write path.
+
 ## Remaining publication conditions
 
 - Execute the release checks and supported-platform artifact builds in CI.

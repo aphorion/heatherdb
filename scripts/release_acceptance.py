@@ -9,6 +9,7 @@ import math
 import os
 from pathlib import Path
 import random
+import platform
 import secrets
 import socket
 import statistics
@@ -52,14 +53,19 @@ class Engine:
             sock.bind(('127.0.0.1', 0))
             self.port = sock.getsockname()[1]
         self.process = None
+        self.stderr = None
 
     def start(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith('HEATHER_')}
         env.update(HEATHER_ADMIN_USER='admin', HEATHER_ADMIN_PASSWORD=self.password, RUST_LOG='error')
-        self.process = subprocess.Popen([str(binary), '--data-dir', str(self.directory), '--host', '127.0.0.1', '--port', str(self.port), '--dimension', '64', '--map-size-mb', '32'], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        if self.stderr is not None:
+            self.stderr.close()
+        self.stderr = tempfile.TemporaryFile(mode='w+t')
+        self.process = subprocess.Popen([str(binary), '--data-dir', str(self.directory), '--host', '127.0.0.1', '--port', str(self.port), '--dimension', '64', '--map-size-mb', '32'], env=env, stdout=subprocess.DEVNULL, stderr=self.stderr)
         for _ in range(200):
             if self.process.poll() is not None:
-                raise RuntimeError(f'Engine exited during startup: {self.process.returncode}')
+                self.stderr.seek(0)
+                raise RuntimeError(f'Engine exited during startup: {self.process.returncode}: {self.stderr.read()[-1000:]}')
             try:
                 if self.request('GET', '/ready', auth=False)[0] == 200:
                     return
@@ -220,18 +226,25 @@ def main(args):
 
             def cold_restore():
                 engine.stop()
-                archive = temp / 'cold.tar.gz'
-                expect(engine.cli('backup', 'create', '--output', str(archive)).returncode == 0, 'Cold backup failed')
-                restored = Engine(temp / 'cold-restored')
-                restored.password = engine.password
-                restored.auth = engine.auth
-                engines.append(restored)
-                expect(engine.cli('restore', 'restore', '--input', str(archive), directory=restored.directory).returncode == 0, 'Cold restore failed')
-                restored.start()
-                expect(restored.request('GET', route + '/documents/0')[0] == 200, 'Restored user/data could not be read')
-                restored.stop()
-                expect(restored.cli('verify', '--json').returncode == 0, 'Cold restore integrity check failed')
-                engine.start()
+                try:
+                    archive = temp / 'cold.tar.gz'
+                    backup = engine.cli('backup', 'create', '--output', str(archive))
+                    expect(backup.returncode == 0, 'Cold backup failed: ' + backup.stderr[-1000:])
+                    restored = Engine(temp / 'cold-restored')
+                    restored.password = engine.password
+                    restored.auth = engine.auth
+                    engines.append(restored)
+                    restore = engine.cli('restore', 'restore', '--input', str(archive), directory=restored.directory)
+                    expect(restore.returncode == 0, 'Cold restore failed: ' + restore.stderr[-1000:])
+                    restored.start()
+                    expect(restored.request('GET', route + '/documents/0')[0] == 200, 'Restored user/data could not be read')
+                    restored.stop()
+                    verify = restored.cli('verify', '--json')
+                    expect(verify.returncode == 0, 'Cold restore integrity check failed: ' + verify.stderr[-1000:])
+                finally:
+                    # Later independent checks still need the primary server,
+                    # even if backup, restore or verification fails.
+                    engine.start()
             check('OPS-02 cold full backup restores data and users', cold_restore)
 
             def precision():
@@ -330,8 +343,10 @@ def main(args):
         finally:
             for instance in engines:
                 instance.stop()
+                if instance.stderr is not None:
+                    instance.stderr.close()
 
-    report = {'recordedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'engineCommit': subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip(), 'checks': checks, 'observations': observations, 'limits': ['Local macOS run; not power-loss certification', '40-operation concurrency check is not a soak or sustained load test', 'No pre-1.0 migration tested or required', 'No remote services or existing data directories used']}
+    report = {'recordedAt': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'engineCommit': subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip(), 'checks': checks, 'observations': observations, 'limits': [f'{platform.system()} {platform.machine()} run; not power-loss certification', '40-operation concurrency check is not a soak or sustained load test', 'No pre-1.0 migration tested or required', 'No remote services or existing data directories used']}
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + '\n')
     print(json.dumps({'passed': sum(x['status']=='pass' for x in checks), 'failed': sum(x['status']=='fail' for x in checks)}))
