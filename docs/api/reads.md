@@ -28,6 +28,14 @@ Recall the stored pattern nearest the query. Legacy:
 `iterative` runs the Hopfield loop to convergence (up to `t_max`); `fast` is a
 single step.
 
+The result is a reconstruction, not a row: similar writes merge into one hard
+location, so a `read` returns the pattern the memory formed from them, not the
+particular vector you wrote. To get a particular item back — one of several
+memories on the same topic, say — write it with `metadata` and use
+[`documents/query`](documents.md#post-dbdbcollectionsnamedocumentsquery),
+which ranks the stored vectors exactly. See
+[Behaviour](../reference/behaviour.md).
+
 ```bash
 curl -u admin:pw -X POST \
   http://localhost:6380/db/movies/collections/taste/read \
