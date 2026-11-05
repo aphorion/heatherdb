@@ -124,9 +124,9 @@ def main(args):
             def auth_scope():
                 expect(engine.request('GET', '/db', auth=False)[0] == 401, 'Unauthenticated database list accepted')
                 expect(engine.request('GET', '/db', auth='Basic ' + base64.b64encode(b'admin:wrong').decode())[0] == 401, 'Wrong password accepted')
-                password = secrets.token_urlsafe(20)
-                created = engine.cli('user', 'create', 'scoped', '--password', password, '--scope', 'audit')
-                expect(created.returncode == 0, 'Scoped user creation failed')
+                password = '-' + secrets.token_urlsafe(20)
+                created = engine.cli('user', 'create', 'scoped', f'--password={password}', '--scope', 'audit')
+                expect(created.returncode == 0, 'Scoped user creation failed: ' + created.stderr.replace(password, '[redacted]')[-1000:])
                 auth = 'Basic ' + base64.b64encode(f'scoped:{password}'.encode()).decode()
                 expect(engine.request('GET', '/db/audit/collections', auth=auth)[0] == 200, 'Scoped access failed')
                 for path in ['/db', '/db/other/collections', '/collections', '/db/audit/audit']:
@@ -135,8 +135,9 @@ def main(args):
                 expect(status == 200, 'Token mint failed')
                 bearer = 'Bearer ' + token['token']
                 expect(engine.request('GET', '/db/other/collections', auth=bearer)[0] == 403, 'Bearer scope bypass')
-                rotated = secrets.token_urlsafe(20)
-                expect(engine.cli('user', 'passwd', 'scoped', '--password', rotated).returncode == 0, 'Password rotation failed')
+                rotated = '-' + secrets.token_urlsafe(20)
+                rotation = engine.cli('user', 'passwd', 'scoped', f'--password={rotated}')
+                expect(rotation.returncode == 0, 'Password rotation failed: ' + rotation.stderr.replace(rotated, '[redacted]')[-1000:])
                 expect(engine.request('GET', '/db/audit/collections', auth=bearer)[0] == 401, 'Old token survived password rotation')
                 auth = 'Basic ' + base64.b64encode(f'scoped:{rotated}'.encode()).decode()
                 status, token = engine.request('POST', '/auth/token', auth=auth)

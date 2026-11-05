@@ -14,6 +14,8 @@ argument, so it may appear before or after the subcommand.
 
 > The crate is named `heather_server`; the installed binary is `heather`.
 
+For passwords beginning with `-`, use the explicit form `--password=VALUE`.
+
 ## `user`
 
 Manages the LMDB user store at `$DATA_DIR/system/data/`. Mutations are visible
