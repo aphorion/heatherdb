@@ -3,7 +3,7 @@
 Measured source revision: `0e08be78b7164b3733f7d60654b73f6a1862ec08`. Binary: `heather 1.0.0`.
 The [benchmark page](/heatherdb/benchmarks/) presents native execution time,
 authenticated HTTP latency, associative recall and shared-pattern learning as
-separate measurements. These are 1.0.0 candidate results.
+separate measurements. These measurements apply to the recorded source revision.
 
 ## Native execution time
 

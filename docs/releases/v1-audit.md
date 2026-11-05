@@ -1,6 +1,7 @@
-# HeatherDB 1.0 candidate acceptance
+# HeatherDB 1.0 acceptance
 
-Status: 1.0.0 release candidate. No v1.0.0 tag or release is published.
+Scope: HeatherDB 1.0.0. The tagged release workflow verifies artifacts before
+publication.
 The [release contract](../reference/v1-release-contract.md) defines the stable
 surface, compatibility policy and required release evidence.
 
@@ -69,12 +70,16 @@ power-loss certification. Map exhaustion is tested; physical media failure and
 operating-system disk exhaustion are not simulated. Readiness reports its
 documented probe scope. Document deletion does not subtract learned influence.
 
-## Release gates
+## Artifact verification
 
-- Finalize the release source and notes.
+- Use the reviewed release source and version-specific notes.
 - Build and verify the tagged Linux, macOS, Windows and Debian release artifacts.
 - Verify checksums, image digests and package/binary/tag agreement.
 - Retain the documented operational limits, experimental API boundary and
   dependency maintenance notice in the published release notes.
 
-The candidate checks do not substitute for final artifact verification.
+All seven archive targets passed extraction, checksum, version, startup,
+authenticated write/read and restart-persistence checks in
+[package verification](https://github.com/aphorion/heatherdb/actions/runs/41997052964).
+Both Debian targets also passed installation and systemd-service startup.
+The tagged release workflow repeats these gates on the published source.

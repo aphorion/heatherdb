@@ -1,8 +1,7 @@
 # HeatherDB 1.0 release contract
 
-Status: proposed release contract, 5 November 2026. This is the acceptance
-target for 1.0.0, not a statement that every gate has passed. Evidence and
-exceptions belong in the [release audit](../releases/v1-audit.md).
+Status: release contract for 1.0.0, 5 November 2026. Acceptance evidence and
+operational limits are recorded in the [release audit](../releases/v1-audit.md).
 
 ## Baseline and compatibility
 
