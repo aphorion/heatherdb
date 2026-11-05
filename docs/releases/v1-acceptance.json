@@ -1,0 +1,180 @@
+{
+  "recordedAt": "2026-11-05T06:02:25.187403+00:00",
+  "engineCommit": "044324230f3027842350bbdd59f7e5beb98b6cde",
+  "checks": [
+    {
+      "name": "SEC-01 authentication, scope and deleted-user token revocation",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.164
+    },
+    {
+      "name": "API-01 metadata write and exact document lookup",
+      "status": "pass",
+      "detail": {
+        "records": 2
+      },
+      "seconds": 0.035
+    },
+    {
+      "name": "API-02 invalid-item batch rollback",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.041
+    },
+    {
+      "name": "API-03 bounded concurrent read/write workload",
+      "status": "pass",
+      "detail": {
+        "operations": 40,
+        "clients": 4
+      },
+      "seconds": 0.189
+    },
+    {
+      "name": "OPS-02 live snapshot, restore and verification",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.082
+    },
+    {
+      "name": "OPS-01 exclusive ownership and offline-tool refusal",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.007
+    },
+    {
+      "name": "MEM-02 document deletion",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.026
+    },
+    {
+      "name": "DUR-02 explicit durability modes, flush and restart default",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.119
+    },
+    {
+      "name": "DUR-01 acknowledged synchronous write survives process kill",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.104
+    },
+    {
+      "name": "OPS-02 cold full backup restores data and users",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.146
+    },
+    {
+      "name": "MEM-01 both storage precisions in plain mode",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.116
+    },
+    {
+      "name": "MEM-03 deterministic partial-cue quality measurement",
+      "status": "pass",
+      "detail": null,
+      "seconds": 1.136
+    },
+    {
+      "name": "API-02/OPS-03 map exhaustion leaves memory and disk unchanged",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.177
+    },
+    {
+      "name": "FMT-01 unsupported database refused without rewriting",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.107
+    },
+    {
+      "name": "REL-01 binary version discoverability",
+      "status": "pass",
+      "detail": "heather 1.0.0",
+      "seconds": 0.003
+    }
+  ],
+  "observations": {
+    "deleted_user_bearer_http_status": 401,
+    "ids": [
+      0,
+      1
+    ],
+    "associative_quality": {
+      "seed": 20261105,
+      "patterns": 32,
+      "dimension": 64,
+      "erased_fraction": 0.25,
+      "mode": "competitive, default beta=5, iterative",
+      "mean_cosine": 0.1800967157158755,
+      "minimum_cosine": -0.0459223728924943,
+      "fraction_cosine_at_least_0_9": 0.0625,
+      "quality_threshold_is_not_a_release_guarantee": true
+    },
+    "configured_associative_quality": {
+      "seed": 20261105,
+      "patterns": 32,
+      "dimension": 64,
+      "erased_fraction": 0.25,
+      "mode": "competitive, explicitly configured beta=50, iterative",
+      "mean_cosine": 0.562899133300058,
+      "minimum_cosine": -0.11313945540219039,
+      "fraction_cosine_at_least_0_9": 0.09375,
+      "limits": "Synthetic fixture; beta=50 is a declared comparison, not a universal recommendation"
+    },
+    "plain_attention_recall": {
+      "seed": 20261105,
+      "patterns": 32,
+      "dimension": 64,
+      "erased_fraction": 0.25,
+      "mode": "competitive=false, attention scale=50",
+      "mean_cosine": 1.0,
+      "minimum_cosine": 1.0,
+      "fraction_cosine_at_least_0_9": 1.0,
+      "fixture_tolerance": "minimum cosine >= 0.9; this is not a universal capacity guarantee"
+    },
+    "unknown_query": {
+      "finite_result": true,
+      "explicit_abstention": false,
+      "note": "The read API reconstructs a vector for novel input; no automatic unknown-query rejection is promised."
+    },
+    "map_exhaustion": {
+      "http_status": 500,
+      "error": {
+        "error": "storage error: MDB_MAP_FULL: Environment mapsize limit reached"
+      },
+      "before": {
+        "num_locations": 1,
+        "total_writes": 1.0,
+        "current_eta": 0.01,
+        "avg_write_count": 1.0,
+        "max_write_count": 1.0
+      },
+      "after_failed_write": {
+        "num_locations": 1,
+        "total_writes": 1.0,
+        "current_eta": 0.01,
+        "avg_write_count": 1.0,
+        "max_write_count": 1.0
+      },
+      "after_restart": {
+        "num_locations": 1,
+        "total_writes": 1.0,
+        "current_eta": 0.01,
+        "avg_write_count": 1.0,
+        "max_write_count": 1.0
+      }
+    },
+    "ready_with_refused_database": 200
+  },
+  "limits": [
+    "Local macOS run; not power-loss certification",
+    "40-operation concurrency check is not a soak or sustained load test",
+    "No pre-1.0 migration tested or required",
+    "No remote services or existing data directories used"
+  ]
+}
