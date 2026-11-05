@@ -25,7 +25,7 @@ settings make the correspondence exact rather than analogous:
 The non-competitive write path is explicit about this: it stores the address
 as-is, sets `write_count = 1.0`, and performs no activation, merge or migration,
 which makes the collection an exact growing key→value store
-(`heather_db/src/write.rs:107-124`). Under those settings a trained model's
+(`heather_db/src/write.rs:111-122`). Under those settings a trained model's
 attention runs on the store unmodified — same inputs, same outputs, to the bit.
 
 Note what is *not* shared with the ordinary read. `read`'s `HopfieldSS` strategy
