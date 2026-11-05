@@ -151,7 +151,8 @@ The discovery calibration covers all planted groups in the tested streams,
 but default competitive proposals include mixed/redundant directions. Independent
 validation rejects the tested structure-free controls; this validation is an
 evaluation layer, not native automatic abstention. The report retains the
-tradeoff between adaptation and old-pattern retention, and does not claim a new
+tradeoff between adaptation and old-pattern retention
+([graceful forgetting](../explanation/learning-and-graceful-forgetting.md)), and does not claim a new
 scientific discovery. Protocol, per-seed results, comparisons and figure links
 are available in the follow-up report.
 

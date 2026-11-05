@@ -77,12 +77,11 @@ nothing works and no warm-up period to sit through; the first write makes the
 system slightly better at its job, and the millionth does exactly the same
 thing.
 
-And none of it erases itself. Learning your new phone number does not delete the
-old one, but train a neural network on a new task and it will happily overwrite
-the last — catastrophic forgetting, the reason most learned systems are frozen
-the moment they ship. Writes here settle alongside what is already stored rather
-than on top of it, which is what makes a system that keeps learning in
-production a reasonable thing to run.
+Retention is a policy choice. Competitive writes learn shared patterns and can
+adapt to changing data through graceful forgetting. Plain writes retain
+individual observations for associative recall. Preserve evidence separately
+when both current knowledge and historical records matter. See
+[Choose a memory mode](how-to/choose-memory-mode.md).
 
 <!--figure:memory-->
 

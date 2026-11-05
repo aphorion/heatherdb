@@ -112,8 +112,8 @@ individually retrievable rows.
 | imbalanced | +0.1917 | [+0.1279, +0.2554] |
 | drift | +0.2984 | [+0.2929, +0.3039] |
 
-The drift gain starts before any new-pattern observations. Adaptation has a
-retention cost: old-pattern fidelity falls from **0.9798** to
+The drift gain starts before any new-pattern observations. For an evolving knowledge policy, this is
+graceful forgetting: old-pattern fidelity falls from **0.9798** to
 **0.7111**. This is updating the learned representation, not preserving
 an immutable episodic archive. Archive requirements need a separate storage
 policy; the experiment does not promise both unlimited retention and adaptation.
@@ -195,7 +195,7 @@ the null result is not simply an inability to express prototype structure.
 - Supported: competitive writes learn a compressed representation of repeated
   shared structure and can improve prediction on unseen noisy examples.
 - Supported here: the learned representation adapts to a change in shared
-  patterns, with measurable loss of old-pattern fidelity.
+  patterns, with measured graceful forgetting of earlier patterns.
 - Supported as a calibration result: learned counters can propose all planted
   hidden groups, with independent validation rejecting the tested nulls.
 - Not established: general semantic reasoning, a novel scientific discovery,

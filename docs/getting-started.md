@@ -12,6 +12,11 @@ HeatherDB comes in two shapes and this page covers both:
   server and no network. [Skip to embedded](#running-it-embedded) if that is
   what you came for.
 
+The default competitive mode learns shared patterns as you write. For retaining
+individual observations and recalling them through attention, choose plain
+writes instead. See [Choose a memory mode](how-to/choose-memory-mode.md) before
+creating a production database.
+
 ## 1. Install it
 
 Download the binary for your platform. It is a single self-contained
