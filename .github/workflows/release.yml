@@ -8,12 +8,9 @@ name: Release
 # glibc targets also get a `.deb` (apt-installable, systemd unit included) —
 # see packaging/deb/.
 #
-# The four Linux targets build via `cross` (not bare `cargo build`), including
-# x86_64-gnu — cross's docker images pin an old glibc baseline, which is
-# the whole point: a bare `ubuntu-latest` runner build would link against
-# whatever glibc that runner image ships (often newer than what's on a
-# user's box) and silently produce a binary that only runs on equally new
-# distros. macOS and Windows build natively on their own runners.
+# Linux targets use cross-rs. GNU builds are runtime-tested on Ubuntu 24.04;
+# static musl builds cover older Linux installations. macOS and Windows build
+# on native runners. All archives are extracted and exercised before publication.
 #
 # FreeBSD was removed rather than left failing; re-add it to the matrix
 # when it is wanted.
@@ -310,7 +307,7 @@ jobs:
         env:
           VERSION: ${{ needs.prep.outputs.version }}
         run: |
-          python3 - <<'PY'
+          python - <<'PY'
           import hashlib, os, pathlib, subprocess, sys
           archives = [p for p in pathlib.Path('dist').iterdir() if p.name.endswith(('.tar.gz', '.zip'))]
           assert len(archives) == 1, archives
@@ -331,7 +328,7 @@ jobs:
           VERSION: ${{ needs.prep.outputs.version }}
         run: |
           set -euo pipefail
-          python3 - <<'PY'
+          python - <<'PY'
           import hashlib, pathlib
           for deb in pathlib.Path('dist').glob('*.deb'):
               expected = pathlib.Path(str(deb) + '.sha256').read_text().split()[0]
