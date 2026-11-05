@@ -37,8 +37,8 @@ cargo test -p heather_server --bin heather users::tests::create_and_verify
 
 cargo bench -p heather_db                                  # all benches
 cargo bench -p heather_db --bench write_throughput         # one
-# benches: capacity, graph_search, multi_collection, persistence,
-#          read_latency, store_ops, write_throughput
+# benches: capacity, graph_search, knn_merge, multi_collection,
+#          persistence, read_latency, store_ops, write_throughput
 ```
 
 ### Running the server

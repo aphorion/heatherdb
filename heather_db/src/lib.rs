@@ -42,6 +42,7 @@ pub mod error;
 pub mod hive;
 pub mod location;
 pub mod merge;
+pub mod nearest;
 pub mod read;
 pub mod scan;
 pub mod server;

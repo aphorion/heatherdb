@@ -1,5 +1,6 @@
 use heather_db::EAMConfig;
 use heather_db::vec_ops;
+use rayon::prelude::*;
 
 use crate::consolidate::consolidate;
 use crate::error::{AlgebraError, Result};
@@ -47,55 +48,78 @@ fn pairwise_combine(
 ) -> Vec<heather_db::HardLocation> {
     let patterns_a = extract_patterns(a);
     let patterns_b = extract_patterns(b);
-    let mut locations = Vec::new();
-    let mut id = 0u64;
 
     let use_full = max_cross_k == 0 || max_cross_k >= b.locations.len();
+    // `cosine_similarity` with the norms computed once instead of per pair
+    // (same arithmetic, so the same values).
+    let norms_b: Vec<f64> = b
+        .locations
+        .iter()
+        .map(|l| vec_ops::l2_norm(&l.address))
+        .collect();
 
-    for (i, pa) in patterns_a.iter().enumerate() {
-        let pairs: Box<dyn Iterator<Item = usize>> = if use_full {
-            Box::new(0..patterns_b.len())
-        } else {
-            // Top-k nearest B-locations by address similarity
-            let mut sims: Vec<(usize, f64)> = b
-                .locations
-                .iter()
-                .enumerate()
-                .map(|(j, lb)| {
-                    (
-                        j,
-                        vec_ops::cosine_similarity(&a.locations[i].address, &lb.address),
-                    )
+    // Rows in parallel; ids are assigned afterwards, in row order.
+    let rows: Vec<Vec<Vec<f64>>> = patterns_a
+        .par_iter()
+        .enumerate()
+        .map(|(i, pa)| {
+            let partners: Vec<usize> = if use_full {
+                (0..patterns_b.len()).collect()
+            } else {
+                // Top-k nearest B-locations by address similarity, most
+                // similar first; equal similarities keep B's order.
+                let addr = &a.locations[i].address;
+                let na = vec_ops::l2_norm(addr);
+                let mut sims: Vec<(usize, f64)> = b
+                    .locations
+                    .iter()
+                    .zip(&norms_b)
+                    .enumerate()
+                    .map(|(j, (lb, &nb))| {
+                        let sim = if na < 1e-12 || nb < 1e-12 {
+                            0.0
+                        } else {
+                            vec_ops::dot(addr, &lb.address) / (na * nb)
+                        };
+                        (j, sim)
+                    })
+                    .collect();
+                let order = |x: &(usize, f64), y: &(usize, f64)| {
+                    y.1.partial_cmp(&x.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                        .then(x.0.cmp(&y.0))
+                };
+                sims.select_nth_unstable_by(max_cross_k - 1, order);
+                sims.truncate(max_cross_k);
+                sims.sort_by(order);
+                sims.into_iter().map(|(j, _)| j).collect()
+            };
+            partners
+                .into_iter()
+                .filter_map(|j| {
+                    let combined: Vec<f64> = pa
+                        .iter()
+                        .zip(patterns_b[j].iter())
+                        .map(|(a, b)| a + sign * b)
+                        .collect();
+                    // Skip degenerate (near-zero) combinations
+                    (vec_ops::l2_norm(&combined) >= 1e-10).then_some(combined)
                 })
-                .collect();
-            sims.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-            sims.truncate(max_cross_k);
-            Box::new(sims.into_iter().map(|(j, _)| j))
-        };
+                .collect()
+        })
+        .collect();
 
-        for j in pairs {
-            let pb = &patterns_b[j];
-            let combined: Vec<f64> = pa
-                .iter()
-                .zip(pb.iter())
-                .map(|(a, b)| a + sign * b)
-                .collect();
-
-            // Skip degenerate (near-zero) combinations
-            if vec_ops::l2_norm(&combined) < 1e-10 {
-                continue;
-            }
-
+    rows.into_iter()
+        .flatten()
+        .enumerate()
+        .map(|(id, combined)| {
             let address = vec_ops::normalize(&combined);
-            let mut loc = heather_db::HardLocation::new(heather_db::LocationId(id), address);
+            let mut loc = heather_db::HardLocation::new(heather_db::LocationId(id as u64), address);
             loc.counter = combined;
             loc.write_count = 1.0;
-            locations.push(loc);
-            id += 1;
-        }
-    }
-
-    locations
+            loc
+        })
+        .collect()
 }
 
 /// Energy-correct EAM addition via pairwise pattern sums.
@@ -259,6 +283,68 @@ mod tests {
         config.l_0 = locations.len().max(1);
         config.k = locations.len().clamp(1, 20);
         EAMSnapshot { locations, config }
+    }
+
+    /// The top-k partner selection picks the same partners, in the same
+    /// order, as a full stable sort of every similarity (the original
+    /// implementation), including among exactly tied B-locations.
+    #[test]
+    fn cross_k_selection_matches_a_full_sort() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(17);
+        let d = 8;
+        let mut v = || -> Vec<f64> { (0..d).map(|_| rng.gen_range(-1.0..1.0)).collect() };
+        let a_locs: Vec<HardLocation> = (0..40)
+            .map(|i| {
+                let x = v();
+                make_loc(i, &x, &x, 1.0)
+            })
+            .collect();
+        let mut b_locs: Vec<HardLocation> = (0..60)
+            .map(|i| {
+                let x = v();
+                make_loc(i, &x, &x, 1.0)
+            })
+            .collect();
+        // Exact ties: copies of earlier B-locations.
+        for i in 0..15 {
+            let copy = b_locs[i * 3].clone();
+            b_locs.push(HardLocation {
+                id: LocationId(60 + i as u64),
+                ..copy
+            });
+        }
+        let a = make_snapshot(a_locs, d);
+        let b = make_snapshot(b_locs, d);
+        let k = 6;
+
+        let got = pairwise_combine(&a, &b, 1.0, k);
+
+        let patterns_a = extract_patterns(&a);
+        let patterns_b = extract_patterns(&b);
+        let mut want: Vec<Vec<f64>> = Vec::new();
+        for (i, pa) in patterns_a.iter().enumerate() {
+            let mut sims: Vec<(usize, f64)> = b
+                .locations
+                .iter()
+                .enumerate()
+                .map(|(j, lb)| {
+                    (
+                        j,
+                        vec_ops::cosine_similarity(&a.locations[i].address, &lb.address),
+                    )
+                })
+                .collect();
+            sims.sort_by(|x, y| y.1.partial_cmp(&x.1).unwrap_or(std::cmp::Ordering::Equal));
+            for (j, _) in sims.into_iter().take(k) {
+                want.push(pa.iter().zip(&patterns_b[j]).map(|(x, y)| x + y).collect());
+            }
+        }
+        assert_eq!(got.len(), want.len());
+        for (id, (loc, counter)) in got.iter().zip(&want).enumerate() {
+            assert_eq!(loc.id, LocationId(id as u64));
+            assert_eq!(&loc.counter, counter, "location {id}");
+        }
     }
 
     #[test]
