@@ -1,0 +1,280 @@
+{
+  "started": "2026-11-10T22:03:37",
+  "machine": {
+    "platform": "macOS-26.5.1-arm64-arm-64bit",
+    "cpu": "arm",
+    "python": "3.12.0"
+  },
+  "heather": {
+    "binary": "/Users/nguthiru/Work/Aphorion/heather_db/target/release/heather",
+    "version": "heather 1.0.0",
+    "commit": "e5dfbb25e3348ac7d94b6b92bed9f66e5403cc7f"
+  },
+  "tasks": {
+    "search": {
+      "dataset_fingerprint": "6e44857cb0788b6d",
+      "doc": "Task 1 - Vector search (the job a vector database does).\n\nDataset   Fashion-MNIST, 60 000 x 784 indexed, 1 000 test-set queries.\nTask      top-10 nearest neighbours by cosine similarity.\nTruth     exact brute-force top-10 (numpy, float64).\nMetric    recall@10; single-query latency p50/p95 over HTTP; index build time.\n\nHeatherDB  plain-mode database, every vector a document; `documents/query`.\nQdrant     the real server (Docker, pinned image), cosine, default HNSW\n           (m=16, ef_construct=100), REST API, default search params.\n",
+      "systems": [
+        {
+          "system": "HeatherDB",
+          "recall@10": 1.0,
+          "build_s": 4.5419263751246035,
+          "p50_ms": 44.7074375115335,
+          "p95_ms": 47.26670600939542,
+          "qps_single_client": 21.90120241085797,
+          "server_cpu_s": 44.983200576
+        },
+        {
+          "system": "Qdrant (v1.12.4)",
+          "recall@10": 0.9965999999999999,
+          "build_s": 30.48278500000015,
+          "p50_ms": 4.229104146361351,
+          "p95_ms": 5.647385702468455,
+          "qps_single_client": 229.75397565340174,
+          "mem_bytes": 561093017,
+          "mem_idle_bytes": 208037478,
+          "disk_bytes": 415784724,
+          "process": "docker container"
+        }
+      ]
+    },
+    "discovery": {
+      "dataset_fingerprint": "dad03ba70c986bbd",
+      "doc": "Task 2 - Pattern discovery (the job a clustering / segmentation job does).\n\nDataset   Fashion-MNIST: learn on the 60 000 train images, unlabelled;\n          evaluate on the 10 000 test images.\nTask      find the groups in the data without labels; assign unseen items.\nMetric    NMI and ARI of the test assignment against the hidden labels, and\n          purity (each group labelled by its train majority).\n\nHeatherDB  competitive-mode database; the train images are streamed in with\n           `write` and the memory grows a codebook. MDL picks how many groups\n           the codebook warrants (no K supplied). Unseen items are assigned by\n           their most-activated hard location (`batch_analyze`, fast read).\nk-means    scikit-learn MiniBatchKMeans, given HeatherDB's K (same budget),\n           and k-means given the true number of classes (K=10, an oracle\n           choice HeatherDB is not given).\n",
+      "systems": [
+        {
+          "system": "HeatherDB (codebook + MDL)",
+          "k": 79,
+          "k_chosen_by": "MDL",
+          "codebook_locations": 6423,
+          "fit_s": 49.82108937622979,
+          "assign_s": 17.104912917129695,
+          "nmi": 0.5268046454013527,
+          "ari": 0.30599841598490307,
+          "purity": 0.6546,
+          "at_k10": {
+            "nmi": 0.6050202636926633,
+            "ari": 0.43445025482321936,
+            "purity": 0.6096
+          },
+          "server_cpu_s": 568.4838751999999
+        },
+        {
+          "system": "k-means (HeatherDB's K)",
+          "k": 79,
+          "k_chosen_by": "operator",
+          "fit_s": 2.3811371671035886,
+          "assign_s": 0.04191391682252288,
+          "nmi": 0.5039627743577089,
+          "ari": 0.1431085717166733,
+          "purity": 0.7417,
+          "mem_bytes": 1499709440,
+          "process": "python service"
+        },
+        {
+          "system": "k-means (true K=10, oracle)",
+          "k": 10,
+          "k_chosen_by": "operator",
+          "fit_s": 0.8833292499184608,
+          "assign_s": 0.03545691631734371,
+          "nmi": 0.5611944872712368,
+          "ari": 0.371147259412596,
+          "purity": 0.5576,
+          "mem_bytes": 1508589568,
+          "process": "python service"
+        }
+      ]
+    },
+    "recs": {
+      "dataset_fingerprint": "a316e12c524930bf",
+      "doc": "Task 3 - Recommendations, and Task 4 - Freshness (new data -> served).\n\nDataset   MovieLens 1M (GroupLens). Implicit feedback: a rating is a view.\nSplit     leave-last-out by timestamp: each user's most recent rating is held\n          out; everything else is training data. Evaluated on a seeded\n          sample of users (same users for every system).\nTask      rank the whole catalogue (seen items excluded) for each user.\nMetric    HR@10 and NDCG@10 of the held-out item.\n\nHeatherDB  storage-native, no training step: an item's vector is a fixed\n           random projection of the users who watched it (d=128, computed\n           from training data); each user's history is written into their\n           own collection; the user's `fingerprint` ranks the catalogue.\nPopularity most-watched items.\nItemKNN    cosine item-item neighbourhood over the interaction matrix.\nALS        `implicit` AlternatingLeastSquares, 64 factors, 15 iterations\n           (the standard matrix-factorisation recommender).\nRaw sum    the same item vectors HeatherDB gets, summed with no memory: shows\n           what the associative memory adds beyond the encoding.\n\nFreshness  the cost to make a brand-new user's history servable:\n           HeatherDB = write that user's collection (one request);\n           ALS = refit the model (the usual nightly retrain), timed.\n",
+      "systems": [
+        {
+          "system": "HeatherDB",
+          "hr@10": 0.05,
+          "ndcg@10": 0.024629456888544135,
+          "fit_s": 0.0502205416560173,
+          "load_s": 48.6480000000447,
+          "serve_ms_per_user": 1.0094109373167157,
+          "server_cpu_s": 17.734873087999972
+        },
+        {
+          "system": "Raw sum (same vectors, no memory)",
+          "hr@10": 0.048,
+          "ndcg@10": 0.023170640608354956
+        },
+        {
+          "system": "Popularity",
+          "hr@10": 0.029,
+          "ndcg@10": 0.016057864986794037,
+          "mem_bytes": 551305216,
+          "process": "python service"
+        },
+        {
+          "system": "ItemKNN (cosine)",
+          "hr@10": 0.0615,
+          "ndcg@10": 0.032362309095202046,
+          "fit_s": 1.0204186663031578,
+          "mem_bytes": 551223296,
+          "process": "python service"
+        },
+        {
+          "system": "ALS (implicit, 64 factors)",
+          "hr@10": 0.0755,
+          "ndcg@10": 0.038533645126874815,
+          "fit_s": 4.9823323749005795,
+          "retrain_to_add_new_user_s": 4.9823323749005795,
+          "mem_bytes": 551206912,
+          "process": "python service"
+        }
+      ],
+      "freshness": {
+        "new_user_ready_ms_p50": 19.033020362257957,
+        "new_user_ready_ms_p95": 51.91143469419329
+      }
+    },
+    "fraud": {
+      "dataset_fingerprint": "10a233bed0ece197",
+      "doc": "Task 5 - Fraud / anomaly detection (the job an outlier-detection model does).\n\nDataset   Credit-card fraud (ULB/Worldline, OpenML 1597): 284 807 card\n          transactions, 492 frauds (0.17 %), 28 PCA features + Amount.\nSplit     seeded stratified 50/50. Detectors see NO fraud labels: they learn\n          \"normal\" from a 50 000-transaction sample of training normals.\nMetric    ROC-AUC and PR-AUC (average precision) on the full test half;\n          recall at a 1 % false-positive budget (the usual review-queue cut).\n\nHeatherDB  `bulk_load` the normals (each its own attractor, k=1 read);\n           score = 1 - cosine(transaction, fast-read reconstruction). The\n           encoding is standardised features plus a constant bias coordinate\n           c=100, unit-normalised: for c >> |x|, 1 - cos(a, b) ~ |a-b|^2/2c^2,\n           so the cosine read measures Euclidean distance to normal.\nIForest    scikit-learn IsolationForest (300 trees), same normals.\nLOF        scikit-learn LocalOutlierFactor (novelty, 20 neighbours), same normals.\n",
+      "systems": [
+        {
+          "system": "HeatherDB",
+          "roc_auc": 0.953439045321952,
+          "pr_auc": 0.1989427758922056,
+          "recall@1%fpr": 0.7113821138211383,
+          "fit_s": 0.4284108751453459,
+          "score_us_per_txn": 289.5080396284084,
+          "server_cpu_s": 173.64340326400009
+        },
+        {
+          "system": "Isolation Forest",
+          "roc_auc": 0.9487359593133349,
+          "pr_auc": 0.127460001043891,
+          "recall@1%fpr": 0.5894308943089431,
+          "fit_s": 0.41738558327779174,
+          "score_us_per_txn": 11.483511409364215,
+          "mem_bytes": 624803840,
+          "process": "python service"
+        },
+        {
+          "system": "LOF",
+          "roc_auc": 0.9505880151444912,
+          "pr_auc": 0.4847307271929306,
+          "recall@1%fpr": 0.7845528455284553,
+          "fit_s": 2.581522583961487,
+          "score_us_per_txn": 49.79856224508094,
+          "mem_bytes": 639860736,
+          "process": "python service"
+        }
+      ]
+    },
+    "classify": {
+      "dataset_fingerprint": "b6c9cb9d8534bfe1",
+      "doc": "Task 6 - Tabular classification (the job a supervised ML model does).\n\nDataset   Bank marketing (UCI, OpenML 1461): 45 211 customers, 16 attributes,\n          target = subscribed to a term deposit (11.7 % positive). The\n          canonical churn / propensity / lead-scoring shape.\nSplit     seeded stratified 70/30.\nMetric    ROC-AUC and PR-AUC on the test set.\n\nHeatherDB  classification as associative completion, no model: each training\n           customer is stored with its outcome attached (address = customer,\n           counter = customer + outcome slots). A new customer is read with\n           the outcome slots blank; the read fills them in. Score = the\n           positive slot's share of the completed outcome.\nLogReg     scikit-learn LogisticRegression (the classic baseline).\nGBDT       scikit-learn HistGradientBoostingClassifier (the strong default\n           for tabular data; the XGBoost/LightGBM family).\n",
+      "systems": [
+        {
+          "system": "HeatherDB (associative completion)",
+          "roc_auc": 0.8668017817599254,
+          "pr_auc": 0.48010123604384053,
+          "fit_s": 0.4437931249849498,
+          "score_us_per_row": 615.3936952679901,
+          "server_cpu_s": 20.118040576000112
+        },
+        {
+          "system": "Logistic regression",
+          "roc_auc": 0.9098143317013985,
+          "pr_auc": 0.5689463089234986,
+          "fit_s": 0.03844824992120266,
+          "score_us_per_row": 0.11977780554295289,
+          "mem_bytes": 301039616,
+          "process": "python service"
+        },
+        {
+          "system": "Gradient-boosted trees",
+          "roc_auc": 0.9350189364734414,
+          "pr_auc": 0.6293507415733048,
+          "fit_s": 2.004198083654046,
+          "score_us_per_row": 2.9568834654905563,
+          "mem_bytes": 314441728,
+          "process": "python service"
+        }
+      ]
+    }
+  },
+  "heather_footprint": {
+    "peak_rss_bytes": 1198358528,
+    "rss_all_loaded_bytes": 7045120,
+    "disk_bytes": 1162170368,
+    "databases": {
+      "databases": [
+        {
+          "name": "default",
+          "created_at": 1794337417,
+          "dimension": 128,
+          "map_size_mb": 4096,
+          "collections": 0,
+          "competitive": true,
+          "precision": "f64",
+          "format_version": 1,
+          "skipped_records": 0
+        },
+        {
+          "name": "fraud",
+          "created_at": 1794338115,
+          "dimension": 30,
+          "map_size_mb": 16384,
+          "collections": 1,
+          "competitive": false,
+          "precision": "f64",
+          "format_version": 1,
+          "skipped_records": 0
+        },
+        {
+          "name": "patterns",
+          "created_at": 1794337519,
+          "dimension": 784,
+          "map_size_mb": 16384,
+          "collections": 1,
+          "competitive": true,
+          "precision": "f32",
+          "format_version": 1,
+          "skipped_records": 0
+        },
+        {
+          "name": "propensity",
+          "created_at": 1794338175,
+          "dimension": 54,
+          "map_size_mb": 16384,
+          "collections": 1,
+          "competitive": false,
+          "precision": "f64",
+          "format_version": 1,
+          "skipped_records": 0
+        },
+        {
+          "name": "recs",
+          "created_at": 1794337709,
+          "dimension": 128,
+          "map_size_mb": 16384,
+          "collections": 2000,
+          "competitive": true,
+          "precision": "f32",
+          "format_version": 1,
+          "skipped_records": 0
+        },
+        {
+          "name": "search",
+          "created_at": 1794337426,
+          "dimension": 784,
+          "map_size_mb": 16384,
+          "collections": 1,
+          "competitive": false,
+          "precision": "f32",
+          "format_version": 1,
+          "skipped_records": 0
+        }
+      ]
+    }
+  },
+  "finished": "2026-11-10T22:16:33"
+}

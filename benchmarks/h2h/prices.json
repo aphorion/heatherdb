@@ -1,0 +1,13 @@
+{
+  "_note": "AWS us-east-1 on-demand list prices (USD), Graviton m7g family, as recalled at time of writing (2026-11). Edit to your provider; the report recomputes.",
+  "hours_per_month": 730,
+  "instances": [
+    {"name": "m7g.medium", "vcpu": 1, "mem_gib": 4,  "usd_per_hour": 0.0408},
+    {"name": "m7g.large",  "vcpu": 2, "mem_gib": 8,  "usd_per_hour": 0.0816},
+    {"name": "m7g.xlarge", "vcpu": 4, "mem_gib": 16, "usd_per_hour": 0.1632},
+    {"name": "m7g.2xlarge","vcpu": 8, "mem_gib": 32, "usd_per_hour": 0.3264}
+  ],
+  "block_storage_usd_per_gib_month": 0.08,
+  "memory_headroom": 1.5,
+  "retrain_runs_per_month": 30
+}
