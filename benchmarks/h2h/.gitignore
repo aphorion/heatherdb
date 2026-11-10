@@ -5,3 +5,5 @@ __pycache__/
 results/run.log
 results/results.pre-shadow.json
 results/results.pre-memcut.json
+.venv
+data
