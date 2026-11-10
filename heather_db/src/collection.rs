@@ -2159,58 +2159,14 @@ impl Collection {
 
         match strategy {
             ReadStrategy::HopfieldIter => {
-                // Run iterative read from the (possibly graph-found) activation set
-                let patterns: Vec<Vec<f64>> = indices
-                    .iter()
-                    .map(|&i| inner.locations[i].unit_pattern())
-                    .collect();
-                let addresses: Vec<&[f64]> = indices
-                    .iter()
-                    .map(|&i| inner.locations[i].address.as_slice())
-                    .collect();
-
-                let mut xi = vec_ops::normalize(query);
-                let mut converged = false;
-                let mut iterations = 0;
-                let mut final_weights = vec_ops::softmax(&sims, inner.config.beta);
-
-                for t in 0..inner.config.t_max {
-                    iterations = t + 1;
-                    let step_sims: Vec<f64> = addresses
-                        .iter()
-                        .map(|addr| vec_ops::cosine_similarity(&xi, addr))
-                        .collect();
-                    let alpha = vec_ops::softmax(&step_sims, inner.config.beta);
-                    final_weights = alpha.clone();
-                    let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
-                    let xi_new = vec_ops::normalize(&vec_ops::weighted_sum(&pattern_refs, &alpha));
-                    let sim = vec_ops::cosine_similarity(&xi, &xi_new);
-                    xi = xi_new;
-                    if sim > 1.0 - inner.config.epsilon {
-                        converged = true;
-                        break;
-                    }
-                }
-
-                let activated_locations = indices
-                    .iter()
-                    .zip(final_weights.iter())
-                    .map(|(&idx, &weight)| {
-                        let sim = vec_ops::cosine_similarity(&xi, &inner.locations[idx].address);
-                        read::ActivatedLocation {
-                            id: idx,
-                            similarity: sim,
-                            weight,
-                        }
-                    })
-                    .collect();
-
-                Ok(ReadTrace {
-                    iterations,
-                    converged,
-                    activated_locations,
-                    result: xi,
-                })
+                // Settle on the keys of the (possibly graph-found) activation
+                // set, then read the values once.
+                Ok(read::trace_settled(
+                    query,
+                    &inner.locations,
+                    &inner.config,
+                    &indices,
+                ))
             }
             ReadStrategy::HopfieldSS => {
                 let alpha = vec_ops::softmax(&sims, inner.config.beta);
