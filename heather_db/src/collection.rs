@@ -250,56 +250,28 @@ pub(crate) struct EAMInner {
     pub(crate) landmarks_at: usize,
     /// Flat LocationId → index lookup array for O(1) graph traversal
     pub(crate) id_lookup: Vec<u32>,
-    /// Contiguous [L × D] f32 copy of the addresses (row i =
-    /// `locations[i].address`), for the k-nearest scans of writes and reads
-    /// (see [`scan`]) and the shadow index. Updated incrementally on writes.
-    pub(crate) matrix32: Vec<f32>,
-    /// An upper bound on the norm of every row of `matrix32`.
-    pub(crate) max_norm: f64,
+    /// The int8 shadow of every address (row i = `locations[i].address`),
+    /// for the exact k-nearest scans of writes and reads (see [`scan`]).
+    /// Updated incrementally on writes.
+    pub(crate) scan: scan::Scan,
     /// In-process mutation counter. Bumped on every write-locked mutation;
     /// lets snapshot→load_snapshot cycles detect concurrent writes. Not
     /// persisted — resets to 0 on load.
     pub(crate) version: u64,
 }
 
-/// The f32 copy of these locations' addresses (see [`scan`]) and an upper
-/// bound on their norms.
 impl EAMInner {
     /// The exact `k` nearest locations to `query` for a read, sorted
-    /// descending: the parallel f32 scan writes use (see [`scan`]), whose
+    /// descending: the int8 shadow scan writes use (see [`scan`]), whose
     /// candidates are re-ranked in f64, so the answer is the f64 scan's. It
-    /// falls back to the f64 scan when the f32 copy is not in step.
+    /// falls back to the f64 scan when the shadow is not in step.
     pub(crate) fn activate(&self, query: &[f64], k: usize) -> (Vec<usize>, Vec<f64>) {
-        scan::nearest(
-            query,
-            &self.locations,
-            k,
-            &write_scan(&self.matrix32, self.max_norm),
-        )
-    }
-}
-
-fn f32_rows(locations: &[HardLocation]) -> (Vec<f32>, f64) {
-    let mut rows =
-        Vec::with_capacity(locations.len() * locations.first().map_or(0, |l| l.address.len()));
-    let mut max_norm: f64 = 0.0;
-    for loc in locations {
-        rows.extend(loc.address.iter().map(|&a| a as f32));
-        max_norm = max_norm.max(vec_ops::l2_norm(&loc.address));
-    }
-    (rows, max_norm)
-}
-
-/// What a write searches for its k nearest locations (see [`scan`]).
-fn write_scan(matrix32: &[f32], max_norm: f64) -> scan::Scan<'_> {
-    scan::Scan {
-        matrix: matrix32,
-        max_norm,
+        scan::nearest(query, &self.locations, k, &self.scan)
     }
 }
 
 impl EAMInner {
-    /// Full rebuild of landmarks + id_lookup + the f32 address matrix.
+    /// Full rebuild of landmarks + id_lookup + the int8 shadow.
     pub(crate) fn rebuild_graph_cache(&mut self) {
         self.id_lookup = read::build_id_lookup(&self.locations);
         self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
@@ -328,21 +300,15 @@ impl EAMInner {
         }
     }
 
-    /// Rebuild the f32 address matrix from locations.
+    /// Rebuild the int8 shadow from locations.
     pub(crate) fn rebuild_address_matrix(&mut self) {
-        (self.matrix32, self.max_norm) = f32_rows(&self.locations);
+        self.scan = scan::Scan::from_locations(&self.locations);
     }
 
     /// Sync specific rows of the address matrix after address migration.
     pub(crate) fn sync_addresses(&mut self, indices: &[usize]) {
-        let d = self.config.d;
         for &idx in indices {
-            let start = idx * d;
-            let address = &self.locations[idx].address;
-            for (x, &a) in self.matrix32[start..start + d].iter_mut().zip(address) {
-                *x = a as f32;
-            }
-            self.max_norm = self.max_norm.max(vec_ops::l2_norm(address));
+            self.scan.set(idx, &self.locations[idx].address);
         }
     }
 
@@ -350,9 +316,7 @@ impl EAMInner {
     /// as the collection grows).
     pub(crate) fn append_addresses(&mut self, start_idx: usize) {
         for i in start_idx..self.locations.len() {
-            let address = &self.locations[i].address;
-            self.matrix32.extend(address.iter().map(|&a| a as f32));
-            self.max_norm = self.max_norm.max(vec_ops::l2_norm(address));
+            self.scan.push(&self.locations[i].address);
         }
         self.refresh_landmarks();
     }
@@ -447,63 +411,6 @@ pub struct Collection {
     /// The database's selective attention, shared by its collections; `None`
     /// unless the database opted in. See [`crate::attention`].
     attention: Option<Arc<crate::attention::SharedAttention>>,
-    /// Exact k-nearest index for document queries on plain collections,
-    /// built on first use (see [`crate::shadow`]). Not persisted.
-    shadow: std::sync::Mutex<Option<Arc<crate::shadow::ShadowIndex>>>,
-}
-
-impl Collection {
-    /// The exact `k` nearest locations for a document query: the shadow
-    /// index on a large plain collection, otherwise [`EAMInner::activate`].
-    /// Both return the same rows in the same order. Plain collections only
-    /// append, so rows written after the index was built are scanned
-    /// directly, and the index is rebuilt once they pass
-    /// [`crate::shadow::REBUILD_FRACTION`] of it or the indexed prefix changes.
-    fn activate_indexed(
-        &self,
-        inner: &EAMInner,
-        query: &[f64],
-        k: usize,
-    ) -> (Vec<usize>, Vec<f64>) {
-        use crate::shadow::{MIN_ROWS, REBUILD_FRACTION, ShadowIndex};
-        let n = inner.locations.len();
-        let d = inner.config.d;
-        if inner.config.competitive
-            || n < MIN_ROWS
-            || k == 0
-            || k > n
-            || inner.matrix32.len() != n * d
-        {
-            return inner.activate(query, k);
-        }
-        let usable = |idx: &ShadowIndex| {
-            idx.indexed <= n
-                && inner.locations[0].id.0 == idx.first_id
-                && inner.locations[idx.indexed - 1].id.0 == idx.last_id
-                && ((n - idx.indexed) as f64) <= REBUILD_FRACTION * idx.indexed as f64
-        };
-        let index = {
-            let Ok(mut slot) = self.shadow.lock() else {
-                return inner.activate(query, k);
-            };
-            match slot.as_ref() {
-                Some(idx) if usable(idx) => idx.clone(),
-                _ => {
-                    let built = Arc::new(ShadowIndex::build(
-                        &inner.matrix32,
-                        n,
-                        d,
-                        inner.locations[0].id.0,
-                        inner.locations[n - 1].id.0,
-                    ));
-                    *slot = Some(built.clone());
-                    built
-                }
-            }
-        };
-        let q = vec_ops::normalize(query);
-        index.nearest(&q, k, n, |r| inner.locations[r].address.as_slice())
-    }
 }
 
 /// Hold the collection lock through persistence and recovery. Successful writes
@@ -659,7 +566,7 @@ impl Collection {
         let id_lookup = read::build_id_lookup(&locations);
         let landmarks = read::select_landmarks(&locations, config.num_landmarks);
         let landmarks_at = locations.len();
-        let (matrix32, max_norm) = f32_rows(&locations);
+        let scan = scan::Scan::from_locations(&locations);
         Ok(Collection {
             collection_id,
             name,
@@ -673,13 +580,11 @@ impl Collection {
                 landmarks_at,
                 landmarks,
                 id_lookup,
-                matrix32,
-                max_norm,
+                scan,
                 version: 0,
             }),
             store,
             attention: None,
-            shadow: std::sync::Mutex::new(None),
         })
     }
 
@@ -723,7 +628,7 @@ impl Collection {
         let id_lookup = read::build_id_lookup(&locations);
         let landmarks = read::select_landmarks(&locations, config.num_landmarks);
         let landmarks_at = locations.len();
-        let (matrix32, max_norm) = f32_rows(&locations);
+        let scan = scan::Scan::from_locations(&locations);
         Ok(Collection {
             collection_id,
             name,
@@ -737,13 +642,11 @@ impl Collection {
                 landmarks_at,
                 landmarks,
                 id_lookup,
-                matrix32,
-                max_norm,
+                scan,
                 version: 0,
             }),
             store,
             attention: None,
-            shadow: std::sync::Mutex::new(None),
         })
     }
 
@@ -780,19 +683,10 @@ impl Collection {
                 ref mut locations,
                 ref mut next_id,
                 ref mut eta,
-                ref matrix32,
-                max_norm,
+                ref scan,
                 ..
             } = *inner;
-            let r = write::adaptive_write(
-                input,
-                locations,
-                config,
-                *eta,
-                next_id,
-                &mut rng,
-                &write_scan(matrix32, max_norm),
-            );
+            let r = write::adaptive_write(input, locations, config, *eta, next_id, &mut rng, scan);
             *eta = r.eta;
             r
         };
@@ -875,20 +769,11 @@ impl Collection {
                 ref mut locations,
                 ref mut next_id,
                 ref mut eta,
-                ref matrix32,
-                max_norm,
+                ref scan,
                 ..
             } = *inner;
             let r = write::adaptive_write_two(
-                address,
-                counter,
-                locations,
-                config,
-                *eta,
-                next_id,
-                &mut rng,
-                &write_scan(matrix32, max_norm),
-                opts,
+                address, counter, locations, config, *eta, next_id, &mut rng, scan, opts,
             );
             *eta = r.eta;
             r
@@ -1075,19 +960,11 @@ impl Collection {
                     ref mut locations,
                     ref mut next_id,
                     ref mut eta,
-                    ref matrix32,
-                    max_norm,
+                    ref scan,
                     ..
                 } = *inner;
-                let r = write::adaptive_write(
-                    input,
-                    locations,
-                    config,
-                    *eta,
-                    next_id,
-                    &mut rng,
-                    &write_scan(matrix32, max_norm),
-                );
+                let r =
+                    write::adaptive_write(input, locations, config, *eta, next_id, &mut rng, scan);
                 *eta = r.eta;
                 r
             };
@@ -1878,19 +1755,10 @@ impl Collection {
                 ref mut locations,
                 ref mut next_id,
                 ref mut eta,
-                ref matrix32,
-                max_norm,
+                ref scan,
                 ..
             } = *inner;
-            let r = write::adaptive_write(
-                input,
-                locations,
-                config,
-                *eta,
-                next_id,
-                &mut rng,
-                &write_scan(matrix32, max_norm),
-            );
+            let r = write::adaptive_write(input, locations, config, *eta, next_id, &mut rng, scan);
             *eta = r.eta;
             r
         };
@@ -2036,19 +1904,11 @@ impl Collection {
                     ref mut locations,
                     ref mut next_id,
                     ref mut eta,
-                    ref matrix32,
-                    max_norm,
+                    ref scan,
                     ..
                 } = *inner;
-                let r = write::adaptive_write(
-                    input,
-                    locations,
-                    config,
-                    *eta,
-                    next_id,
-                    &mut rng,
-                    &write_scan(matrix32, max_norm),
-                );
+                let r =
+                    write::adaptive_write(input, locations, config, *eta, next_id, &mut rng, scan);
                 *eta = r.eta;
                 r
             };
@@ -2339,7 +2199,7 @@ impl Collection {
         let k = (inner.config.k * QUERY_CANDIDATE_FACTOR)
             .max(n)
             .min(inner.locations.len());
-        let (indices, _sims) = self.activate_indexed(&inner, query, k);
+        let (indices, _sims) = inner.activate(query, k);
 
         // Step 2: Gather candidate doc IDs from posting lists (deduplicated)
         let mut candidate_ids = std::collections::HashSet::new();
@@ -2482,7 +2342,7 @@ impl Collection {
         let k = (inner.config.k * QUERY_CANDIDATE_FACTOR)
             .max(n)
             .min(inner.locations.len());
-        let (indices, _sims) = self.activate_indexed(&inner, query, k);
+        let (indices, _sims) = inner.activate(query, k);
 
         // The cleanup temperature is a property of the codebook's geometry,
         // not of any one recovered filler, so it is selected once per query

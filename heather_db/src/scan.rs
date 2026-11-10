@@ -1,21 +1,30 @@
-//! Exact k-nearest search for writes, from a single-precision scan.
+//! Exact k-nearest search from an int8 shadow of every address.
 //!
-//! A write needs the k locations nearest its input ([`read::activate`]
+//! Reads and writes need the k locations nearest a query ([`read::activate`]
 //! finds them with an f64 dot product per location). This module finds the
-//! same k for less: it scores every location in f32, where a dot product is
-//! about twice as cheap and vectorises, keeps every location the f32 score
-//! cannot rule out, and ranks those with the engine's own f64 dot.
+//! same k by reading a quarter of the bytes: every address keeps an **int8
+//! shadow** — its coordinates rounded to one of 255 levels of a per-row
+//! scale — together with two numbers that make the shadow's error exact:
+//! how far the shadow is from the address, and the shadow's own length.
 //!
-//! **Why the answer is exact.** For unit vectors the f32 dot product differs
-//! from the true one by at most `err` (a rounding bound, [`error_bound`]).
-//! Let `t` be the k-th best f32 score. The k locations scoring at least `t`
-//! truly score at least `t − err`, so the true k-th best does too, and every
-//! location in the true top k has an f32 score of at least `t − 2·err`.
-//! Those are the candidates; the f64 dot ranks them. With `err` near 1e-5
-//! there are about k candidates, so the f64 work is negligible.
+//! **Why the answer is exact.** Write the query `q` and an address `x` as
+//! their shadows plus a remainder, `q = q̃ + (q − q̃)` and `x = x̃ + (x − x̃)`.
+//! Then
 //!
-//! Writing the demo's 62,418 movie embeddings (d = 128) took 32 s instead of
-//! the f64 scan's 70 s, and built the same memory, bit for bit.
+//! ```text
+//! |q·x − q̃·x̃|  ≤  |q| |x − x̃|  +  |q − q̃| |x̃|
+//! ```
+//!
+//! and `q̃·x̃` is an integer dot product times two scales, computed exactly.
+//! Every row therefore gets a certified interval for its true score. Let
+//! `floor` be the k-th best lower end. The true k-th best score is at least
+//! `floor`, so every location in the true top k has an upper end of at least
+//! `floor`. Those rows are the candidates, and the engine's own f64 dot ranks
+//! them, so the result is [`read::activate`]'s. On real embeddings the
+//! intervals are narrow enough that a few dozen rows of a million survive.
+//!
+//! An int8 shadow is a quarter of the size of an f32 copy and an eighth of
+//! the f64 addresses, and the scan is limited by how many bytes it reads.
 //!
 //! [`read::activate`]: crate::read::activate
 
@@ -25,60 +34,133 @@ use crate::location::HardLocation;
 use crate::read;
 use crate::vec_ops;
 
-/// Minimum work (locations · dimension) before the f32 scan uses rayon.
+/// Minimum work (locations · dimension) before the scan uses rayon.
 const PARALLEL_THRESHOLD: usize = 200_000;
+/// Rows per parallel chunk.
+const CHUNK: usize = 4096;
 
-/// The f32 copy of a collection's addresses, row `i` = `locations[i].address`.
-pub struct Scan<'a> {
-    pub matrix: &'a [f32],
-    /// An upper bound on every row's norm.
-    pub max_norm: f64,
+/// The int8 shadow of a collection's addresses; row `i` shadows
+/// `locations[i].address`.
+#[derive(Debug, Clone, Default)]
+pub struct Scan {
+    d: usize,
+    codes: Vec<i8>,
+    /// Per-row scale: the shadow is `codes · scale`.
+    scale: Vec<f32>,
+    /// Upper bound on `|x − x̃|`.
+    err: Vec<f32>,
+    /// Upper bound on `|x̃|`.
+    norm: Vec<f32>,
 }
 
-impl Default for Scan<'_> {
-    /// No matrix: [`nearest`] falls back to [`read::activate`].
-    fn default() -> Self {
-        Self {
-            matrix: &[],
-            max_norm: 0.0,
-        }
+/// An f64 rounded up to the nearest f32 that is not smaller.
+fn up(v: f64) -> f32 {
+    let f = v as f32;
+    if (f as f64) < v { f.next_up() } else { f }
+}
+
+/// Shadow of one vector: codes, scale, and the two error terms, in f64.
+fn quantise(x: &[f64]) -> (Vec<i8>, f64, f64, f64) {
+    let m = x.iter().fold(0.0f64, |a, v| a.max(v.abs()));
+    if !(m > 0.0 && m.is_finite()) {
+        // Nothing to round (zero or non-finite): the shadow is zero and the
+        // whole vector is error.
+        let e = x.iter().map(|v| v * v).sum::<f64>().sqrt();
+        return (vec![0; x.len()], 1.0, e, 0.0);
     }
+    let s = (m / 127.0) as f32 as f64; // the scale actually stored
+    let mut codes = Vec::with_capacity(x.len());
+    let (mut e2, mut n2) = (0.0f64, 0.0f64);
+    for &v in x {
+        let c = (v / s).round().clamp(-127.0, 127.0);
+        let r = c * s;
+        codes.push(c as i8);
+        e2 += (v - r) * (v - r);
+        n2 += r * r;
+    }
+    (codes, s, e2.sqrt(), n2.sqrt())
 }
 
-/// The largest difference between an f32 dot product of `q` and a row (any
-/// summation order, with or without fused multiply-add) and its f64 value as
-/// computed by [`vec_ops::dot`].
-///
-/// Rounding each factor to f32 and the product costs at most 3u relative
-/// (u = 2⁻²⁴), summing d terms at most (d − 1)u of Σ|qᵢxᵢ| ≤ |q||x|; the f64
-/// dot adds d·2⁻⁵³ of the same. Factors below f32's normal range lose up to
-/// its smallest normal each. The 1% margin covers the second-order terms.
-pub fn error_bound(d: usize, q_norm: f64, max_norm: f64) -> f64 {
-    let u = f32::EPSILON as f64 / 2.0;
-    let rel = (d as f64 + 3.0) * u + d as f64 * f64::EPSILON;
-    1.01 * rel * q_norm * max_norm + 2.0 * d as f64 * f32::MIN_POSITIVE as f64
-}
-
-/// f32 dot product with 16 independent accumulators, so it vectorises.
 #[inline]
-pub fn dot_f32(a: &[f32], b: &[f32]) -> f32 {
-    let mut acc = [0.0f32; 16];
-    let (ca, ra) = a.as_chunks::<16>();
-    let (cb, rb) = b.as_chunks::<16>();
-    for (x, y) in ca.iter().zip(cb) {
-        for j in 0..16 {
-            acc[j] += x[j] * y[j];
-        }
-    }
-    let mut sum: f32 = acc.iter().sum();
-    for (x, y) in ra.iter().zip(rb) {
-        sum += x * y;
-    }
-    sum
+fn dot_i8(a: &[i8], b: &[i8]) -> i32 {
+    a.iter().zip(b).map(|(x, y)| *x as i32 * *y as i32).sum()
 }
 
-pub fn to_f32(v: &[f64]) -> Vec<f32> {
-    v.iter().map(|&x| x as f32).collect()
+impl Scan {
+    /// The shadow of every address.
+    pub fn from_locations(locations: &[HardLocation]) -> Self {
+        let d = locations.first().map_or(0, |l| l.address.len());
+        let mut s = Scan {
+            d,
+            ..Default::default()
+        };
+        s.codes.reserve(locations.len() * d);
+        for loc in locations {
+            s.push(&loc.address);
+        }
+        s
+    }
+
+    /// Rows shadowed.
+    pub fn len(&self) -> usize {
+        self.scale.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.scale.is_empty()
+    }
+
+    /// Bytes the shadow holds.
+    pub fn bytes(&self) -> usize {
+        self.codes.len() + 12 * self.scale.len()
+    }
+
+    /// Appends the shadow of a new address.
+    pub fn push(&mut self, address: &[f64]) {
+        if self.d == 0 {
+            self.d = address.len();
+        }
+        let (c, s, e, n) = quantise(address);
+        self.codes.extend_from_slice(&c);
+        self.scale.push(s as f32);
+        self.err.push(up(e));
+        self.norm.push(up(n));
+    }
+
+    /// Replaces row `i` after its address moved.
+    pub fn set(&mut self, i: usize, address: &[f64]) {
+        let d = self.d;
+        let (c, s, e, n) = quantise(address);
+        self.codes[i * d..(i + 1) * d].copy_from_slice(&c);
+        self.scale[i] = s as f32;
+        self.err[i] = up(e);
+        self.norm[i] = up(n);
+    }
+
+    /// Certified (lower, upper) bounds on `q·x_i` for rows `lo..hi`, where
+    /// `q` has shadow `(cq, tq)`, length `qn` and shadow error `eq`.
+    fn bounds(
+        &self,
+        cq: &[i8],
+        tq: f64,
+        qn: f64,
+        eq: f64,
+        lo: usize,
+        hi: usize,
+    ) -> Vec<(f64, f64)> {
+        let d = self.d;
+        // f64 rounding of the exact product and of the engine's own f64 dot.
+        let fp = 4.0 * (d as f64 + 4.0) * f64::EPSILON;
+        (lo..hi)
+            .map(|i| {
+                let approx =
+                    tq * self.scale[i] as f64 * dot_i8(cq, &self.codes[i * d..(i + 1) * d]) as f64;
+                let (e, n) = (self.err[i] as f64, self.norm[i] as f64);
+                let rad = qn * e + eq * n + fp * qn * (n + e) + f64::MIN_POSITIVE;
+                (approx - rad, approx + rad)
+            })
+            .collect()
+    }
 }
 
 /// The exact k nearest locations to `query`, sorted descending: the same
@@ -92,46 +174,36 @@ pub fn nearest(
 ) -> (Vec<usize>, Vec<f64>) {
     let n = locations.len();
     let d = query.len();
-    let usable = k > 0
-        && k <= n
-        && scan.matrix.len() == n * d
-        && scan.max_norm.is_finite()
-        && scan.max_norm < 1e30;
-    if !usable {
+    if !(k > 0 && k <= n && scan.len() == n && scan.d == d) {
         return read::activate(query, locations, k);
     }
 
     let q = vec_ops::normalize(query);
-    let q32 = to_f32(&q);
-    let mut approx = score_rows(&q32, scan.matrix, d);
+    let (cq, tq, eq, _) = quantise(&q);
+    let qn = vec_ops::l2_norm(&q);
 
-    let err = error_bound(d, vec_ops::l2_norm(&q), scan.max_norm);
-    let mut sorted = approx.clone();
-    let (_, kth, _) = sorted.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
-    let floor = *kth as f64 - 2.0 * err;
+    let bounds: Vec<(f64, f64)> = if n * d >= PARALLEL_THRESHOLD {
+        (0..n.div_ceil(CHUNK))
+            .into_par_iter()
+            .flat_map_iter(|c| scan.bounds(&cq, tq, qn, eq, c * CHUNK, ((c + 1) * CHUNK).min(n)))
+            .collect()
+    } else {
+        scan.bounds(&cq, tq, qn, eq, 0, n)
+    };
 
-    let mut best: Vec<(usize, f64)> = approx
-        .drain(..)
+    let mut lows: Vec<f64> = bounds.iter().map(|b| b.0).collect();
+    let (_, kth, _) = lows.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
+    let floor = *kth;
+
+    let mut best: Vec<(usize, f64)> = bounds
+        .iter()
         .enumerate()
-        .filter(|&(_, a)| a as f64 >= floor)
+        .filter(|(_, b)| b.1 >= floor)
         .map(|(i, _)| (i, vec_ops::dot(&q, &locations[i].address)))
         .collect();
     best.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     best.truncate(k);
     best.into_iter().unzip()
-}
-
-/// f32 scores of `q` against every row of `matrix`.
-fn score_rows(q: &[f32], matrix: &[f32], d: usize) -> Vec<f32> {
-    if matrix.len() >= PARALLEL_THRESHOLD {
-        matrix
-            .par_chunks(d)
-            .with_min_len(256)
-            .map(|row| dot_f32(q, row))
-            .collect()
-    } else {
-        matrix.chunks(d).map(|row| dot_f32(q, row)).collect()
-    }
 }
 
 #[cfg(test)]
@@ -160,25 +232,18 @@ mod tests {
             .collect()
     }
 
-    fn matrix(locations: &[HardLocation]) -> Vec<f32> {
-        locations.iter().flat_map(|l| to_f32(&l.address)).collect()
-    }
-
-    fn sims_of(locations: &[HardLocation], q: &[f64], k: usize) -> Vec<f64> {
-        read::activate(q, locations, k).1
-    }
-
     #[test]
-    fn the_f32_scan_finds_the_exact_nearest() {
+    fn the_int8_scan_finds_the_exact_nearest() {
         let mut rng = StdRng::seed_from_u64(7);
-        for (n, d) in [(50, 3), (3000, 64), (2500, 130)] {
+        for (n, d) in [(50, 3), (3000, 64), (2500, 130), (600, 784)] {
             let mut locations = clustered(n, d, &mut rng);
             locations[1].address = locations[0].address.clone();
-            let m = matrix(&locations);
-            let scan = Scan {
-                matrix: &m,
-                max_norm: 1.0 + 1e-12,
-            };
+            // Rows of very different lengths, as plain collections store them.
+            for (i, loc) in locations.iter_mut().enumerate().filter(|(i, _)| i % 5 == 4) {
+                let s = 1.0 + (i % 7) as f64;
+                loc.address.iter_mut().for_each(|x| *x *= s);
+            }
+            let scan = Scan::from_locations(&locations);
             for t in 0..200 {
                 let q = if t % 2 == 0 {
                     locations[rng.gen_range(0..n)].address.clone()
@@ -187,9 +252,9 @@ mod tests {
                 };
                 for k in [1, 20] {
                     let (idx, sims) = nearest(&q, &locations, k, &scan);
-                    // Same similarities as the f64 scan (indices may differ only
-                    // between exactly equal similarities).
-                    assert_eq!(sims, sims_of(&locations, &q, k));
+                    // Same similarities as the f64 scan (indices may differ
+                    // only between exactly equal similarities).
+                    assert_eq!(sims, read::activate(&q, &locations, k).1);
                     for (&i, &s) in idx.iter().zip(&sims) {
                         assert_eq!(
                             s,
@@ -202,20 +267,64 @@ mod tests {
     }
 
     #[test]
-    fn the_error_bound_holds() {
+    fn the_bounds_hold() {
         let mut rng = StdRng::seed_from_u64(5);
         for d in [2, 64, 128, 1024] {
-            let rows: Vec<Vec<f64>> = (0..300)
-                .map(|_| vec_ops::random_unit_vector(d, &mut rng))
+            let rows: Vec<HardLocation> = (0..300)
+                .map(|i| {
+                    let scale = rng.gen_range(0.01..50.0);
+                    let v: Vec<f64> = vec_ops::random_unit_vector(d, &mut rng)
+                        .iter()
+                        .map(|x| x * scale)
+                        .collect();
+                    HardLocation::new(LocationId(i), v)
+                })
                 .collect();
-            let m: Vec<f32> = rows.iter().flat_map(|r| to_f32(r)).collect();
+            let scan = Scan::from_locations(&rows);
             let q = vec_ops::random_unit_vector(d, &mut rng);
-            let err = error_bound(d, 1.0, 1.0 + 1e-12);
-            for (i, r) in rows.iter().enumerate() {
-                let exact = vec_ops::dot(&q, r);
-                let row = &m[i * d..(i + 1) * d];
-                assert!((dot_f32(&to_f32(&q), row) as f64 - exact).abs() <= err);
+            let (cq, tq, eq, _) = quantise(&q);
+            let b = scan.bounds(&cq, tq, vec_ops::l2_norm(&q), eq, 0, rows.len());
+            for (r, (lo, hi)) in rows.iter().zip(b) {
+                let exact = vec_ops::dot(&q, &r.address);
+                assert!(lo <= exact && exact <= hi, "{lo} <= {exact} <= {hi}");
             }
         }
+    }
+
+    #[test]
+    fn set_and_push_keep_rows_in_step() {
+        let mut rng = StdRng::seed_from_u64(9);
+        let mut locations = clustered(500, 32, &mut rng);
+        let mut scan = Scan::from_locations(&locations[..400]);
+        for loc in &locations[400..] {
+            scan.push(&loc.address);
+        }
+        for i in [3, 77, 450] {
+            locations[i].address = vec_ops::random_unit_vector(32, &mut rng);
+            scan.set(i, &locations[i].address);
+        }
+        for _ in 0..50 {
+            let q = vec_ops::random_unit_vector(32, &mut rng);
+            assert_eq!(
+                nearest(&q, &locations, 10, &scan).1,
+                read::activate(&q, &locations, 10).1
+            );
+        }
+    }
+
+    #[test]
+    fn zero_and_empty_rows_are_handled() {
+        let locations = vec![
+            HardLocation::new(LocationId(0), vec![0.0; 4]),
+            HardLocation::new(LocationId(1), vec![1.0, 0.0, 0.0, 0.0]),
+            HardLocation::new(LocationId(2), vec![0.0, 2.0, 0.0, 0.0]),
+        ];
+        let scan = Scan::from_locations(&locations);
+        let q = [0.9, 0.1, 0.0, 0.0];
+        assert_eq!(
+            nearest(&q, &locations, 2, &scan).1,
+            read::activate(&q, &locations, 2).1
+        );
+        assert_eq!(scan.bytes(), 3 * 4 + 36);
     }
 }

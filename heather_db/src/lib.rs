@@ -47,7 +47,6 @@ pub mod nearest;
 pub mod read;
 pub mod scan;
 pub mod server;
-pub mod shadow;
 pub mod store;
 pub mod vec_ops;
 pub mod verify;

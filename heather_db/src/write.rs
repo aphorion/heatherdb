@@ -486,10 +486,7 @@ mod tests {
                 HardLocation::new(LocationId(i as u64), vec_ops::normalize(&v))
             })
             .collect();
-        let matrix: Vec<f32> = locations
-            .iter()
-            .flat_map(|l| scan::to_f32(&l.address))
-            .collect();
+        let shadow = Scan::from_locations(&locations);
 
         let target = 257;
         let input = locations[target].address.clone();
@@ -501,10 +498,7 @@ mod tests {
             0.01,
             &mut next_id,
             &mut rng,
-            &Scan {
-                matrix: &matrix,
-                max_norm: 1.0 + 1e-12,
-            },
+            &shadow,
         );
         assert!(
             result.modified_indices.contains(&target),
