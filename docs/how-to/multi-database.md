@@ -92,8 +92,9 @@ curl -u admin:pw -X DELETE http://localhost:6380/db/movies
 ```
 
 This does **not** delete anything. The directory is moved to
-`$HEATHER_DATA_DIR/_trash/movies-<unix-seconds>/`. There is no automatic
-cleanup of the trash — reclaiming that disk is your call.
+`$HEATHER_DATA_DIR/_trash/movies-<unix-seconds>/` (with a `-1`, `-2`, …
+suffix if `movies` was already dropped in the same second). There is no
+automatic cleanup of the trash — reclaiming that disk is your call.
 
 `{"dropped": false}` means the database was not mounted.
 

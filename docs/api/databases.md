@@ -104,7 +104,9 @@ records reads have skipped since it was opened because they did not decode
 
 Drop a database. Moves `$DATA/db/{db}/` to
 `$DATA/_trash/{db}-<unix-seconds>/` rather than deleting it — recover by
-moving the directory back and restarting.
+moving the directory back and restarting. When the same name was already
+dropped within that second, the entry gets a counter:
+`{db}-<unix-seconds>-1/`, `-2/`, and so on.
 
 Auth: Basic or Bearer, root or `Database(db)`. The scope classifier is
 method-blind on `/db/{name}/...`, so a user scoped to `movies` can drop
@@ -132,7 +134,7 @@ disk. Without it, `purged` is `false`.
 
 | Status | Cause |
 |---|---|
-| `400 Bad Request` | the move to `_trash/` failed |
+| `400 Bad Request` | the move to `_trash/` failed; the database stays mounted and unchanged |
 | `403 Forbidden` | the caller is scoped to a different database, or the target is `default`, which cannot be dropped (the legacy routes target it) |
 
 See also [Backup and restore](../how-to/backup-and-restore.md).

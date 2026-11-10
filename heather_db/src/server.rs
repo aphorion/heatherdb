@@ -413,24 +413,42 @@ impl Server {
         if !dir.exists() {
             return Ok(true);
         }
+        let trashed = match self.move_to_trash(name, &dir) {
+            Ok(trashed) => trashed,
+            Err(e) => {
+                // The database left the registry above but is still on disk.
+                // Mount it again so a failed drop leaves the server as it was,
+                // instead of hiding a database that reappears on restart.
+                return Err(match self.remount(name) {
+                    Ok(()) => e,
+                    Err(remount) => HeatherError::Storage(format!(
+                        "{e}; the database could not be remounted either: {remount}"
+                    )),
+                });
+            }
+        };
+        if purge {
+            std::fs::remove_dir_all(&trashed)
+                .map_err(|e| HeatherError::Storage(format!("purge {}: {e}", trashed.display())))?;
+        }
+        Ok(true)
+    }
+
+    /// Rename a database directory into `$ROOT/_trash/` and return where it
+    /// landed.
+    fn move_to_trash(&self, name: &str, dir: &Path) -> Result<PathBuf> {
         let trash_root = self.root.join("_trash");
         std::fs::create_dir_all(&trash_root)
             .map_err(|e| HeatherError::Storage(format!("create {}: {e}", trash_root.display())))?;
-        let trashed = trash_root.join(format!("{name}-{}", now_secs()));
+        let trashed = unique_trash_path(&trash_root, name, now_secs());
 
         // A surviving Hive clone, or Windows' asynchronous release of the
         // mapping, can leave the directory briefly un-renameable. Retry for
         // up to ~2s rather than failing a drop that is about to succeed.
         let mut last_err = None;
         for _ in 0..40 {
-            match std::fs::rename(&dir, &trashed) {
-                Ok(()) if purge => {
-                    std::fs::remove_dir_all(&trashed).map_err(|e| {
-                        HeatherError::Storage(format!("purge {}: {e}", trashed.display()))
-                    })?;
-                    return Ok(true);
-                }
-                Ok(()) => return Ok(true),
+            match std::fs::rename(dir, &trashed) {
+                Ok(()) => return Ok(trashed),
                 Err(e) => {
                     last_err = Some(e);
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -443,6 +461,17 @@ impl Server {
             trashed.display(),
             last_err.expect("loop runs at least once")
         )))
+    }
+
+    /// Mount an on-disk database into the registry, unless something already
+    /// claimed the name.
+    fn remount(&self, name: &str) -> Result<()> {
+        let cfg = self.database_config(name)?;
+        let hive = open_hive_for(&self.root, &cfg)?;
+        let mut map = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        map.entry(name.to_string())
+            .or_insert_with(|| Arc::new(hive));
+        Ok(())
     }
 
     /// Why a database on disk was not mounted, if it was refused (its
@@ -483,6 +512,20 @@ fn open_hive_for(root: &Path, cfg: &DbConfig) -> Result<Hive> {
         cfg.map_size_mb,
         cfg.audit.clone(),
     )
+}
+
+/// A free `_trash/` entry for `name` dropped at `secs`: `{name}-{secs}`, or
+/// `{name}-{secs}-{n}` when an earlier drop of the same name took that slot
+/// in the same second.
+fn unique_trash_path(trash_root: &Path, name: &str, secs: u64) -> PathBuf {
+    let first = trash_root.join(format!("{name}-{secs}"));
+    if !first.exists() {
+        return first;
+    }
+    (1u64..)
+        .map(|n| trash_root.join(format!("{name}-{secs}-{n}")))
+        .find(|p| !p.exists())
+        .expect("an unbounded counter always finds a free name")
 }
 
 fn now_secs() -> u64 {
@@ -608,6 +651,72 @@ mod tests {
 
         // Dropping what is not there is still `false`, purge or not.
         assert!(!server.drop_database_with("scratch", true).unwrap());
+    }
+
+    /// #81: dropping the same name twice within one second used to collide
+    /// on `_trash/{name}-{secs}` and fail the second drop.
+    #[test]
+    fn drop_same_name_twice_in_a_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(dir.path(), 64).unwrap();
+        for _ in 0..3 {
+            server
+                .create_database(DbConfig::new("collide", 8).unwrap())
+                .unwrap();
+            assert!(server.drop_database("collide").unwrap());
+            assert!(server.database("collide").is_none());
+        }
+        let trashed = std::fs::read_dir(dir.path().join("_trash"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("collide-")
+            })
+            .count();
+        assert_eq!(trashed, 3);
+        assert!(!server.database_path("collide").exists());
+    }
+
+    #[test]
+    fn trash_path_takes_a_suffix_when_the_slot_is_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        assert_eq!(unique_trash_path(root, "db", 7), root.join("db-7"));
+        std::fs::create_dir(root.join("db-7")).unwrap();
+        assert_eq!(unique_trash_path(root, "db", 7), root.join("db-7-1"));
+        std::fs::create_dir(root.join("db-7-1")).unwrap();
+        assert_eq!(unique_trash_path(root, "db", 7), root.join("db-7-2"));
+    }
+
+    /// A drop whose move fails leaves the database mounted, instead of gone
+    /// from the registry but still on disk.
+    #[test]
+    fn failed_drop_keeps_the_database_mounted() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(dir.path(), 64).unwrap();
+        let hive = server
+            .create_database(DbConfig::new("stays", 8).unwrap())
+            .unwrap();
+        hive.get_or_create_collection("c")
+            .unwrap()
+            .write(&[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        drop(hive);
+        // A file where `_trash/` should be makes the move impossible.
+        std::fs::write(dir.path().join("_trash"), b"not a directory").unwrap();
+
+        assert!(server.drop_database("stays").is_err());
+        assert!(server.databases().unwrap().contains(&"stays".to_string()));
+        let col = server
+            .database("stays")
+            .unwrap()
+            .get_collection("c")
+            .unwrap()
+            .expect("collection survives a failed drop");
+        assert_eq!(col.stats().unwrap().total_writes, 1.0);
     }
 
     #[test]
