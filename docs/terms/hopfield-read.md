@@ -26,12 +26,16 @@ move:
 ```
 ξ₀ = normalize(query)
 repeat up to t_max:
-    sims  = cosine(ξ, addressⱼ)
-    α     = softmax(β · sims)
-    ξ_new = normalize(Σ αⱼ · patternⱼ)
+    α     = softmax(β · cosine(ξ, addressⱼ))
+    ξ_new = normalize(Σ αⱼ · addressⱼ)
     stop if cosine(ξ, ξ_new) > 1 − epsilon
     ξ    ← ξ_new
+result = normalize(Σ softmax(β · cosine(ξ, addressⱼ))ⱼ · patternⱼ)
 ```
+
+The loop runs over the addresses only and the stored patterns are read once,
+at the end. A pattern can differ from its own address, so feeding it back in
+as the next guess would pull the estimate toward a different item.
 
 Each pass re-weights toward whatever the *current* estimate resembles rather
 than what the original query resembled, which is exactly what carves basins:
@@ -40,8 +44,9 @@ instead of staying where it landed. The loop stops when a pass barely moves
 the estimate, or at `t_max`.
 
 Two strategies are exposed. `iterative` (the default) runs the loop to
-convergence; `fast` does a single step, which is cheaper and adequate when the
-query is already close. `analyze` runs the identical computation but reports
+convergence; `fast` does a single step, which is cheaper, adequate when the
+query is already close, and the one to use when the read feeds a confidence
+decision. See [choose a read strategy](../how-to/choose-a-read-strategy.md). `analyze` runs the identical computation but reports
 its working — iterations, whether it converged, and which locations carried
 what weight.
 

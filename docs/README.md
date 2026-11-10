@@ -98,6 +98,8 @@ Nine lessons in order, each turning on one result you produce yourself.
   role/filler bundles, multi-role scoring, cleanup.
 - [Calibrate a gate](how-to/calibrate-a-gate.md) — derive a threshold instead
   of choosing one.
+- [Choose a read strategy](how-to/choose-a-read-strategy.md) — `fast` to look
+  up and gate, `iterative` to recover a damaged query.
 - [Find your metric's floor](how-to/find-your-metrics-floor.md) — what your
   score reads on data with no structure.
 - [Explain a result](how-to/explain-a-result.md) — attribution without a second

@@ -33,7 +33,7 @@ Two candidates come free with every read. They are not equivalent.
 | Statistic | How | Signal |
 |---|---|---|
 | First-contact similarity | cosine(query, `fast` read) — one step, before iteration | strong |
-| Post-iteration similarity | cosine(query, `iterative` read) | none |
+| Settled similarity | `analyze` with `iterative`: cosine(settled state, nearest address) | none |
 
 **First contact carries the signal.** Measured on a labelled sample: mean
 0.818 for queries that apply against 0.304 for queries that do not, ROC AUC
