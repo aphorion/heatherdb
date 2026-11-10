@@ -507,7 +507,7 @@ pub fn hopfield_iter_from(
 }
 
 /// Hopfield iterative read (Eq. 13-14): settle on the keys, then read the
-/// values once. See [`settle_on_keys`].
+/// values once. See `settle_on_keys`.
 pub fn hopfield_iter(
     query: &[f64],
     locations: &[HardLocation],
