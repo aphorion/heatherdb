@@ -28,7 +28,7 @@ endpoint that documents it.
 
 ## Route table
 
-45 endpoints, verified against `heather_server` 0.4.1. Collection and algebra routes
+47 endpoints, verified against `heather_server` 0.4.1. Collection and algebra routes
 exist in two shapes; both are listed, and both link to the one endpoint that
 documents them. The `/db/{db}` shape addresses any database, the legacy shape
 addresses `default`.
@@ -58,6 +58,8 @@ Source of truth: `heather_server/src/main.rs`.
 | [GET /db](../api/databases.md#get-db) | — |
 | [POST /db](../api/databases.md#post-db) | — |
 | [GET /db/{db}](../api/databases.md#get-dbdb) | — |
+| [GET /db/{db}/durability](../api/databases.md#get-dbdbdurability) | — |
+| [PUT /db/{db}/durability](../api/databases.md#put-dbdbdurability) | — |
 | [DELETE /db/{db}](../api/databases.md#delete-dbdb) | — |
 
 ### Dream

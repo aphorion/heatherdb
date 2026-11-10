@@ -215,10 +215,7 @@ fn check_cross_product_cap(
 }
 
 pub async fn health() -> Response {
-    Json(HealthResponse {
-        status: "ok".to_string(),
-    })
-    .into_response()
+    Json(HealthResponse::ok()).into_response()
 }
 
 pub async fn create_collection(
@@ -264,8 +261,11 @@ pub async fn drop_collection(State(hive): State<AppState>, Path(name): Path<Stri
 pub async fn write(
     State(hive): State<AppState>,
     Path(name): Path<String>,
-    Json(req): Json<WriteRequest>,
+    Json(mut req): Json<WriteRequest>,
 ) -> Response {
+    if let Err(message) = resolve_vectors(&mut req.vectors, req.vectors_b64.take(), "vectors") {
+        return error_response(StatusCode::BAD_REQUEST, message);
+    }
     let num_vectors = req.vectors.len();
     if num_vectors == 0 {
         return error_response(StatusCode::BAD_REQUEST, "vectors array must not be empty");
@@ -288,14 +288,22 @@ pub async fn write(
                     "metadata length must match vectors length".to_string(),
                 ));
             }
-            let mut ids = Vec::with_capacity(req.vectors.len());
-            for (vec, meta) in req.vectors.iter().zip(metadata.iter()) {
-                let meta_bytes = serde_json::to_vec(meta).map_err(|e| {
-                    heather_db::HeatherError::InvalidInput(format!("invalid metadata JSON: {e}"))
-                })?;
-                let id = col_clone.write_with_metadata(vec, &meta_bytes)?;
-                ids.push(id);
-            }
+            // One transaction for the whole request, not one per vector.
+            let items = req
+                .vectors
+                .iter()
+                .zip(metadata.iter())
+                .map(|(vec, meta)| {
+                    serde_json::to_vec(meta)
+                        .map(|bytes| (vec.as_slice(), bytes))
+                        .map_err(|e| {
+                            heather_db::HeatherError::InvalidInput(format!(
+                                "invalid metadata JSON: {e}"
+                            ))
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let ids = col_clone.write_batch_with_metadata(&items)?;
             Ok((ids.len(), Some(ids)))
         } else {
             col_clone.write_batch(&req.vectors)?;
@@ -317,7 +325,14 @@ pub async fn write(
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, collection = %name, "Write failed");
-            error_response(StatusCode::BAD_REQUEST, e)
+            let status = match &e {
+                heather_db::HeatherError::Storage(_)
+                | heather_db::HeatherError::Serialization(_)
+                | heather_db::HeatherError::LockPoisoned => StatusCode::INTERNAL_SERVER_ERROR,
+                heather_db::HeatherError::Conflict(_) => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            error_response(status, e)
         }
         Err(e) => {
             tracing::error!(error = %e, "Write task panicked");
@@ -329,8 +344,13 @@ pub async fn write(
 pub async fn bulk_load(
     State(hive): State<AppState>,
     Path(name): Path<String>,
-    Json(req): Json<BulkLoadRequest>,
+    Json(mut req): Json<BulkLoadRequest>,
 ) -> Response {
+    if let Err(message) = resolve_vectors(&mut req.addresses, req.addresses_b64.take(), "addresses")
+        .and_then(|()| resolve_vectors(&mut req.counters, req.counters_b64.take(), "counters"))
+    {
+        return error_response(StatusCode::BAD_REQUEST, message);
+    }
     if req.addresses.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "addresses must not be empty");
     }
@@ -1023,7 +1043,11 @@ pub async fn batch_analyze(
     }
 }
 
-pub async fn get_documents(State(hive): State<AppState>, Path(name): Path<String>) -> Response {
+pub async fn get_documents(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<DocumentsQuery>,
+) -> Response {
     let col = match hive.get_collection(&name) {
         Ok(Some(col)) => col,
         Ok(None) => {
@@ -1035,10 +1059,14 @@ pub async fn get_documents(State(hive): State<AppState>, Path(name): Path<String
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
 
-    let result = tokio::task::spawn_blocking(move || col.list_documents()).await;
+    // Paged with ?limit= (and ?offset=); the whole collection otherwise.
+    let result = tokio::task::spawn_blocking(move || {
+        col.list_documents_page(query.offset.unwrap_or(0), query.limit.unwrap_or(usize::MAX))
+    })
+    .await;
 
     match result {
-        Ok(Ok(docs)) => {
+        Ok(Ok((docs, total, skipped))) => {
             let documents: Vec<DocumentItem> = docs
                 .into_iter()
                 .filter_map(|(id, _vec, meta)| {
@@ -1047,7 +1075,12 @@ pub async fn get_documents(State(hive): State<AppState>, Path(name): Path<String
                         .map(|metadata| DocumentItem { id, metadata })
                 })
                 .collect();
-            Json(DocumentsResponse { documents }).into_response()
+            Json(DocumentsResponse {
+                documents,
+                total,
+                skipped,
+            })
+            .into_response()
         }
         Ok(Err(e)) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
@@ -1886,5 +1919,169 @@ mod rotate_tests {
         let (status, body) = body_json(resp).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(body["error"].is_string());
+    }
+}
+
+#[cfg(test)]
+mod document_paging_tests {
+    use super::*;
+
+    async fn body_json(resp: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// `?limit=` (with `?offset=`) returns one page in id order and the
+    /// total; without it the whole collection comes back, with the total.
+    #[tokio::test]
+    async fn documents_page_with_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = heather_db::EAMConfig::new(4).unwrap();
+        let hive: AppState = Arc::new(Hive::open(dir.path(), config, 64).unwrap());
+        let col = hive.get_or_create_collection("docs").unwrap();
+        for i in 0..5 {
+            let mut v = vec![0.0; 4];
+            v[i % 4] = 1.0;
+            col.write_with_metadata(&v, format!(r#"{{"i":{i}}}"#).as_bytes())
+                .unwrap();
+        }
+
+        let page = |offset, limit| {
+            get_documents(
+                State(hive.clone()),
+                Path("docs".into()),
+                axum::extract::Query(DocumentsQuery { offset, limit }),
+            )
+        };
+        let ids = |body: &serde_json::Value| -> Vec<u64> {
+            body["documents"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["id"].as_u64().unwrap())
+                .collect()
+        };
+
+        let first = body_json(page(None, Some(2)).await).await;
+        assert_eq!(
+            (ids(&first), first["total"].clone()),
+            (vec![0, 1], 5.into())
+        );
+        let last = body_json(page(Some(4), Some(2)).await).await;
+        assert_eq!(ids(&last), vec![4]);
+        assert_eq!(
+            first["documents"][1]["metadata"],
+            serde_json::json!({"i": 1})
+        );
+        let past = body_json(page(Some(9), Some(2)).await).await;
+        assert_eq!((ids(&past), past["total"].clone()), (vec![], 5.into()));
+
+        let all = body_json(page(None, None).await).await;
+        assert_eq!((ids(&all).len(), all["total"].clone()), (5, 5.into()));
+    }
+}
+
+#[cfg(test)]
+mod binary_vector_tests {
+    use super::*;
+    use base64::Engine as _;
+
+    async fn body_json(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    fn b64(v: &[f64]) -> String {
+        let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    }
+
+    fn hive(dir: &tempfile::TempDir) -> AppState {
+        let config = heather_db::EAMConfig::new(4).unwrap();
+        Arc::new(Hive::open(dir.path(), config, 64).unwrap())
+    }
+
+    fn write_body(v: serde_json::Value) -> WriteRequest {
+        serde_json::from_value(v).unwrap()
+    }
+
+    /// Base64 vectors decode to exactly the f64 values encoded, bit for bit.
+    #[test]
+    fn decode_vectors_round_trips_f64() {
+        let v = vec![1.0, -0.5, f64::MIN_POSITIVE, 1e300];
+        assert_eq!(
+            decode_vectors(vec![b64(&v)], "vectors_b64").unwrap(),
+            vec![v]
+        );
+        assert!(decode_vectors(vec!["not base64!".into()], "vectors_b64").is_err());
+        // 12 bytes is not a whole number of f64s.
+        let ragged = base64::engine::general_purpose::STANDARD.encode([0u8; 12]);
+        assert!(decode_vectors(vec![ragged], "vectors_b64").is_err());
+    }
+
+    /// A write with vectors_b64 and metadata stores the same documents a JSON
+    /// write would; sending both forms, or neither, is a 400.
+    #[tokio::test]
+    async fn write_accepts_base64_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let hive = hive(&dir);
+        let a = [1.0, 0.0, 0.0, 0.0];
+        let b = [0.0, 0.0, 1.0, 0.0];
+
+        let resp = write(
+            State(hive.clone()),
+            Path("docs".into()),
+            Json(write_body(serde_json::json!({
+                "vectors_b64": [b64(&a), b64(&b)],
+                "metadata": [{"n": "a"}, {"n": "b"}],
+            }))),
+        )
+        .await;
+        let (status, body) = body_json(resp).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["ids"], serde_json::json!([0, 1]));
+
+        let col = hive.get_or_create_collection("docs").unwrap();
+        let (stored, meta) = col.get_document(1).unwrap().unwrap();
+        assert_eq!(stored, b.to_vec());
+        assert_eq!(meta, br#"{"n":"b"}"#.to_vec());
+
+        let both = write(
+            State(hive.clone()),
+            Path("docs".into()),
+            Json(write_body(
+                serde_json::json!({"vectors": [a], "vectors_b64": [b64(&a)]}),
+            )),
+        )
+        .await;
+        assert_eq!(both.status(), StatusCode::BAD_REQUEST);
+
+        let neither = write(
+            State(hive),
+            Path("docs".into()),
+            Json(write_body(serde_json::json!({}))),
+        )
+        .await;
+        assert_eq!(neither.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// Health advertises the server version and the base64 feature.
+    #[tokio::test]
+    async fn health_advertises_features() {
+        let (status, body) = body_json(health().await).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert!(
+            body["features"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|f| f == "vectors_b64")
+        );
     }
 }

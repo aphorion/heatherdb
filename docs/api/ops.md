@@ -18,8 +18,13 @@ curl http://localhost:6380/health
 ```
 
 ```json
-{ "status": "ok" }
+{ "status": "ok", "version": "0.4.3", "features": ["vectors_b64"] }
 ```
+
+`version` is the server's version; `features` lists optional request forms
+it accepts, so a client can check before using one: `vectors_b64` means
+`write` takes `vectors_b64` and `bulk_load` takes `addresses_b64` /
+`counters_b64` (servers before 0.4.3 send neither field).
 
 Non-200: none. If the process is up, this is `200`.
 
@@ -37,7 +42,7 @@ curl http://localhost:6380/healthz
 ```
 
 ```json
-{ "status": "ok" }
+{ "status": "ok", "version": "0.4.3", "features": ["vectors_b64"] }
 ```
 
 Non-200: none.
@@ -59,7 +64,7 @@ curl http://localhost:6380/ready
 ```
 
 ```json
-{ "status": "ok" }
+{ "status": "ok", "version": "0.4.3", "features": ["vectors_b64"] }
 ```
 
 | Status | Cause |
@@ -80,7 +85,7 @@ curl http://localhost:6380/readyz
 ```
 
 ```json
-{ "status": "ok" }
+{ "status": "ok", "version": "0.4.3", "features": ["vectors_b64"] }
 ```
 
 | Status | Cause |

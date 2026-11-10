@@ -24,3 +24,11 @@ __pycache__/
 # Claude Code local session/runtime state (scheduled-task locks etc.) —
 # machine-local, not repo content.
 .claude/
+
+# cargo-fuzz output
+/fuzz/target
+/fuzz/corpus
+/fuzz/artifacts
+/fuzz/coverage
+/target-dev
+/fuzz/Cargo.lock

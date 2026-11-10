@@ -1,8 +1,10 @@
 use std::path::Path;
 
 use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions, RoTxn, RwTxn};
+use heed::{Database, Env, EnvFlags, EnvOpenOptions, FlagSetMode, RoTxn, RwTxn};
 
+pub use crate::codec::DocVector;
+use crate::config::Precision;
 use crate::error::{HeatherError, Result};
 use crate::location::{HardLocation, LocationId};
 
@@ -17,6 +19,14 @@ fn location_key(collection_id: u32, location_id: u64) -> [u8; 12] {
 }
 
 /// 4-byte prefix for scanning all locations in a collection.
+/// The record id in a `[collection_id 4B | id 8B BE]` key (0 if malformed).
+fn key_id(key: &[u8]) -> u64 {
+    key.get(4..12)
+        .and_then(|b| b.try_into().ok())
+        .map(u64::from_be_bytes)
+        .unwrap_or(0)
+}
+
 fn collection_prefix(collection_id: u32) -> [u8; 4] {
     collection_id.to_be_bytes()
 }
@@ -40,6 +50,10 @@ fn metadata_key(collection_id: u32, key: &str) -> Vec<u8> {
 
 pub struct Store {
     env: Env,
+    /// Records tolerant reads skipped because they did not decode.
+    skipped: std::sync::atomic::AtomicU64,
+    /// How vectors are encoded on disk (see [`crate::config::Precision`]).
+    precision: Precision,
     registry_db: Database<Bytes, Bytes>,
     locations_db: Database<Bytes, Bytes>,
     metadata_db: Database<Bytes, Bytes>,
@@ -48,8 +62,52 @@ pub struct Store {
     audit_db: Database<Bytes, Bytes>,
 }
 
+/// A stored document: its id and its serialised (vector, metadata).
+pub type RawDocument = (u64, Vec<u8>);
+
 impl Store {
+    /// Whether every commit is synced to disk (the default).
+    pub fn syncs(&self) -> Result<bool> {
+        Ok(self.env.get_flags()? & EnvFlags::NO_SYNC.bits() == 0)
+    }
+
+    /// Turns per-commit syncing off (`false`) or back on (`true`).
+    ///
+    /// Without it (LMDB `NO_SYNC`) commits reach the OS but not the disk:
+    /// much faster where a sync is slow (macOS `F_FULLFSYNC`), but a system
+    /// crash (not a process crash) can lose recent commits or, on file
+    /// systems that reorder writes, corrupt the database. For data that can
+    /// be rebuilt, such as a memory replayed from a stream. Turning it back on
+    /// syncs everything written in between before returning. LMDB keeps the
+    /// flag on the open environment, not in the file, so a restarted server
+    /// syncs again.
+    pub fn set_sync(&self, sync: bool) -> Result<()> {
+        let mode = if sync {
+            FlagSetMode::Disable
+        } else {
+            FlagSetMode::Enable
+        };
+        // SAFETY: NO_SYNC only changes when commits are flushed, not their
+        // contents; the risk is the documented crash window above.
+        unsafe { self.env.set_flags(EnvFlags::NO_SYNC, mode)? };
+        if sync {
+            self.env.force_sync()?;
+        }
+        Ok(())
+    }
+
+    /// Opens a store that keeps vectors in f64.
     pub fn open(path: &Path, map_size_mb: usize) -> Result<Self> {
+        Self::open_with_precision(path, map_size_mb, Precision::F64)
+    }
+
+    /// Opens a store that keeps vectors at `precision`. A store must always be
+    /// opened with the precision it was created with (`db.toml` records it).
+    pub fn open_with_precision(
+        path: &Path,
+        map_size_mb: usize,
+        precision: Precision,
+    ) -> Result<Self> {
         std::fs::create_dir_all(path)
             .map_err(|e| HeatherError::Storage(format!("failed to create dir: {e}")))?;
 
@@ -71,6 +129,8 @@ impl Store {
 
         Ok(Store {
             env,
+            skipped: std::sync::atomic::AtomicU64::new(0),
+            precision,
             registry_db,
             locations_db,
             metadata_db,
@@ -204,8 +264,22 @@ impl Store {
         loc: &HardLocation,
     ) -> Result<()> {
         let key = location_key(collection_id, loc.id.0);
-        let data = bincode::serialize(loc)?;
+        let data = self.encode_location(loc)?;
         self.locations_db.put(txn, &key, &data)?;
+        Ok(())
+    }
+
+    /// Stores raw bytes as a location (tests: simulating damage).
+    #[cfg(test)]
+    pub(crate) fn put_raw_location(
+        &self,
+        txn: &mut RwTxn,
+        collection_id: u32,
+        location_id: u64,
+        bytes: &[u8],
+    ) -> Result<()> {
+        self.locations_db
+            .put(txn, &location_key(collection_id, location_id), bytes)?;
         Ok(())
     }
 
@@ -227,10 +301,161 @@ impl Store {
         let iter = self.locations_db.prefix_iter(&rtxn, &prefix)?;
         for result in iter {
             let (_key, value) = result?;
-            let loc: HardLocation = bincode::deserialize(value)?;
-            locations.push(loc);
+            // A location that does not decode is skipped (and counted), so
+            // one bad record cannot keep the collection from opening.
+            if let Some(loc) = self.tolerate(self.decode_location(value))? {
+                locations.push(loc);
+            }
         }
         Ok(locations)
+    }
+
+    /// Decodes every stored location and document of a collection and
+    /// counts what is current, legacy, corrupt or unsupported (see
+    /// [`crate::verify`]). Reads only.
+    pub fn verify_collection(
+        &self,
+        name: &str,
+        collection_id: u32,
+    ) -> Result<crate::verify::CollectionReport> {
+        use crate::codec::{self, Format};
+        use crate::verify::{CollectionReport, MAX_PROBLEMS, RecordCounts};
+
+        fn count<T>(
+            counts: &mut RecordCounts,
+            problems: &mut Vec<String>,
+            what: &str,
+            id: u64,
+            bytes: &[u8],
+            decoded: Result<T>,
+        ) {
+            match decoded {
+                Ok(_) => match codec::format(bytes) {
+                    Ok(Format::Legacy) => counts.legacy += 1,
+                    _ => counts.current += 1,
+                },
+                Err(e) => {
+                    match e {
+                        HeatherError::UnsupportedFormat(_) => counts.unsupported += 1,
+                        _ => counts.corrupt += 1,
+                    }
+                    if problems.len() < MAX_PROBLEMS {
+                        problems.push(format!("{what} {id}: {e}"));
+                    }
+                }
+            }
+        }
+
+        let rtxn = self.env.read_txn()?;
+        let prefix = collection_prefix(collection_id);
+        let mut report = CollectionReport {
+            collection: name.to_string(),
+            locations: RecordCounts::default(),
+            documents: RecordCounts::default(),
+            problems: Vec::new(),
+        };
+
+        for result in self.locations_db.prefix_iter(&rtxn, &prefix)? {
+            let (key, value) = result?;
+            let id = key_id(key);
+            let decoded = codec::decode_location(value, self.precision);
+            count(
+                &mut report.locations,
+                &mut report.problems,
+                "location",
+                id,
+                value,
+                decoded,
+            );
+        }
+        for result in self.documents_db.prefix_iter(&rtxn, &prefix)? {
+            let (key, value) = result?;
+            let id = key_id(key);
+            // A reference must point at a location of this collection.
+            let decoded = match codec::decode_document_parts(value, self.precision) {
+                Ok((DocVector::Location(at), _))
+                    if self
+                        .locations_db
+                        .get(&rtxn, &location_key(collection_id, at))?
+                        .is_none() =>
+                {
+                    Err(HeatherError::Corrupt(format!(
+                        "refers to location {at}, which does not exist"
+                    )))
+                }
+                other => other,
+            };
+            count(
+                &mut report.documents,
+                &mut report.problems,
+                "document",
+                id,
+                value,
+                decoded,
+            );
+        }
+        Ok(report)
+    }
+
+    /// For reads that serve many records: a record that does not decode
+    /// ([`HeatherError::Corrupt`] or [`HeatherError::UnsupportedFormat`]) is
+    /// counted and skipped (`Ok(None)`) instead of failing the read. Storage
+    /// errors still fail it.
+    pub fn tolerate<T>(&self, decoded: Result<T>) -> Result<Option<T>> {
+        match decoded {
+            Ok(v) => Ok(Some(v)),
+            Err(HeatherError::Corrupt(_) | HeatherError::UnsupportedFormat(_)) => {
+                self.skipped
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Records skipped by tolerant reads since the store was opened.
+    pub fn skipped_records(&self) -> u64 {
+        self.skipped.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    // --- Vector encoding (by precision) ---
+
+    fn encode_location(&self, loc: &HardLocation) -> Result<Vec<u8>> {
+        Ok(crate::codec::encode_location(loc, self.precision))
+    }
+
+    fn decode_location(&self, bytes: &[u8]) -> Result<HardLocation> {
+        crate::codec::decode_location(bytes, self.precision)
+    }
+
+    /// A document's stored bytes: its vector (at the store's precision) and
+    /// its metadata, in the record envelope (see [`crate::codec`]).
+    pub fn encode_document(&self, vector: &[f64], metadata: &[u8]) -> Result<Vec<u8>> {
+        Ok(crate::codec::encode_document(
+            vector,
+            metadata,
+            self.precision,
+        ))
+    }
+
+    /// A document whose vector is its location's address (a plain
+    /// collection's write): stored as a reference to the location and the
+    /// metadata, without a third copy of the vector.
+    pub fn encode_document_ref(&self, location_id: u64, metadata: &[u8]) -> Vec<u8> {
+        crate::codec::encode_document_ref(location_id, metadata, self.precision)
+    }
+
+    /// The vector and metadata of a stored document. A value that does not
+    /// decode is [`HeatherError::Corrupt`]. A document stored by reference
+    /// ([`Self::encode_document_ref`]) has no vector of its own: resolve it
+    /// with [`Self::decode_document_parts`] instead.
+    pub fn decode_document(&self, bytes: &[u8]) -> Result<(Vec<f64>, Vec<u8>)> {
+        crate::codec::decode_document(bytes, self.precision)
+    }
+
+    /// A stored document's vector, inline or by reference, and its metadata.
+    pub fn decode_document_parts(&self, bytes: &[u8]) -> Result<(DocVector, Vec<u8>)> {
+        crate::codec::decode_document_parts(bytes, self.precision)
     }
 
     // --- Metadata operations (collection-scoped) ---
@@ -286,6 +511,31 @@ impl Store {
         Ok(val.map(|v| v.to_vec()))
     }
 
+    /// One page of a collection's documents in id order, and how many there
+    /// are in all. Only the page's values are copied.
+    pub fn list_documents_page(
+        &self,
+        collection_id: u32,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<RawDocument>, usize)> {
+        let rtxn = self.env.read_txn()?;
+        let prefix = collection_prefix(collection_id);
+        let mut docs = Vec::with_capacity(limit.min(1024));
+        let mut total = 0;
+        for result in self.documents_db.prefix_iter(&rtxn, &prefix)? {
+            let (key, value) = result?;
+            if total >= offset && docs.len() < limit {
+                let idx_bytes: [u8; 8] = key[4..12].try_into().map_err(|_| {
+                    HeatherError::Storage("invalid document key length".to_string())
+                })?;
+                docs.push((u64::from_be_bytes(idx_bytes), value.to_vec()));
+            }
+            total += 1;
+        }
+        Ok((docs, total))
+    }
+
     pub fn list_documents(&self, collection_id: u32) -> Result<Vec<(u64, Vec<u8>)>> {
         let rtxn = self.env.read_txn()?;
         let prefix = collection_prefix(collection_id);
@@ -318,6 +568,29 @@ impl Store {
             None => Vec::new(),
         };
         doc_ids.push(doc_id);
+        let data = bincode::serialize(&doc_ids)?;
+        self.doc_index_db.put(txn, &key, &data)?;
+        Ok(())
+    }
+
+    /// Append several document IDs to a location's posting list, reading and
+    /// rewriting the list once.
+    pub fn append_docs_to_location(
+        &self,
+        txn: &mut RwTxn,
+        collection_id: u32,
+        location_id: u64,
+        new_doc_ids: &[u64],
+    ) -> Result<()> {
+        if new_doc_ids.is_empty() {
+            return Ok(());
+        }
+        let key = location_key(collection_id, location_id);
+        let mut doc_ids: Vec<u64> = match self.doc_index_db.get(txn, &key)? {
+            Some(data) => bincode::deserialize(data)?,
+            None => Vec::new(),
+        };
+        doc_ids.extend_from_slice(new_doc_ids);
         let data = bincode::serialize(&doc_ids)?;
         self.doc_index_db.put(txn, &key, &data)?;
         Ok(())
@@ -715,5 +988,75 @@ mod tests {
         assert_eq!(store.get_collection_id("doomed").unwrap(), None);
         assert_eq!(store.load_all_locations(col_id).unwrap().len(), 0);
         assert!(store.load_metadata(col_id, "next_id").unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod precision_tests {
+    use super::*;
+
+    /// An f32 store keeps vectors at f32 (rounded once, widened on load) in
+    /// about half the bytes; an f64 store keeps them exactly.
+    #[test]
+    fn f32_stores_round_trip_at_f32_in_half_the_space() {
+        let vector: Vec<f64> = (0..256).map(|i| (i as f64).sin() / 3.0).collect();
+        let rounded: Vec<f64> = vector.iter().map(|&x| f64::from(x as f32)).collect();
+
+        let dir32 = tempfile::TempDir::new().unwrap();
+        let s32 = Store::open_with_precision(dir32.path(), 16, Precision::F32).unwrap();
+        let dir64 = tempfile::TempDir::new().unwrap();
+        let s64 = Store::open(dir64.path(), 16).unwrap();
+
+        let d32 = s32.encode_document(&vector, b"{}").unwrap();
+        let d64 = s64.encode_document(&vector, b"{}").unwrap();
+        assert!(
+            d32.len() * 10 < d64.len() * 6,
+            "{} vs {} bytes",
+            d32.len(),
+            d64.len()
+        );
+        assert_eq!(
+            s32.decode_document(&d32).unwrap(),
+            (rounded.clone(), b"{}".to_vec())
+        );
+        assert_eq!(
+            s64.decode_document(&d64).unwrap(),
+            (vector.clone(), b"{}".to_vec())
+        );
+
+        let mut loc = HardLocation::new(LocationId(7), vector.clone());
+        loc.counter = vector.clone();
+        loc.write_count = 2.5;
+        loc.neighbors = vec![1, 2];
+        let mut txn = s32.write_txn().unwrap();
+        s32.put_location(&mut txn, 0, &loc).unwrap();
+        txn.commit().unwrap();
+        let back = s32.load_all_locations(0).unwrap().pop().unwrap();
+        assert_eq!(
+            (back.id, back.write_count, back.neighbors.clone()),
+            (LocationId(7), 2.5, vec![1, 2])
+        );
+        assert_eq!(back.address, rounded);
+        assert_eq!(back.counter, rounded);
+    }
+}
+
+#[cfg(test)]
+mod sync_tests {
+    use super::*;
+
+    /// Syncing is on by default and can be turned off and back on. (LMDB
+    /// keeps the flag on the open environment, not in the file, so a new
+    /// process syncs again; heed reuses an environment still open in this
+    /// process, so that part cannot be shown here.)
+    #[test]
+    fn sync_can_be_turned_off_and_back_on() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = Store::open(dir.path(), 16).unwrap();
+        assert!(store.syncs().unwrap());
+        store.set_sync(false).unwrap();
+        assert!(!store.syncs().unwrap());
+        store.set_sync(true).unwrap();
+        assert!(store.syncs().unwrap());
     }
 }

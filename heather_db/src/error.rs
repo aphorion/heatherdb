@@ -31,6 +31,16 @@ pub enum HeatherError {
 
     #[error("conflict: {0}")]
     Conflict(String),
+
+    /// A stored value that does not decode: a checksum mismatch, truncation
+    /// or impossible length. One bad record; the rest of the store is fine.
+    #[error("corrupt record: {0}")]
+    Corrupt(String),
+
+    /// A stored value or database in a format this HeatherDB does not know
+    /// (written by a newer one).
+    #[error("unsupported format: {0}")]
+    UnsupportedFormat(String),
 }
 
 impl From<heed::Error> for HeatherError {

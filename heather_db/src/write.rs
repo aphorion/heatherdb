@@ -2,7 +2,7 @@ use rand::Rng;
 
 use crate::config::{EAMConfig, engram_bits, surprise_bits};
 use crate::location::{HardLocation, LocationId};
-use crate::read;
+use crate::scan::{self, Scan};
 use crate::vec_ops;
 
 /// Result of a write operation, including any new locations created by splits.
@@ -45,13 +45,14 @@ impl Default for WriteOpts {
     }
 }
 
-/// Legacy three-phase adaptive write. Unchanged behavior: delegates to the
-/// two-field rule with `address == counter` and the gate off, which reproduces
-/// the original pipeline exactly.
+/// Legacy three-phase adaptive write: delegates to the two-field rule with
+/// `address == counter` and the gate off.
 ///
-/// Phase 1 — Select: k-NN activation, weight computation, conscience winner.
-/// Phase 2 — Update: counter accumulation + competitive address migration in one pass.
-/// Phase 3 — Regulate: topology maintenance (novelty/overload split, local dedup).
+/// Phase 1 — Select: k-NN activation, weight computation, conscience winner,
+///           join-or-spawn decision.
+/// Phase 2 — Update (joins only): counter accumulation + competitive address
+///           migration in one pass.
+/// Phase 3 — Regulate: topology maintenance (novelty split or overload split).
 // The eight parameters are the write pipeline's full state: the input, the
 // locations it mutates, the config and learning rate that govern it, the id
 // counter it draws from, the rng it splits with, and the landmark/lookup
@@ -65,8 +66,7 @@ pub fn adaptive_write(
     eta: f64,
     next_id: &mut u64,
     rng: &mut impl Rng,
-    landmarks: &[usize],
-    id_lookup: &[u32],
+    scan: &Scan,
 ) -> WriteResult {
     adaptive_write_two(
         input,
@@ -76,8 +76,7 @@ pub fn adaptive_write(
         eta,
         next_id,
         rng,
-        landmarks,
-        id_lookup,
+        scan,
         WriteOpts::default(),
     )
 }
@@ -100,8 +99,7 @@ pub fn adaptive_write_two(
     eta: f64,
     next_id: &mut u64,
     rng: &mut impl Rng,
-    landmarks: &[usize],
-    id_lookup: &[u32],
+    scan: &Scan,
     opts: WriteOpts,
 ) -> WriteResult {
     // Non-competitive mode: verbatim streaming append. Store the address
@@ -126,8 +124,13 @@ pub fn adaptive_write_two(
     let k = config.k.min(locations.len());
 
     // ── Phase 1: Select ─────────────────────────────────────────────
-    // k-nearest via graph search (falls back to SoA/brute force when graph is young).
-    let (indices, sims) = read::activate_auto(address, locations, k, landmarks, id_lookup);
+    // The exact k nearest locations. Not graph search: it is approximate, and
+    // a missed neighbour here changes what the memory learns. On the demo
+    // lexicon (41,400 writes, d = 128) it missed the nearest location on 98%
+    // of writes, so most writes saw nothing close enough and spawned a new
+    // location instead of joining one: 53,394 locations against 19,030.
+    // An f32 scan finds the candidates and the f64 dot ranks them (see scan).
+    let (indices, sims) = scan::nearest(address, locations, k, scan);
 
     if indices.is_empty() {
         // Cold start: the index is empty (data-seeded, l_0 == 0). Seed the first
@@ -204,14 +207,35 @@ pub fn adaptive_write_two(
     };
     let winner_global = indices[winner_local];
 
+    // Join or spawn, decided before anything is updated. Legacy: no location is
+    // close enough in address (max_sim < tau_split). Gated: the address matched
+    // but the counter didn't cohere with any candidate's law (force_spawn) — a
+    // same-context-different-law episode gets its own family.
+    let spawn_novelty = if opts.gate {
+        force_spawn
+    } else if config.mdl_gate {
+        // MDL novelty: spawn immediately only when a single contact is surprising
+        // enough to pay for its own engram outright. The bar is log2(L+1)+log2(d/32),
+        // not a fixed tau_split — it rises as the index fills.
+        surprise_bits(max_sim) > engram_bits(locations.len(), config.d)
+    } else {
+        max_sim < config.tau_split
+    };
+
     // ── Phase 2: Update ─────────────────────────────────────────────
     // Single pass over activated set: counter accumulation + address migration.
     // Under the gate a join is winner-take-all (k = 1) and accumulates the
-    // counter at full weight; a forced spawn touches no existing location.
+    // counter at full weight. A write that spawns touches no existing location:
+    // the activation weights are relative to the best match (w_j = s_j / max_sim),
+    // so when nothing is close they are not small — a neighbour at 0.10 against
+    // a best match of 0.15 takes the input at weight 0.67 — and accumulating a
+    // novel input into the k nearest counters smears it across unrelated
+    // memories while it also gets a location of its own.
+    let joins = !spawn_novelty;
     let eta_winner = eta / (1.0 + locations[winner_global].write_count / config.tau_damp);
     let eta_neighbor = eta_winner * 0.1;
 
-    if !force_spawn {
+    if joins {
         for (local_idx, &global_idx) in indices.iter().enumerate() {
             let is_winner = local_idx == winner_local;
             if opts.gate && !is_winner {
@@ -251,7 +275,7 @@ pub fn adaptive_write_two(
     // MDL: the joining write adds its residual surprise (how poorly it matched the
     // winner) to the winner's debt. surprise·recurrence accrues here, one write at
     // a time, until it clears an engram and the location splits in Phase 3.
-    if config.mdl_gate && !force_spawn {
+    if config.mdl_gate && joins {
         locations[winner_global].surprise_mass += surprise_bits(sims[winner_local]);
     }
 
@@ -290,23 +314,12 @@ pub fn adaptive_write_two(
     let eta_new = (eta * config.lambda).max(config.eta_min);
 
     // ── Phase 3: Regulate ───────────────────────────────────────────
-    // Topology maintenance: novelty split OR overload split, then local dedup.
+    // Topology maintenance: a novelty split when the write spawned, an overload
+    // split when it joined a saturated winner — never both, so a write adds at
+    // most one location.
     let mut new_locations = Vec::new();
 
-    // Novelty spawn. Legacy: no location is close enough in address
-    // (max_sim < tau_split). Gated: the address matched but the counter didn't
-    // cohere with any candidate's law (force_spawn) — a same-context-different-
-    // law episode gets its own family.
-    let spawn_novelty = if opts.gate {
-        force_spawn
-    } else if config.mdl_gate {
-        // MDL novelty: spawn immediately only when a single contact is surprising
-        // enough to pay for its own engram outright. The bar is log2(L+1)+log2(d/32),
-        // not a fixed tau_split — it rises as the index fills.
-        surprise_bits(max_sim) > engram_bits(locations.len(), config.d)
-    } else {
-        max_sim < config.tau_split
-    };
+    // Novelty spawn (decided before Phase 2).
     if spawn_novelty {
         let id = LocationId(*next_id);
         *next_id += 1;
@@ -334,7 +347,7 @@ pub fn adaptive_write_two(
     } else {
         locations[winner_global].write_count > config.tau_overload
     };
-    if !force_spawn && overloaded {
+    if joins && overloaded {
         // Overload split: winner is saturated — spawn perturbed neighbor
         let id = LocationId(*next_id);
         *next_id += 1;
@@ -386,13 +399,6 @@ pub fn adaptive_write_two(
         new_locations.push(new_loc);
     }
 
-    // Local dedup: if both splits fired and produced near-identical locations,
-    // merge them. Does not merge back into existing (overload children are
-    // intentionally near the winner; novelty children are far from everything).
-    if new_locations.len() > 1 {
-        dedup_new_locations(&mut new_locations, config);
-    }
-
     WriteResult {
         modified_indices: indices,
         new_locations,
@@ -400,55 +406,115 @@ pub fn adaptive_write_two(
     }
 }
 
-/// Dedup among newly created locations: if two are within tau_merge, merge.
-fn dedup_new_locations(new_locations: &mut Vec<HardLocation>, config: &EAMConfig) {
-    let mut absorbed = vec![false; new_locations.len()];
-
-    for i in 0..new_locations.len() {
-        if absorbed[i] {
-            continue;
-        }
-        for j in (i + 1)..new_locations.len() {
-            if absorbed[j] {
-                continue;
-            }
-            let sim =
-                vec_ops::cosine_similarity(&new_locations[i].address, &new_locations[j].address);
-            if sim > config.tau_merge {
-                let j_counter = new_locations[j].counter.clone();
-                let j_wc = new_locations[j].write_count;
-                let total_wc = new_locations[i].write_count + j_wc;
-                if total_wc > 1e-12 {
-                    let wi = new_locations[i].write_count / total_wc;
-                    let wj = j_wc / total_wc;
-                    let new_addr: Vec<f64> = new_locations[i]
-                        .address
-                        .iter()
-                        .zip(new_locations[j].address.iter())
-                        .map(|(a, b)| a * wi + b * wj)
-                        .collect();
-                    new_locations[i].address = vec_ops::normalize(&new_addr);
-                }
-                vec_ops::add_scaled(&mut new_locations[i].counter, &j_counter, 1.0);
-                new_locations[i].write_count += j_wc;
-                absorbed[j] = true;
-            }
-        }
-    }
-
-    if absorbed.iter().any(|&a| a) {
-        let mut idx = 0;
-        new_locations.retain(|_| {
-            let keep = !absorbed[idx];
-            idx += 1;
-            keep
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write that spawns its own location leaves every existing location
+    /// as it was (regression: the novel input was also accumulated into the
+    /// k nearest counters, at weights relative to a poor best match, so
+    /// unrelated memories absorbed it).
+    #[test]
+    fn a_novel_write_touches_no_existing_location() {
+        let config = EAMConfig::new(4).unwrap();
+        let mut locations = vec![
+            HardLocation::new(LocationId(0), vec_ops::normalize(&[1.0, 0.0, 0.0, 0.0])),
+            HardLocation::new(LocationId(1), vec_ops::normalize(&[0.0, 1.0, 0.0, 0.0])),
+        ];
+        for loc in &mut locations {
+            loc.counter = loc.address.clone();
+            loc.write_count = 1.0;
+        }
+        let before: Vec<(Vec<f64>, Vec<f64>, f64)> = locations
+            .iter()
+            .map(|l| (l.address.clone(), l.counter.clone(), l.write_count))
+            .collect();
+
+        // Cosine 0.2 / 0.1 to the two locations: below tau_split (0.3).
+        let input = vec_ops::normalize(&[0.2, 0.1, 0.97, 0.0]);
+        let mut next_id = 2u64;
+        let mut rng = rand::thread_rng();
+        let result = adaptive_write(
+            &input,
+            &mut locations,
+            &config,
+            0.01,
+            &mut next_id,
+            &mut rng,
+            &Scan::default(),
+        );
+
+        assert_eq!(result.new_locations.len(), 1, "a novel write spawns");
+        for (loc, (address, counter, write_count)) in locations.iter().zip(&before) {
+            assert_eq!(&loc.counter, counter, "counter absorbed a novel write");
+            assert_eq!(loc.write_count, *write_count, "write_count moved");
+            assert_eq!(&loc.address, address, "address migrated");
+        }
+
+        // A write close to location 0 still joins it and updates it.
+        let near = vec_ops::normalize(&[1.0, 0.05, 0.0, 0.0]);
+        let result = adaptive_write(
+            &near,
+            &mut locations,
+            &config,
+            0.01,
+            &mut next_id,
+            &mut rng,
+            &Scan::default(),
+        );
+        assert!(result.new_locations.is_empty(), "a near write joins");
+        assert!(
+            locations[0].write_count > before[0].2,
+            "the join was not accumulated"
+        );
+    }
+
+    /// A write activates its exact nearest locations when it searches the
+    /// f32 matrix (regression: writes took the approximate graph path,
+    /// missed the nearest location, and spawned new ones).
+    #[test]
+    fn writes_activate_the_exact_nearest() {
+        use rand::SeedableRng;
+
+        let d = 32;
+        let n = 400;
+        let config = EAMConfig::new(d).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let mut locations: Vec<HardLocation> = (0..n)
+            .map(|i| {
+                let v: Vec<f64> = (0..d).map(|_| rng.gen_range(-1.0..1.0)).collect();
+                HardLocation::new(LocationId(i as u64), vec_ops::normalize(&v))
+            })
+            .collect();
+        let matrix: Vec<f32> = locations
+            .iter()
+            .flat_map(|l| scan::to_f32(&l.address))
+            .collect();
+
+        let target = 257;
+        let input = locations[target].address.clone();
+        let mut next_id = n as u64;
+        let result = adaptive_write(
+            &input,
+            &mut locations,
+            &config,
+            0.01,
+            &mut next_id,
+            &mut rng,
+            &Scan {
+                matrix: &matrix,
+                max_norm: 1.0 + 1e-12,
+            },
+        );
+        assert!(
+            result.modified_indices.contains(&target),
+            "the location the input is identical to was not activated"
+        );
+        assert!(
+            result.new_locations.is_empty(),
+            "spawned instead of joining"
+        );
+    }
 
     #[test]
     fn test_basic_write() {
@@ -469,8 +535,7 @@ mod tests {
             0.01,
             &mut next_id,
             &mut rng,
-            &[],
-            &[],
+            &Scan::default(),
         );
         assert!(!result.modified_indices.is_empty());
         // Location 0 should have received the most weight
@@ -504,8 +569,7 @@ mod tests {
                 0.01,
                 &mut next_id,
                 &mut rng,
-                &[],
-                &[],
+                &Scan::default(),
             );
             for loc in r.new_locations {
                 locations.push(loc);
@@ -551,8 +615,7 @@ mod tests {
                 0.01,
                 &mut next_id,
                 &mut rng,
-                &[],
-                &[],
+                &Scan::default(),
             );
             if !r.new_locations.is_empty() {
                 split = true;
@@ -584,8 +647,7 @@ mod tests {
             0.01,
             &mut next_id,
             &mut rng,
-            &[],
-            &[],
+            &Scan::default(),
         );
         // Should have created at least one new location (novelty split)
         assert!(!result.new_locations.is_empty());

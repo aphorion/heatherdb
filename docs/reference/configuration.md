@@ -148,7 +148,7 @@ edit and a restart.
 | `neighbor_cap` | `max(d/4, 20)` | Non-zero enables the navigable graph. Effective capacity is computed dynamically as `max((k-1)·⌈ln L⌉, 2k)`. `0` disables the graph |
 | `num_landmarks` | `32` | Landmark entry points for graph search |
 | `mdl_gate` | `false` | Allocate by description length (`surprise·recurrence > engram bits`) instead of `tau_split` / `tau_overload` |
-| `competitive` | `true` | `false` makes writes verbatim streaming appends — no activation, no merge, no address migration. Turns the collection into an exact growing key→value store |
+| `competitive` | `true` | Adaptive learning of shared patterns by default. `false` appends individual vectors without activation, merge or migration. Choose at database creation; see [Choose a memory mode](../how-to/choose-memory-mode.md) |
 
 Validation, enforced whenever a config is built or merged:
 

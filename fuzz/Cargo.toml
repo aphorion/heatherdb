@@ -1,0 +1,32 @@
+# Fuzz targets for the storage decoders (cargo-fuzz, nightly):
+#   cargo +nightly fuzz run decode_location -- -max_total_time=60
+# Outside the workspace so stable builds and CI never compile it; the
+# scheduled `fuzz` workflow runs it.
+[package]
+name = "heather_fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+heather_db = { path = "../heather_db" }
+
+[[bin]]
+name = "decode_location"
+path = "fuzz_targets/decode_location.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_document"
+path = "fuzz_targets/decode_document.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

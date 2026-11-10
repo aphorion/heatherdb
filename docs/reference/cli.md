@@ -14,6 +14,8 @@ argument, so it may appear before or after the subcommand.
 
 > The crate is named `heather_server`; the installed binary is `heather`.
 
+For passwords beginning with `-`, use the explicit form `--password=VALUE`.
+
 ## `user`
 
 Manages the LMDB user store at `$DATA_DIR/system/data/`. Mutations are visible
@@ -107,6 +109,32 @@ Lists directories under `$DATA_DIR/snapshots/`.
 ### `snapshot delete <NAME>`
 
 Deletes one snapshot directory under `$DATA_DIR/snapshots/`.
+
+## `verify`
+
+### `verify [--db <NAME>] [--json]`
+
+Offline integrity check. Decodes every stored location and document of
+every database (or only `--db`) and reports, per collection, how many
+records are in the current format, how many predate it (still readable),
+and how many are **corrupt** (checksum mismatch, truncation) or
+**unsupported** (a newer record format), naming the first 20 damaged
+records by key. Databases that are not mounted because their format is
+newer are reported as not checked. `--json` prints the report as JSON.
+
+Exits non-zero if anything is damaged or could not be checked. Needs the
+server stopped (it takes the engine lock). See
+[Storage format](storage-format.md).
+
+```bash
+heather verify --data-dir /var/lib/heatherdb
+```
+
+```text
+films:
+  docs    locations 3 ok (0 legacy), 0 corrupt, 0 unsupported · documents 3 ok (0 legacy), 0 corrupt, 0 unsupported
+✓ no damage found
+```
 
 ## Exit codes
 

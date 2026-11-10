@@ -9,6 +9,7 @@ mod routes;
 mod routes_db;
 mod tokens;
 mod users;
+mod verify;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -28,7 +29,7 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "heather_server", about = "HeatherDB server")]
+#[command(name = "heather", version, about = "HeatherDB server")]
 struct Args {
     /// Directory for database storage (root for `db/<name>/...` and the
     /// users.json file).
@@ -137,6 +138,15 @@ enum Cmd {
         #[command(subcommand)]
         cmd: backup::SnapshotCmd,
     },
+    /// Check every stored record for damage (offline: stop the server first).
+    Verify {
+        /// Only this database.
+        #[arg(long)]
+        db: Option<String>,
+        /// Print the report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 async fn shutdown_signal() {
@@ -182,6 +192,7 @@ fn main() -> std::process::ExitCode {
             Cmd::Backup { cmd } => backup::run_backup(&data_dir, cmd),
             Cmd::Restore { cmd } => backup::run_restore(&data_dir, cmd),
             Cmd::Snapshot { cmd } => backup::run_snapshot(&data_dir, cmd),
+            Cmd::Verify { db, json } => verify::run(&data_dir, db.as_deref(), *json),
         };
     }
 
@@ -228,6 +239,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
         }
     };
 
+    for (name, reason) in server.refused_databases() {
+        tracing::warn!(database = %name, "Not mounted: {reason}");
+    }
+
     let databases = server.databases().unwrap_or_default();
     tracing::info!(
         path = %data_dir.display(),
@@ -237,9 +252,18 @@ async fn serve(args: Args) -> std::process::ExitCode {
     );
 
     let server = Arc::new(server);
-    let default_hive = server
-        .database(DEFAULT_DB)
-        .expect("default database missing immediately after open");
+    let default_hive = match server.database(DEFAULT_DB) {
+        Some(hive) => hive,
+        None => {
+            eprintln!(
+                "error: default database unavailable: {}",
+                server
+                    .refused(DEFAULT_DB)
+                    .unwrap_or_else(|| "not mounted".into())
+            );
+            return std::process::ExitCode::FAILURE;
+        }
+    };
 
     // Auth — load (or create) the user store.
     let user_store = match users::UserStore::load(&data_dir) {
@@ -355,6 +379,10 @@ async fn serve(args: Args) -> std::process::ExitCode {
     // Scoped /db/{db}/collections/... and /db/{db}/algebra/...
     let db_scoped_router = Router::new()
         .route("/db/{db}/collections", post(routes_db::create_collection))
+        .route(
+            "/db/{db}/durability",
+            get(routes_db::get_durability).put(routes_db::set_durability),
+        )
         .route("/db/{db}/collections", get(routes_db::list_collections))
         .route(
             "/db/{db}/collections/{name}",

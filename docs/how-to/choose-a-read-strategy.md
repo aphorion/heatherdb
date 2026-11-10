@@ -32,7 +32,8 @@ the query starts far from the item it belongs to.
 | Look up the item nearest a reasonably clean query | `fast` | One step already lands on the item; iteration adds latency and no accuracy |
 | Decide whether to trust or abstain from an answer | `fast` | The first-step weights and fidelity carry the signal; see [abstention](../explanation/abstention.md) |
 | Read a key→value collection | either | Both return the value stored under the matched key |
-| Recover an item from a heavily corrupted or partial query | `iterative` | Each pass pulls the state closer to the item before the value is read |
+| Get a clean copy of an item from a heavily corrupted or partial query | `iterative` | Each pass pulls the state onto the item before the value is read, so the result is the item rather than a blend with its neighbours |
+| Decide *which* item a very noisy query belongs to | `fast` | It picks the right item about as often as `iterative`, and slightly more often at extreme noise, in one step |
 | Clean up an unbind or compose result to a stored symbol | `iterative` | See [the cleanup loop](../explanation/the-cleanup-loop.md) |
 | Inspect weights with `analyze` for a confidence decision | `fast` | `iterative` reports the weights at the settled point, which look alike for every query |
 
@@ -42,16 +43,24 @@ the query starts far from the item it belongs to.
 noise added to the query. "Noise" is the noise vector's length relative to
 the stored item's.
 
-| Noise | `fast` returns the right item | `iterative` returns the right item |
-|---|---|---|
-| 0 | 30 / 30 | 30 / 30 |
-| 1.0 | 26 / 30 | 30 / 30 |
-| 1.5 | 14 / 30 | 30 / 30 |
-| 2.0 | 2 / 30 | 30 / 30 |
-| 3.0 | 0 / 30 | 29 / 30 |
+| Noise | `fast`: right item | `fast`: cosine to item | `iterative`: right item | `iterative`: cosine to item |
+|---|---|---|---|---|
+| 0 | 30 / 30 | 1.00 | 30 / 30 | 1.00 |
+| 2.0 | 30 / 30 | 0.82 | 30 / 30 | 1.00 |
+| 3.0 | 30 / 30 | 0.62 | 29 / 30 | 0.97 |
+| 4.0 | 29 / 30 | 0.52 | 26 / 30 | 0.87 |
+| 5.0 | 16 / 30 | 0.38 | 13 / 30 | 0.44 |
 
-On clean queries the two agree. As the query degrades, `fast` blends toward
-its neighbours and `iterative` still settles on the right item.
+Both pick the right item until the noise is several times the signal. What
+differs is what comes back: `fast` returns a blend of the item and its
+neighbours, which drifts away from the item as the query degrades, while
+`iterative` settles on the item first and returns it nearly intact. Past
+the point where the query no longer points at the right item, iterating
+commits harder to the wrong one, so `fast` holds up slightly better there.
+
+On a key→value collection (`bulk_load` with values that differ from their
+keys), both return the value stored under the matched key: cosine 0.999 to
+the intended value for each.
 
 The confidence picture runs the other way. On the same collection, 30
 queries near stored items against 30 never-stored queries:

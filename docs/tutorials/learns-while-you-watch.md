@@ -116,17 +116,17 @@ for target in (10, 100, 1000):
 python3 lesson2.py
 ```
 ```
-   10 writes   fidelity 0.232   vs prototype 0.277   locations   5
+   10 writes   fidelity 0.767   vs prototype 0.962   locations   5
   100 writes   fidelity 0.760   vs prototype 0.962   locations  27
- 1000 writes   fidelity 0.782   vs prototype 0.999   locations 254
+ 1000 writes   fidelity 0.782   vs prototype 0.999   locations 255
 ```
 
 ## What just happened
 
-Read the third column first. After 10 writes the engine's answer had almost
-nothing to do with the pattern the query came from — 0.277 is barely better
-than a random guess. After 100 it was 0.962. After 1000 it was 0.999, which is
-the pattern, recovered from a query that was a poor copy of it.
+Read the third column first. After 10 writes — two noisy copies of each
+pattern — the engine's answer was already 0.962 similar to the pattern the
+query came from, against a query that was itself a poor copy. After 1000 it was
+0.999, which is the pattern, recovered almost exactly.
 
 Nothing in the transcript did any training. There was no fit, no epoch, no
 checkpoint, no reload. The only calls were `write` and `read`. The improvement
@@ -137,13 +137,15 @@ learning](../terms/online-learning.md) means when the store is doing it.
 
 Three details worth stopping on.
 
-**The engine was never unavailable.** At 10 writes it answered, badly. There is
-no threshold below which the API refuses. A system that is 30% useful on day
-one is a different proposition from one that is 0% useful until a training run
-finishes.
+**The engine was never unavailable.** At 10 writes it answered, and answered
+well. There is no threshold below which the API refuses and no warm-up to sit
+through: each of the first writes landed far from everything before it, took a
+location of its own, and left the others alone, so two copies of a pattern were
+enough to reconstruct it. A system that is useful on day one is a different
+proposition from one that is 0% useful until a training run finishes.
 
 **The codebook grew, but not one entry per vector.** 10 → 5, 100 → 27,
-1000 → 254 — roughly a quarter of the writes, and not a number you configured.
+1000 → 255 — roughly a quarter of the writes, and not a number you configured.
 Whether that ratio means anything is a fair question, so measure it: write the
 same 1000 vectors again, drawn from 1000 unrelated patterns instead of 5.
 
@@ -155,20 +157,22 @@ print(call("GET", "/db/growth/collections/noise/stats")["num_locations"])
 ```
 
 ```
-1121
+869
 ```
 
-Same 1000 writes, 258 locations when they came from five patterns and 1121 when
+Same 1000 writes, 255 locations when they came from five patterns and 869 when
 they came from a thousand. The codebook is sized by how much genuinely distinct
-material arrived, not by how many requests you made — that decision belongs to
-the [MDL gate](../how-to/tune-a-database.md#the-mdl-allocation-gate), which
-allocates a new location only when an existing one cannot account for what
-arrived.
+material arrived, not by how many requests you made: a write joins the nearest
+location when it is close enough (cosine at least `tau_split`, 0.3 by default)
+and gets a location of its own when nothing is. It is 869 rather than 1000
+because in 128 dimensions a few random vectors do land within 0.3 of an earlier
+one. The opt-in [MDL gate](../how-to/tune-a-database.md#the-mdl-allocation-gate)
+replaces that fixed threshold with a description-length test.
 
-**Fidelity moved with quality, but not to 1.0.** It went 0.232 → 0.760 → 0.782
-and stopped. That ceiling is honest: your query is a *bad* copy, so the
-reconstruction lands on the clean pattern and stays a fixed distance from the
-query you actually sent. Fidelity measures agreement between question and
+**Fidelity is not the same as quality.** It went 0.767 → 0.760 → 0.782 while
+the answer went from 0.962 to 0.999 against the true pattern. That gap is
+honest: your query is a *bad* copy, so the reconstruction lands on the clean
+pattern and stays a fixed distance from the query you actually sent. Fidelity measures agreement between question and
 answer, not the engine's self-esteem — the next lessons lean on it hard.
 
 One more thing to notice about what this replaces. There was no model to

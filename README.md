@@ -122,6 +122,7 @@ heather_db/               # Engine library
     write.rs              # Competitive learning, splits, merges, the MDL gate
     read.rs               # Activation, the Hopfield loop, graph search
     merge.rs              # KNN merge with posting-list migration
+    nearest.rs            # Nearest neighbours for merges: exact, projected k-d search
     config.rs             # EAMConfig
     db_config.rs          # Per-database persisted config (dimension, EAM knobs)
     store.rs              # LMDB persistence
@@ -150,6 +151,19 @@ default database and as `/db/{db}/collections/…` scoped. The scoped handlers i
 `routes_db.rs` are three-line wrappers that resolve the hive and delegate to
 `routes.rs`, so logic belongs in the legacy handler and the wrapper picks it up.
 See [architecture](./docs/explanation/architecture.md).
+
+## Contributing
+
+Contributions to the engine, documentation, examples and benchmarks are welcome.
+Every pull request is reviewed manually by a maintainer before merging.
+
+**AI-assisted contributions are welcome.** Contributors must understand and
+verify their changes, document behaviour and limitations, and provide the
+checks they actually ran. Briefly describe how AI was used and what you
+independently verified. Unreviewed generated patches and unsupported claims
+are not ready for review.
+
+Read the [contributor guide](./CONTRIBUTING.md) before opening a pull request.
 
 ## Development
 

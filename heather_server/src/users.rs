@@ -12,9 +12,8 @@
 //!     for free now that they live in an env.
 //!   - Multi-process safe by design — LMDB is built for it.
 //!
-//! No migration: pre-1.0, fresh-start only. Existing `users.json` files
-//! are ignored — recreate the user via the CLI on first boot of an
-//! upgraded engine.
+//! 1.0 establishes a fresh baseline. Legacy `users.json` files are not
+//! imported; no migration from 0.x is required.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -199,6 +198,18 @@ impl UserStore {
             .map_err(|e| e.to_string())?;
         wtxn.commit().map_err(|e| e.to_string())?;
         Ok(removed)
+    }
+
+    /// Resolve the current user without checking a password. Token requests use
+    /// a fresh transaction so CLI deletion, password changes and recreation are
+    /// visible immediately, without paying Argon2 on every bearer request.
+    pub fn get(&self, name: &str) -> Option<User> {
+        let txn = self.env.read_txn().ok()?;
+        self.users
+            .get(&txn, name)
+            .ok()
+            .flatten()
+            .and_then(|bytes| bincode::deserialize(bytes).ok())
     }
 
     /// Verify a username + password. Always runs an Argon2 verify (against

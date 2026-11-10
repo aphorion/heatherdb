@@ -1,6 +1,6 @@
 [package]
 name = "heather_server"
-version = "0.4.1"
+version = "1.0.0"
 edition = "2024"
 rust-version = "1.88"
 description = "HeatherDB — an associative-memory database with an HTTP API"
@@ -53,7 +53,7 @@ tempfile = "3"
 # on first install. See packaging/deb/ for the maintainer scripts + unit file.
 [package.metadata.deb]
 name = "heatherdb"
-maintainer = "Aphorion Labs <hello@aphorion.dev>"
+maintainer = "Aphorion Labs <hello@aphorion.co>"
 copyright = "2026, Aphorion Labs"
 extended-description = """\
 HeatherDB — memory that learns. An associative-memory database: one write \

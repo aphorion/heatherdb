@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::config::EAMConfig;
-use crate::db_config::{DEFAULT_MAP_SIZE_MB, DbConfig, validate_db_name};
+use crate::db_config::{DEFAULT_MAP_SIZE_MB, DbConfig, FORMAT_VERSION, validate_db_name};
 use crate::error::{HeatherError, Result};
 use crate::hive::Hive;
 
@@ -43,14 +43,52 @@ pub const DEFAULT_DB: &str = "default";
 const SERVER_TAG: &str = "server.toml";
 
 /// The data-dir layout this engine build reads and writes. `Server::open`
-/// refuses any other value (pre-1.0 policy: back up and recreate, no
-/// migration shims).
+/// refuses any other value. 1.0 establishes a fresh baseline; future changes
+/// require an explicit compatibility or upgrade procedure.
 const SUPPORTED_LAYOUT: &str = "v0.2";
 
 /// Advisory lock file held (flock-exclusive) for the lifetime of an open
 /// `Server`. Cold backup/restore tooling takes the same lock to refuse
 /// running against a live engine.
 const ENGINE_LOCK: &str = "engine.lock";
+
+#[cfg(test)]
+mod default_restore_tests {
+    use super::*;
+
+    #[test]
+    fn named_database_only_root_gets_a_default_database() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let server = Server::open(dir.path(), 64).unwrap();
+            server
+                .create_database(DbConfig::new("restored", 64).unwrap())
+                .unwrap();
+        }
+        // A per-database snapshot restored into a clean root has this shape.
+        std::fs::remove_dir_all(dir.path().join("db/default")).unwrap();
+        let server = Server::open(dir.path(), 64).unwrap();
+        assert!(server.database("restored").is_some());
+        assert!(server.database(DEFAULT_DB).is_some());
+    }
+
+    #[test]
+    fn refused_default_format_is_not_recreated() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _server = Server::open(dir.path(), 64).unwrap();
+        }
+        let file = dir.path().join("db/default/db.toml");
+        let mut cfg = DbConfig::load(&file).unwrap();
+        cfg.format_version = u32::MAX;
+        cfg.save(&file).unwrap();
+        let before = std::fs::read(&file).unwrap();
+        let server = Server::open(dir.path(), 64).unwrap();
+        assert!(server.database(DEFAULT_DB).is_none());
+        assert!(server.refused(DEFAULT_DB).is_some());
+        assert_eq!(before, std::fs::read(file).unwrap());
+    }
+}
 
 /// Try to acquire the exclusive engine lock for a data dir. Returns the
 /// held lock file on success (the lock releases when the file drops) or
@@ -90,6 +128,9 @@ pub struct Server {
     /// `name → Arc<Hive>`. Read-heavy: handlers acquire a read lock,
     /// look up the Arc, and drop the lock before doing any work.
     inner: RwLock<HashMap<String, Arc<Hive>>>,
+    /// Databases found on disk but not mounted, with why (a format newer
+    /// than this HeatherDB reads).
+    refused: RwLock<HashMap<String, String>>,
     /// Held exclusively for the Server's lifetime; see [`try_acquire_engine_lock`].
     _engine_lock: std::fs::File,
 }
@@ -166,6 +207,7 @@ impl Server {
             root: root.to_path_buf(),
             default_dimension,
             inner: RwLock::new(HashMap::new()),
+            refused: RwLock::new(HashMap::new()),
             _engine_lock: engine_lock,
         };
 
@@ -193,7 +235,31 @@ impl Server {
             if !cfg_path.exists() {
                 continue;
             }
-            let cfg = DbConfig::load(&cfg_path)?;
+            let mut cfg = DbConfig::load(&cfg_path)?;
+
+            // A newer format is refused, not misread; the other databases
+            // still mount.
+            if cfg.format_version > FORMAT_VERSION {
+                let reason = format!(
+                    "database {name} uses format {} but this HeatherDB reads up to {FORMAT_VERSION}; \
+                     upgrade HeatherDB to open it",
+                    cfg.format_version
+                );
+                server
+                    .refused
+                    .write()
+                    .map_err(|_| HeatherError::LockPoisoned)?
+                    .insert(name, reason);
+                continue;
+            }
+
+            // Older databases are read as they are; what is written from now
+            // on uses the current record format, so say so.
+            if cfg.format_version < FORMAT_VERSION {
+                cfg.format_version = FORMAT_VERSION;
+                cfg.save(&cfg_path)?;
+            }
+
             let hive = open_hive_for(&server.root, &cfg)?;
             server
                 .inner
@@ -202,13 +268,16 @@ impl Server {
                 .insert(name, Arc::new(hive));
         }
 
-        // If nothing exists yet, lazily create `default` so the legacy
-        // /collections/... routes work out of the box.
+        // A named-database snapshot may be restored into an otherwise empty
+        // root. The HTTP server still needs `default` for its legacy aliases.
+        // Never replace an existing default database refused for its format.
         let needs_default = server
             .inner
             .read()
             .map_err(|_| HeatherError::LockPoisoned)?
-            .is_empty();
+            .get(DEFAULT_DB)
+            .is_none()
+            && server.refused(DEFAULT_DB).is_none();
         if needs_default {
             let mut cfg = DbConfig::new(DEFAULT_DB, default_dimension)?;
             cfg.eam.l_0 = default_l_0;
@@ -305,6 +374,15 @@ impl Server {
     /// Refuses to drop the default database to avoid the foot-gun where
     /// legacy routes silently start 404'ing.
     pub fn drop_database(&self, name: &str) -> Result<bool> {
+        self.drop_database_with(name, false)
+    }
+
+    /// Drops a database like [`Self::drop_database`]; with `purge` its
+    /// directory is then deleted from `_trash/` instead of kept there, for
+    /// data that will never be recovered (it can be rebuilt, or is
+    /// scratch). The move to `_trash/` still comes first, so the database is
+    /// unmounted atomically before anything is deleted.
+    pub fn drop_database_with(&self, name: &str, purge: bool) -> Result<bool> {
         if name == DEFAULT_DB {
             return Err(HeatherError::InvalidInput(
                 "cannot drop the default database (rename or restart with empty data dir)".into(),
@@ -346,6 +424,12 @@ impl Server {
         let mut last_err = None;
         for _ in 0..40 {
             match std::fs::rename(&dir, &trashed) {
+                Ok(()) if purge => {
+                    std::fs::remove_dir_all(&trashed).map_err(|e| {
+                        HeatherError::Storage(format!("purge {}: {e}", trashed.display()))
+                    })?;
+                    return Ok(true);
+                }
                 Ok(()) => return Ok(true),
                 Err(e) => {
                     last_err = Some(e);
@@ -359,6 +443,20 @@ impl Server {
             trashed.display(),
             last_err.expect("loop runs at least once")
         )))
+    }
+
+    /// Why a database on disk was not mounted, if it was refused (its
+    /// format is newer than this HeatherDB reads).
+    pub fn refused(&self, name: &str) -> Option<String> {
+        self.refused.read().ok()?.get(name).cloned()
+    }
+
+    /// Every refused database and why.
+    pub fn refused_databases(&self) -> Vec<(String, String)> {
+        self.refused
+            .read()
+            .map(|r| r.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
     }
 
     /// Default dimension that was used to seed the default DB on this run.
@@ -471,6 +569,45 @@ mod tests {
         let dropped = server.drop_database("memoria").unwrap();
         assert!(dropped);
         assert!(server.database("memoria").is_none());
+    }
+
+    /// A plain drop keeps the database in `_trash/`; a purge leaves nothing.
+    #[test]
+    fn purge_deletes_instead_of_trashing() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Server::open(dir.path(), 64).unwrap();
+        let trash = |prefix: &str| -> usize {
+            std::fs::read_dir(dir.path().join("_trash"))
+                .map(|entries| {
+                    entries
+                        .filter(|e| {
+                            e.as_ref()
+                                .unwrap()
+                                .file_name()
+                                .to_string_lossy()
+                                .starts_with(prefix)
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+
+        server
+            .create_database(DbConfig::new("kept", 8).unwrap())
+            .unwrap();
+        assert!(server.drop_database_with("kept", false).unwrap());
+        assert_eq!(trash("kept-"), 1);
+
+        server
+            .create_database(DbConfig::new("scratch", 8).unwrap())
+            .unwrap();
+        assert!(server.drop_database_with("scratch", true).unwrap());
+        assert_eq!(trash("scratch-"), 0);
+        assert!(!server.database_path("scratch").exists());
+        assert!(server.database("scratch").is_none());
+
+        // Dropping what is not there is still `false`, purge or not.
+        assert!(!server.drop_database_with("scratch", true).unwrap());
     }
 
     #[test]
@@ -603,5 +740,49 @@ mod tests {
         let cols_b = b.list_collections().unwrap();
         assert!(cols_a.contains(&"shared".to_string()));
         assert!(!cols_b.contains(&"shared".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    /// A database in a newer format than this HeatherDB is refused (and
+    /// says why) while the others mount; an older one is mounted and marked
+    /// current.
+    #[test]
+    fn newer_formats_are_refused_older_ones_upgraded() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let server = Server::open(dir.path(), 8).unwrap();
+            for name in ["future", "past", "now"] {
+                server
+                    .create_database(DbConfig::new(name, 8).unwrap())
+                    .unwrap();
+            }
+        }
+        let set = |name: &str, version: u32| {
+            let path = dir.path().join("db").join(name).join("db.toml");
+            let mut cfg = DbConfig::load(&path).unwrap();
+            cfg.format_version = version;
+            cfg.save(&path).unwrap();
+        };
+        set("future", FORMAT_VERSION + 1);
+        set("past", 0);
+
+        let server = Server::open(dir.path(), 8).unwrap();
+        assert!(server.database("future").is_none());
+        assert!(
+            server
+                .refused("future")
+                .unwrap()
+                .contains("upgrade HeatherDB")
+        );
+        assert!(server.database("now").is_some());
+        assert!(server.database("past").is_some());
+        assert_eq!(
+            server.database_config("past").unwrap().format_version,
+            FORMAT_VERSION
+        );
     }
 }

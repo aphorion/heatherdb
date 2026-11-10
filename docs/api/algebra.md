@@ -1,5 +1,7 @@
 # Algebra endpoints
 
+Experimental in 1.0. See the [stability boundary](overview.md#10-stability-boundary).
+
 Vector algebra over whole collections. Each op reads one or two source
 collections, computes, and writes the result into a target collection,
 creating the target if needed. Sources must exist (`404` otherwise).

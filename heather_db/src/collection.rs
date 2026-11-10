@@ -1,4 +1,5 @@
-use std::sync::{Arc, RwLock};
+use std::ops::{Deref, DerefMut};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use rayon::prelude::*;
 use realfft::num_complex::Complex;
@@ -9,7 +10,8 @@ use crate::location::{HardLocation, LocationId};
 use crate::merge;
 use crate::read;
 pub use crate::read::{ActivatedLocation, AttentionContributor, AttentionTrace, ReadTrace};
-use crate::store::Store;
+use crate::scan;
+use crate::store::{DocVector, Store};
 use crate::vec_ops;
 use crate::write;
 
@@ -242,6 +244,8 @@ pub enum ReadStrategy {
 }
 
 pub(crate) struct EAMInner {
+    /// False if recovery from a failed mutation could not read the store.
+    valid: bool,
     pub(crate) config: EAMConfig,
     pub(crate) locations: Vec<HardLocation>,
     pub(crate) next_id: u64,
@@ -249,15 +253,43 @@ pub(crate) struct EAMInner {
     pub(crate) doc_next_id: u64,
     /// Cached landmark indices for graph search entry points
     pub(crate) landmarks: Vec<usize>,
+    /// How many locations there were when `landmarks` was last selected
+    /// (see [`EAMInner::refresh_landmarks`]).
+    pub(crate) landmarks_at: usize,
     /// Flat LocationId → index lookup array for O(1) graph traversal
     pub(crate) id_lookup: Vec<u32>,
     /// Contiguous [L × D] address matrix for cache-friendly brute-force activation.
     /// Row i = `locations[i].address`. Updated incrementally on writes.
     pub(crate) address_matrix: Vec<f64>,
+    /// `address_matrix` in f32, for writes' k-nearest search (see [`scan`]).
+    pub(crate) matrix32: Vec<f32>,
+    /// An upper bound on the norm of every row of `matrix32`.
+    pub(crate) max_norm: f64,
     /// In-process mutation counter. Bumped on every write-locked mutation;
     /// lets snapshot→load_snapshot cycles detect concurrent writes. Not
     /// persisted — resets to 0 on load.
     pub(crate) version: u64,
+}
+
+/// The f32 copy of these locations' addresses (see [`scan`]) and an upper
+/// bound on their norms.
+fn f32_rows(locations: &[HardLocation]) -> (Vec<f32>, f64) {
+    let mut rows =
+        Vec::with_capacity(locations.len() * locations.first().map_or(0, |l| l.address.len()));
+    let mut max_norm: f64 = 0.0;
+    for loc in locations {
+        rows.extend(loc.address.iter().map(|&a| a as f32));
+        max_norm = max_norm.max(vec_ops::l2_norm(&loc.address));
+    }
+    (rows, max_norm)
+}
+
+/// What a write searches for its k nearest locations (see [`scan`]).
+fn write_scan(matrix32: &[f32], max_norm: f64) -> scan::Scan<'_> {
+    scan::Scan {
+        matrix: matrix32,
+        max_norm,
+    }
 }
 
 impl EAMInner {
@@ -265,7 +297,29 @@ impl EAMInner {
     pub(crate) fn rebuild_graph_cache(&mut self) {
         self.id_lookup = read::build_id_lookup(&self.locations);
         self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
+        self.landmarks_at = self.locations.len();
         self.rebuild_address_matrix();
+    }
+
+    /// Re-selects landmarks as the collection grows.
+    ///
+    /// Landmarks are where graph search ([`read::graph_activate`]) enters the
+    /// neighbour graph. They used to be chosen only when a collection was
+    /// opened (and by compress / merge / snapshot loads), so a collection
+    /// created empty and grown by writes kept none for the life of the
+    /// process. They are now re-selected while the
+    /// collection has fewer than `num_landmarks` locations' worth, and again
+    /// after each 25% of growth (at least 256 locations), which keeps the
+    /// O(N log N) selection amortised.
+    pub(crate) fn refresh_landmarks(&mut self) {
+        let len = self.locations.len();
+        let wanted = self.config.num_landmarks.min(len);
+        let grown = len >= self.landmarks_at + (self.landmarks_at / 4).max(256);
+
+        if self.config.num_landmarks > 0 && (self.landmarks.len() < wanted || grown) {
+            self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
+            self.landmarks_at = len;
+        }
     }
 
     /// Rebuild address matrix from locations.
@@ -275,6 +329,7 @@ impl EAMInner {
         for loc in &self.locations {
             self.address_matrix.extend_from_slice(&loc.address);
         }
+        (self.matrix32, self.max_norm) = f32_rows(&self.locations);
     }
 
     /// Sync specific rows of the address matrix after address migration.
@@ -282,16 +337,32 @@ impl EAMInner {
         let d = self.config.d;
         for &idx in indices {
             let start = idx * d;
-            self.address_matrix[start..start + d].copy_from_slice(&self.locations[idx].address);
+            let address = &self.locations[idx].address;
+            self.address_matrix[start..start + d].copy_from_slice(address);
+            for (x, &a) in self.matrix32[start..start + d].iter_mut().zip(address) {
+                *x = a as f32;
+            }
+            self.max_norm = self.max_norm.max(vec_ops::l2_norm(address));
         }
     }
 
-    /// Append addresses for newly added locations.
+    /// Append addresses for newly added locations (and refresh landmarks
+    /// as the collection grows).
     pub(crate) fn append_addresses(&mut self, start_idx: usize) {
         for i in start_idx..self.locations.len() {
-            self.address_matrix
-                .extend_from_slice(&self.locations[i].address);
+            let address = &self.locations[i].address;
+            self.address_matrix.extend_from_slice(address);
+            self.matrix32.extend(address.iter().map(|&a| a as f32));
+            self.max_norm = self.max_norm.max(vec_ops::l2_norm(address));
         }
+        self.refresh_landmarks();
+    }
+
+    /// The address of the location with this id, if it exists.
+    pub(crate) fn location_address(&self, id: u64) -> Option<&[f64]> {
+        let idx = *self.id_lookup.get(id as usize)?;
+        let loc = self.locations.get(idx as usize)?;
+        (loc.id.0 == id).then_some(loc.address.as_slice())
     }
 
     /// Incremental update after appending new locations.
@@ -314,7 +385,118 @@ pub struct Collection {
     store: Arc<Store>,
 }
 
+/// Hold the collection lock through persistence and recovery. Successful writes
+/// do not copy the collection. An error reloads the last committed state before
+/// releasing the lock; if storage cannot be read, later operations fail closed.
+struct AtomicMutation<'a> {
+    collection: &'a Collection,
+    inner: RwLockWriteGuard<'a, EAMInner>,
+    committed: bool,
+    dirty: bool,
+}
+
+impl AtomicMutation<'_> {
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Deref for AtomicMutation<'_> {
+    type Target = EAMInner;
+    fn deref(&self) -> &EAMInner {
+        &self.inner
+    }
+}
+
+impl DerefMut for AtomicMutation<'_> {
+    fn deref_mut(&mut self) -> &mut EAMInner {
+        self.dirty = true;
+        &mut self.inner
+    }
+}
+
+impl Drop for AtomicMutation<'_> {
+    fn drop(&mut self) {
+        if self.committed || !self.dirty {
+            return;
+        }
+        let version = self.inner.version;
+        let recovered = Collection::load(
+            self.collection.collection_id,
+            self.collection.name.clone(),
+            self.collection.store.clone(),
+            &self.inner.config,
+        )
+        .and_then(|loaded| {
+            loaded
+                .inner
+                .into_inner()
+                .map_err(|_| HeatherError::LockPoisoned)
+        });
+        match recovered {
+            Ok(mut restored) => {
+                restored.version = version;
+                *self.inner = restored;
+            }
+            Err(_) => self.inner.valid = false,
+        }
+    }
+}
+
+/// How many times more locations a document query draws candidates from
+/// than a read activates. At 1, about 16% of documents could not be found by
+/// their own vector once writes used the neighbour graph; at 2 none could not
+/// in tests; 4 leaves margin.
+const QUERY_CANDIDATE_FACTOR: usize = 4;
+
+/// The id of the location a write created, when the write was a plain
+/// (non-competitive) one that stored `input` verbatim as that location's
+/// address: its document can then refer to the location instead of keeping
+/// another copy of the vector.
+fn plain_location(
+    config: &EAMConfig,
+    modified: &[usize],
+    created: &[HardLocation],
+    input: &[f64],
+) -> Option<u64> {
+    match created {
+        [loc] if !config.competitive && modified.is_empty() && loc.address == input => {
+            Some(loc.id.0)
+        }
+        _ => None,
+    }
+}
+
 impl Collection {
+    fn read_inner(&self) -> Result<RwLockReadGuard<'_, EAMInner>> {
+        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        if !inner.valid {
+            return Err(HeatherError::Storage(
+                "collection recovery failed; restart after repairing storage".into(),
+            ));
+        }
+        Ok(inner)
+    }
+
+    fn write_inner(&self) -> Result<RwLockWriteGuard<'_, EAMInner>> {
+        let inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        if !inner.valid {
+            return Err(HeatherError::Storage(
+                "collection recovery failed; restart after repairing storage".into(),
+            ));
+        }
+        Ok(inner)
+    }
+
+    fn atomic_mutation(&self) -> Result<AtomicMutation<'_>> {
+        Ok(AtomicMutation {
+            collection: self,
+            inner: self.write_inner()?,
+            committed: false,
+            dirty: false,
+        })
+    }
+
     /// Create a new collection, initializing with L_0 random locations.
     pub fn new(
         collection_id: u32,
@@ -361,18 +543,24 @@ impl Collection {
             address_matrix.extend_from_slice(&loc.address);
         }
 
+        let landmarks_at = locations.len();
+        let (matrix32, max_norm) = f32_rows(&locations);
         Ok(Collection {
             collection_id,
             name,
             inner: RwLock::new(EAMInner {
+                valid: true,
                 config: config.clone(),
                 locations,
                 next_id,
                 eta,
                 doc_next_id: 0,
+                landmarks_at,
                 landmarks,
                 id_lookup,
                 address_matrix,
+                matrix32,
+                max_norm,
                 version: 0,
             }),
             store,
@@ -424,18 +612,24 @@ impl Collection {
             address_matrix.extend_from_slice(&loc.address);
         }
 
+        let landmarks_at = locations.len();
+        let (matrix32, max_norm) = f32_rows(&locations);
         Ok(Collection {
             collection_id,
             name,
             inner: RwLock::new(EAMInner {
+                valid: true,
                 config: config.clone(),
                 locations,
                 next_id,
                 eta,
                 doc_next_id,
+                landmarks_at,
                 landmarks,
                 id_lookup,
                 address_matrix,
+                matrix32,
+                max_norm,
                 version: 0,
             }),
             store,
@@ -454,8 +648,7 @@ impl Collection {
     pub fn write(&self, input: &[f64]) -> Result<()> {
         vec_ops::validate_vector(input)?;
 
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
-        inner.version += 1;
+        let mut inner = self.atomic_mutation()?;
 
         if input.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -463,6 +656,8 @@ impl Collection {
                 got: input.len(),
             });
         }
+
+        inner.version += 1;
 
         // No EmptyMemory guard: a data-seeded index (l_0 == 0) starts empty and
         // is seeded by the first write (adaptive_write cold-start).
@@ -474,12 +669,18 @@ impl Collection {
                 ref mut locations,
                 ref mut next_id,
                 ref mut eta,
-                ref landmarks,
-                ref id_lookup,
+                ref matrix32,
+                max_norm,
                 ..
             } = *inner;
             let r = write::adaptive_write(
-                input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                input,
+                locations,
+                config,
+                *eta,
+                next_id,
+                &mut rng,
+                &write_scan(matrix32, max_norm),
             );
             *eta = r.eta;
             r
@@ -524,6 +725,7 @@ impl Collection {
             inner.append_addresses(start);
         }
 
+        inner.commit();
         Ok(())
     }
 
@@ -540,7 +742,7 @@ impl Collection {
         vec_ops::validate_vector(address)?;
         vec_ops::validate_vector(counter)?;
 
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut inner = self.atomic_mutation()?;
 
         if address.len() != inner.config.d || counter.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -553,6 +755,8 @@ impl Collection {
             });
         }
 
+        inner.version += 1;
+
         let mut rng = rand::thread_rng();
         let result = {
             let EAMInner {
@@ -560,12 +764,19 @@ impl Collection {
                 ref mut locations,
                 ref mut next_id,
                 ref mut eta,
-                ref landmarks,
-                ref id_lookup,
+                ref matrix32,
+                max_norm,
                 ..
             } = *inner;
             let r = write::adaptive_write_two(
-                address, counter, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                address,
+                counter,
+                locations,
+                config,
+                *eta,
+                next_id,
+                &mut rng,
+                &write_scan(matrix32, max_norm),
                 opts,
             );
             *eta = r.eta;
@@ -604,6 +815,7 @@ impl Collection {
             inner.append_addresses(start);
         }
 
+        inner.commit();
         Ok(())
     }
 
@@ -613,8 +825,7 @@ impl Collection {
             vec_ops::validate_vector(input.as_ref())?;
         }
 
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
-        inner.version += 1;
+        let mut inner = self.atomic_mutation()?;
 
         // No EmptyMemory guard: data-seeded index is seeded by the first write.
 
@@ -628,6 +839,8 @@ impl Collection {
             }
         }
 
+        inner.version += 1;
+
         let mut rng = rand::thread_rng();
         let mut all_modified = std::collections::HashSet::new();
         let mut all_new_locs: Vec<HardLocation> = Vec::new();
@@ -640,12 +853,18 @@ impl Collection {
                     ref mut locations,
                     ref mut next_id,
                     ref mut eta,
-                    ref landmarks,
-                    ref id_lookup,
+                    ref matrix32,
+                    max_norm,
                     ..
                 } = *inner;
                 let r = write::adaptive_write(
-                    input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                    input,
+                    locations,
+                    config,
+                    *eta,
+                    next_id,
+                    &mut rng,
+                    &write_scan(matrix32, max_norm),
                 );
                 *eta = r.eta;
                 r
@@ -699,6 +918,7 @@ impl Collection {
 
         txn.commit()?;
 
+        inner.commit();
         Ok(())
     }
 
@@ -707,7 +927,7 @@ impl Collection {
     pub fn read(&self, query: &[f64], strategy: ReadStrategy) -> Result<Vec<f64>> {
         vec_ops::validate_vector(query)?;
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         if query.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -796,7 +1016,7 @@ impl Collection {
     ) -> Result<AttentionTrace> {
         vec_ops::validate_vector(query)?;
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         Self::check_query(&inner, query)?;
 
@@ -822,7 +1042,7 @@ impl Collection {
         barred: &[usize],
     ) -> Result<AttentionTrace> {
         vec_ops::validate_vector(query)?;
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Self::check_query(&inner, query)?;
 
         let barred: std::collections::HashSet<usize> = barred.iter().copied().collect();
@@ -970,7 +1190,7 @@ impl Collection {
             )));
         }
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         queries
             .par_iter()
@@ -989,7 +1209,7 @@ impl Collection {
     /// [`read_attention_traced`](Self::read_attention_traced)'s activation.
     pub fn top_location(&self, query: &[f64]) -> Result<usize> {
         vec_ops::validate_vector(query)?;
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Self::check_query(&inner, query)?;
         Self::top_location_locked(&inner, query)
     }
@@ -1000,7 +1220,7 @@ impl Collection {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         queries
             .par_iter()
             .map(|query| {
@@ -1035,7 +1255,7 @@ impl Collection {
         if queries.is_empty() {
             return Ok(Vec::new());
         }
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         queries
             .par_iter()
             .map(|query| {
@@ -1060,7 +1280,7 @@ impl Collection {
     /// Returns `(β*, DL*)`. The neighbour lists are β-independent, so the sweep
     /// computes them once.
     pub fn calibrate_beta(&self, betas: &[f64]) -> Result<(f64, f64)> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         let n = inner.locations.len();
         if n < 2 {
             return Ok((inner.config.beta, 0.0));
@@ -1142,7 +1362,7 @@ impl Collection {
     pub fn read_attention_mdl_traced(&self, query: &[f64]) -> Result<(AttentionTrace, f64)> {
         vec_ops::validate_vector(query)?;
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         if query.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -1215,7 +1435,8 @@ impl Collection {
     /// Run KNN merge to consolidate similar locations.
     /// Migrates document index posting lists from removed locations to survivors.
     pub fn merge(&self) -> Result<usize> {
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut inner = self.atomic_mutation()?;
+        self.materialize_document_refs(&inner)?;
         inner.version += 1;
         let EAMInner {
             ref config,
@@ -1264,6 +1485,7 @@ impl Collection {
             inner.rebuild_graph_cache();
         }
 
+        inner.commit();
         Ok(result.merge_count)
     }
 
@@ -1272,7 +1494,7 @@ impl Collection {
     /// encode each of the W writes as which location it selects (the data). This is
     /// the engine's native entropy readout; compression lowers it.
     pub fn description_length(&self, kappa: f64) -> Result<f64> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         let l = inner.locations.len().max(1) as f64;
         let w: f64 = inner
             .locations
@@ -1289,7 +1511,8 @@ impl Collection {
     /// auto-calibrates how many locations its data actually warrants. Compression is
     /// the native objective; the location count is the emergent result.
     pub fn compress(&self, kappa: f64, lambda: f64) -> Result<CompressResult> {
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut inner = self.atomic_mutation()?;
+        self.materialize_document_refs(&inner)?;
         let w: f64 = inner
             .locations
             .iter()
@@ -1393,6 +1616,7 @@ impl Collection {
             inner.rebuild_graph_cache();
         }
 
+        inner.commit();
         Ok(CompressResult {
             locations_before,
             locations_after,
@@ -1404,7 +1628,7 @@ impl Collection {
 
     /// Flush all locations to persistent storage.
     pub fn flush(&self) -> Result<()> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         let mut txn = self.store.write_txn()?;
         for loc in &inner.locations {
@@ -1432,8 +1656,7 @@ impl Collection {
     pub fn write_with_metadata(&self, input: &[f64], metadata: &[u8]) -> Result<u64> {
         vec_ops::validate_vector(input)?;
 
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
-        inner.version += 1;
+        let mut inner = self.atomic_mutation()?;
 
         if input.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -1441,6 +1664,8 @@ impl Collection {
                 got: input.len(),
             });
         }
+
+        inner.version += 1;
 
         // No EmptyMemory guard: a data-seeded index (l_0 == 0) starts empty and
         // is seeded by the first write (adaptive_write cold-start).
@@ -1453,12 +1678,18 @@ impl Collection {
                 ref mut locations,
                 ref mut next_id,
                 ref mut eta,
-                ref landmarks,
-                ref id_lookup,
+                ref matrix32,
+                max_norm,
                 ..
             } = *inner;
             let r = write::adaptive_write(
-                input, locations, config, *eta, next_id, &mut rng, landmarks, id_lookup,
+                input,
+                locations,
+                config,
+                *eta,
+                next_id,
+                &mut rng,
+                &write_scan(matrix32, max_norm),
             );
             *eta = r.eta;
             r
@@ -1497,8 +1728,13 @@ impl Collection {
             self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
 
-        // Persist document (vector + metadata)
-        let doc_data = bincode::serialize(&(input.to_vec(), metadata.to_vec()))?;
+        // Persist document (vector + metadata). A plain write's vector is its
+        // new location's address, so the document refers to it instead.
+        let doc_data =
+            match plain_location(&inner.config, &result.modified_indices, &new_locs, input) {
+                Some(id) => self.store.encode_document_ref(id, metadata),
+                None => self.store.encode_document(input, metadata)?,
+            };
         self.store
             .put_document(&mut txn, self.collection_id, doc_id, &doc_data)?;
 
@@ -1540,23 +1776,220 @@ impl Collection {
             inner.append_addresses(start);
         }
 
+        inner.commit();
         Ok(doc_id)
+    }
+
+    /// Write many patterns with their metadata in one atomic transaction.
+    /// Returns the document IDs, in input order.
+    ///
+    /// The result is the same as calling [`Self::write_with_metadata`] once per
+    /// item, in order: each adaptive write sees the locations the earlier ones
+    /// joined, migrated or created. Only persistence is batched. Every touched
+    /// location is stored once, in its final state, every location's posting
+    /// list is rewritten once with all of its new documents, and the whole
+    /// request commits once instead of once per vector.
+    ///
+    /// A failed transaction restores the last committed state while holding
+    /// the collection lock, before another reader or writer can observe it.
+    pub fn write_batch_with_metadata(
+        &self,
+        items: &[(impl AsRef<[f64]>, impl AsRef<[u8]>)],
+    ) -> Result<Vec<u64>> {
+        for (input, _) in items {
+            vec_ops::validate_vector(input.as_ref())?;
+        }
+
+        let mut inner = self.atomic_mutation()?;
+
+        let d = inner.config.d;
+        for (input, _) in items {
+            if input.as_ref().len() != d {
+                return Err(HeatherError::DimensionMismatch {
+                    expected: d,
+                    got: input.as_ref().len(),
+                });
+            }
+        }
+
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        inner.version += 1;
+
+        let mut rng = rand::thread_rng();
+        // Indices into `inner.locations` of every location joined or created.
+        let mut touched = std::collections::BTreeSet::new();
+        // Location id -> documents to append to its posting list, in order.
+        let mut postings: std::collections::BTreeMap<u64, Vec<u64>> =
+            std::collections::BTreeMap::new();
+        let mut documents = Vec::with_capacity(items.len());
+
+        for (input, metadata) in items {
+            let input = input.as_ref();
+            let result = {
+                let EAMInner {
+                    ref config,
+                    ref mut locations,
+                    ref mut next_id,
+                    ref mut eta,
+                    ref matrix32,
+                    max_norm,
+                    ..
+                } = *inner;
+                let r = write::adaptive_write(
+                    input,
+                    locations,
+                    config,
+                    *eta,
+                    next_id,
+                    &mut rng,
+                    &write_scan(matrix32, max_norm),
+                );
+                *eta = r.eta;
+                r
+            };
+
+            let doc_id = inner.doc_next_id;
+            inner.doc_next_id += 1;
+
+            // As in write_with_metadata: the document goes in the posting list
+            // of every location it joined and every location it created.
+            for &idx in &result.modified_indices {
+                touched.insert(idx);
+                postings
+                    .entry(inner.locations[idx].id.0)
+                    .or_default()
+                    .push(doc_id);
+            }
+
+            inner.sync_addresses(&result.modified_indices);
+            let plain = plain_location(
+                &inner.config,
+                &result.modified_indices,
+                &result.new_locations,
+                input,
+            );
+
+            if !result.new_locations.is_empty() {
+                let start = inner.locations.len();
+                for loc in &result.new_locations {
+                    postings.entry(loc.id.0).or_default().push(doc_id);
+                }
+                inner.locations.extend(result.new_locations);
+                inner.extend_id_lookup(start);
+                inner.append_addresses(start);
+                touched.extend(start..inner.locations.len());
+            }
+
+            documents.push((
+                doc_id,
+                match plain {
+                    Some(id) => self.store.encode_document_ref(id, metadata.as_ref()),
+                    None => self.store.encode_document(input, metadata.as_ref())?,
+                },
+            ));
+        }
+
+        let mut txn = self.store.write_txn()?;
+
+        for &idx in &touched {
+            self.store
+                .put_location(&mut txn, self.collection_id, &inner.locations[idx])?;
+        }
+
+        for (doc_id, data) in &documents {
+            self.store
+                .put_document(&mut txn, self.collection_id, *doc_id, data)?;
+        }
+
+        for (loc_id, doc_ids) in &postings {
+            self.store
+                .append_docs_to_location(&mut txn, self.collection_id, *loc_id, doc_ids)?;
+        }
+
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "next_id",
+            &bincode::serialize(&inner.next_id)?,
+        )?;
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "eta",
+            &bincode::serialize(&inner.eta)?,
+        )?;
+        self.store.put_metadata(
+            &mut txn,
+            self.collection_id,
+            "doc_next_id",
+            &bincode::serialize(&inner.doc_next_id)?,
+        )?;
+
+        txn.commit()?;
+
+        inner.commit();
+        Ok(documents.into_iter().map(|(id, _)| id).collect())
     }
 
     /// Retrieve a document's metadata and vector by its ID.
     pub fn get_document(&self, write_index: u64) -> Result<Option<(Vec<f64>, Vec<u8>)>> {
         match self.store.get_document(self.collection_id, write_index)? {
             Some(data) => {
-                let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
-                Ok(Some((vec, meta)))
+                let inner = self.read_inner()?;
+                Ok(Some(self.resolve_document(&inner, &data)?))
             }
             None => Ok(None),
         }
     }
 
+    /// A stored document's vector and metadata, its vector resolved from its
+    /// location when it is stored by reference. A reference to a location
+    /// that does not exist is [`HeatherError::Corrupt`].
+    fn resolve_document(&self, inner: &EAMInner, data: &[u8]) -> Result<(Vec<f64>, Vec<u8>)> {
+        match self.store.decode_document_parts(data)? {
+            (DocVector::Inline(vector), metadata) => Ok((vector, metadata)),
+            (DocVector::Location(id), metadata) => match inner.location_address(id) {
+                Some(address) => Ok((address.to_vec(), metadata)),
+                None => Err(HeatherError::Corrupt(format!(
+                    "document refers to location {id}, which does not exist"
+                ))),
+            },
+        }
+    }
+
+    /// Stores every document of this collection that refers to its
+    /// location's address with its own copy of the vector again. Run before
+    /// anything changes or removes existing locations (merges, compression,
+    /// snapshot loads), which would otherwise change or take away those
+    /// documents' vectors. A document that does not decode is left as it is.
+    /// Returns how many were rewritten.
+    fn materialize_document_refs(&self, inner: &EAMInner) -> Result<usize> {
+        let mut rewritten = Vec::new();
+        for (doc_id, data) in self.store.list_documents(self.collection_id)? {
+            if let Ok((DocVector::Location(_), _)) = self.store.decode_document_parts(&data)
+                && let Some((vector, metadata)) =
+                    self.store.tolerate(self.resolve_document(inner, &data))?
+            {
+                rewritten.push((doc_id, self.store.encode_document(&vector, &metadata)?));
+            }
+        }
+        if !rewritten.is_empty() {
+            let mut txn = self.store.write_txn()?;
+            for (doc_id, data) in &rewritten {
+                self.store
+                    .put_document(&mut txn, self.collection_id, *doc_id, data)?;
+            }
+            txn.commit()?;
+        }
+        Ok(rewritten.len())
+    }
+
     /// The ids of this collection's hard locations, in storage order.
     pub fn location_ids(&self) -> Result<Vec<u64>> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Ok(inner.locations.iter().map(|l| l.id.0).collect())
     }
 
@@ -1585,7 +2018,7 @@ impl Collection {
     /// that may need to be destroyed, so the unit of erasure is one the
     /// substrate can actually drop.
     pub fn delete_document(&self, write_index: u64) -> Result<bool> {
-        let _guard = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let _guard = self.write_inner()?;
         let mut txn = self.store.write_txn()?;
         let existed =
             self.store
@@ -1594,15 +2027,39 @@ impl Collection {
         Ok(existed)
     }
 
-    /// List all documents in this collection.
+    /// One page of this collection's documents (id order), the total count,
+    /// and how many of the page's documents were skipped because they did
+    /// not decode (see [`Store::tolerate`]).
+    pub fn list_documents_page(
+        &self,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<DocumentRecord>, usize, usize)> {
+        let (raw, total) = self
+            .store
+            .list_documents_page(self.collection_id, offset, limit)?;
+        let (docs, skipped) = self.decode_all(raw)?;
+        Ok((docs, total, skipped))
+    }
+
+    /// List all documents in this collection (skipping any that do not
+    /// decode; see [`Store::tolerate`]).
     pub fn list_documents(&self) -> Result<Vec<DocumentRecord>> {
         let raw = self.store.list_documents(self.collection_id)?;
+        Ok(self.decode_all(raw)?.0)
+    }
+
+    fn decode_all(&self, raw: Vec<(u64, Vec<u8>)>) -> Result<(Vec<DocumentRecord>, usize)> {
+        let inner = self.read_inner()?;
         let mut docs = Vec::with_capacity(raw.len());
+        let mut skipped = 0;
         for (id, data) in raw {
-            let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
-            docs.push((id, vec, meta));
+            match self.store.tolerate(self.resolve_document(&inner, &data))? {
+                Some((vec, meta)) => docs.push((id, vec, meta)),
+                None => skipped += 1,
+            }
         }
-        Ok(docs)
+        Ok((docs, skipped))
     }
 
     /// Query documents by cosine similarity to a query vector, returning top-n.
@@ -1656,7 +2113,7 @@ impl Collection {
             }
         }
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         if query.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -1670,7 +2127,14 @@ impl Collection {
         }
 
         // Step 1: Activate query against hard locations (graph-accelerated when ready)
-        let k = inner.config.k.min(inner.locations.len());
+        // Candidates come from a wider set of locations than a read uses: a
+        // document is posted under the locations its write activated, which
+        // (graph-searched, and since migrated) need not be a query's nearest k.
+        // At least n locations: in a plain collection each holds one document,
+        // so k * factor of them would cap the result below n.
+        let k = (inner.config.k * QUERY_CANDIDATE_FACTOR)
+            .max(n)
+            .min(inner.locations.len());
         let (indices, _sims) = read::activate_auto_full(
             query,
             &inner.locations,
@@ -1699,7 +2163,11 @@ impl Collection {
                 .store
                 .get_document_txn(&rtxn, self.collection_id, doc_id)?
             {
-                let (vec, meta): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+                let Some((vec, meta)) =
+                    self.store.tolerate(self.resolve_document(&inner, &data))?
+                else {
+                    continue;
+                };
                 // Role-scoped when a role is supplied: unbind the stored
                 // superposition by it first, so the score reflects only the
                 // role the query constrained rather than being diluted by
@@ -1778,7 +2246,7 @@ impl Collection {
     ) -> Result<MultiRoleResults> {
         vec_ops::validate_vector(query)?;
 
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         let d = inner.config.d;
 
         if query.len() != d {
@@ -1810,7 +2278,14 @@ impl Collection {
         // Recall is identical to `query_documents`: activate `query` against
         // the hard locations and take the union of their posting lists. The
         // pairs play no part in choosing candidates — see the doc comment.
-        let k = inner.config.k.min(inner.locations.len());
+        // Candidates come from a wider set of locations than a read uses: a
+        // document is posted under the locations its write activated, which
+        // (graph-searched, and since migrated) need not be a query's nearest k.
+        // At least n locations: in a plain collection each holds one document,
+        // so k * factor of them would cap the result below n.
+        let k = (inner.config.k * QUERY_CANDIDATE_FACTOR)
+            .max(n)
+            .min(inner.locations.len());
         let (indices, _sims) = read::activate_auto_full(
             query,
             &inner.locations,
@@ -1874,7 +2349,11 @@ impl Collection {
             else {
                 continue;
             };
-            let (vec, metadata): (Vec<f64>, Vec<u8>) = bincode::deserialize(&data)?;
+            let Some((vec, metadata)) =
+                self.store.tolerate(self.resolve_document(&inner, &data))?
+            else {
+                continue;
+            };
             if vec.len() != d {
                 continue;
             }
@@ -1921,7 +2400,7 @@ impl Collection {
 
     /// Get current collection statistics.
     pub fn stats(&self) -> Result<EAMStats> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         let total_writes: f64 = inner.locations.iter().map(|l| l.write_count).sum();
         let max_write_count = inner
             .locations
@@ -1965,7 +2444,7 @@ impl Collection {
 
     /// Get summary of all hard locations for UI display.
     pub fn locations_summary(&self) -> Result<Vec<LocationSummary>> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Ok(inner
             .locations
             .iter()
@@ -1995,7 +2474,7 @@ impl Collection {
     ///
     /// Returns None if no writes have occurred.
     pub fn fingerprint(&self) -> Result<Option<Vec<f64>>> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         let total_writes: f64 = inner.locations.iter().map(|l| l.write_count).sum();
         if total_writes < 1e-10 {
@@ -2029,21 +2508,21 @@ impl Collection {
     /// Extract an in-memory snapshot of this collection's EAM state.
     /// The snapshot is fully decoupled from persistence.
     pub fn snapshot(&self) -> Result<(Vec<HardLocation>, EAMConfig)> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Ok((inner.locations.clone(), inner.config.clone()))
     }
 
     /// Like [`snapshot`](Self::snapshot), but also returns the mutation
     /// version, for handing to [`load_snapshot_checked`](Self::load_snapshot_checked).
     pub fn snapshot_versioned(&self) -> Result<(Vec<HardLocation>, EAMConfig, u64)> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Ok((inner.locations.clone(), inner.config.clone(), inner.version))
     }
 
     /// Current mutation version. Bumped on every write-locked mutation
     /// (write, merge, load_snapshot). In-process only — resets on load.
     pub fn version(&self) -> Result<u64> {
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
         Ok(inner.version)
     }
 
@@ -2084,7 +2563,7 @@ impl Collection {
             .map(|m| m + 1)
             .unwrap_or(0);
 
-        let mut inner = self.inner.write().map_err(|_| HeatherError::LockPoisoned)?;
+        let mut inner = self.atomic_mutation()?;
         if let Some(expected) = expected_version
             && inner.version != expected
         {
@@ -2093,6 +2572,9 @@ impl Collection {
                 self.name, inner.version, expected
             )));
         }
+        // Documents stored by reference would lose their vectors with the
+        // locations this replaces.
+        self.materialize_document_refs(&inner)?;
         inner.version += 1;
 
         // Persist atomically: clear old locations, write new ones
@@ -2126,6 +2608,7 @@ impl Collection {
         inner.next_id = next_id;
         inner.rebuild_graph_cache();
 
+        inner.commit();
         Ok(())
     }
 
@@ -2133,7 +2616,7 @@ impl Collection {
     /// Uses graph-accelerated activation when available.
     pub fn analyze_read(&self, query: &[f64], strategy: ReadStrategy) -> Result<ReadTrace> {
         vec_ops::validate_vector(query)?;
-        let inner = self.inner.read().map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
 
         if query.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
@@ -2200,6 +2683,73 @@ impl Collection {
 }
 
 #[cfg(test)]
+mod transaction_recovery_tests {
+    use super::*;
+    use crate::Hive;
+
+    #[test]
+    fn failed_metadata_writes_restore_memory_and_document_ids() {
+        for competitive in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = EAMConfig::new(64).unwrap();
+            config.competitive = competitive;
+            let hive = Hive::open(dir.path(), config, 1).unwrap();
+            let col = hive.get_or_create_collection("rollback").unwrap();
+            let vector = vec![0.125; 64];
+            assert_eq!(col.write_with_metadata(&vector, b"{}").unwrap(), 0);
+            let before = col.snapshot().unwrap().0;
+            let eta = col.stats().unwrap().current_eta;
+            let huge = vec![b'x'; 2 * 1024 * 1024];
+            assert!(col.write_with_metadata(&vector, &huge).is_err());
+            assert!(col.write_batch_with_metadata(&[(&vector, &huge)]).is_err());
+            let after = col.snapshot().unwrap().0;
+            assert_eq!(before.len(), after.len());
+            for (old, new) in before.iter().zip(after.iter()) {
+                assert_eq!(old.address, new.address);
+                assert_eq!(old.counter, new.counter);
+                assert_eq!(old.write_count, new.write_count);
+            }
+            assert_eq!(eta, col.stats().unwrap().current_eta);
+            assert_eq!(col.write_with_metadata(&vector, b"{}").unwrap(), 1);
+            assert!(col.get_document(1).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn vector_write_variants_restore_state_after_map_full() {
+        for variant in 0..3 {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = EAMConfig::new(131_072).unwrap();
+            config.competitive = false;
+            let hive = Hive::open(dir.path(), config, 1).unwrap();
+            let col = hive.get_or_create_collection("rollback").unwrap();
+            let mut vector = vec![0.0; 131_072];
+            vector[0] = 1.0;
+            let error = match variant {
+                0 => col.write(&vector),
+                1 => col.write_two(&vector, &vector, write::WriteOpts::default()),
+                _ => col.write_batch(&[&vector]),
+            };
+            assert!(matches!(error, Err(HeatherError::Storage(_))));
+            assert_eq!(col.stats().unwrap().num_locations, 0);
+            assert_eq!(col.inner.read().unwrap().next_id, 0);
+        }
+    }
+
+    #[test]
+    fn unavailable_recovery_cache_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let hive = Hive::open(dir.path(), EAMConfig::new(8).unwrap(), 1).unwrap();
+        let col = hive.get_or_create_collection("unavailable").unwrap();
+        col.inner.write().unwrap().valid = false;
+        assert!(col.stats().is_err());
+        assert!(col.read(&[1.0; 8], ReadStrategy::HopfieldIter).is_err());
+        assert!(col.write(&[1.0; 8]).is_err());
+        assert!(col.flush().is_err());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::TempDir;
@@ -2209,6 +2759,144 @@ mod tests {
         config.l_0 = 50;
         config.k = 5;
         config
+    }
+
+    fn plain_corpus(
+        dir: &TempDir,
+        n: usize,
+        d: usize,
+    ) -> (Arc<Store>, u32, EAMConfig, Vec<Vec<f64>>) {
+        let store = Arc::new(
+            Store::open_with_precision(dir.path(), 256, crate::config::Precision::F32).unwrap(),
+        );
+        let mut txn = store.write_txn().unwrap();
+        let col_id = store.create_collection(&mut txn, "plain").unwrap();
+        txn.commit().unwrap();
+        let mut config = EAMConfig::new(d).unwrap();
+        config.l_0 = 0;
+        config.competitive = false;
+        let col = Collection::new(col_id, "plain".into(), store.clone(), &config).unwrap();
+        let mut rng = rand::thread_rng();
+        // f32-exact vectors, so a vector read back from the location (f32 on
+        // disk) equals the one written.
+        let vectors: Vec<Vec<f64>> = (0..n)
+            .map(|_| {
+                vec_ops::random_unit_vector(d, &mut rng)
+                    .iter()
+                    .map(|x| *x as f32 as f64)
+                    .collect()
+            })
+            .collect();
+        let items: Vec<(Vec<f64>, Vec<u8>)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.clone(), format!("{{\"i\":{i}}}").into_bytes()))
+            .collect();
+        col.write_batch_with_metadata(&items[..n / 2]).unwrap();
+        for (v, m) in &items[n / 2..] {
+            col.write_with_metadata(v, m).unwrap();
+        }
+        (store, col_id, config, vectors)
+    }
+
+    fn is_ref(store: &Store, data: &[u8]) -> bool {
+        matches!(
+            store.decode_document_parts(data).unwrap().0,
+            DocVector::Location(_)
+        )
+    }
+
+    #[test]
+    fn plain_documents_refer_to_their_locations_and_read_back_exactly() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id, config, vectors) = plain_corpus(&dir, 200, 32);
+        for (doc_id, data) in store.list_documents(col_id).unwrap() {
+            assert!(is_ref(&store, &data), "doc {doc_id} inline");
+        }
+        // Every read path resolves the reference, also after reopening.
+        let col = Collection::load(col_id, "plain".into(), store.clone(), &config).unwrap();
+        for (i, v) in vectors.iter().enumerate() {
+            let (vec, meta) = col.get_document(i as u64).unwrap().unwrap();
+            assert_eq!(&vec, v);
+            assert_eq!(meta, format!("{{\"i\":{i}}}").into_bytes());
+        }
+        let (page, total, skipped) = col.list_documents_page(10, 5).unwrap();
+        assert_eq!((total, skipped), (200, 0));
+        assert_eq!(page[0].1, vectors[10]);
+        assert_eq!(col.list_documents().unwrap()[199].1, vectors[199]);
+        let hits = col.query_documents(&vectors[42], 1).unwrap();
+        assert_eq!(hits[0].0, 42);
+        assert!((hits[0].1 - 1.0).abs() < 1e-9);
+        let report = store.verify_collection("plain", col_id).unwrap();
+        assert_eq!(
+            (report.documents.current, report.documents.corrupt),
+            (200, 0)
+        );
+    }
+
+    /// A reference to a location that is gone is a damaged document: skipped
+    /// and counted by listings, an error when fetched, flagged by verify.
+    #[test]
+    fn dangling_document_references_are_skipped_not_fatal() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id, config, _vectors) = plain_corpus(&dir, 10, 16);
+        let mut txn = store.write_txn().unwrap();
+        store
+            .put_document(
+                &mut txn,
+                col_id,
+                3,
+                &store.encode_document_ref(9_999, b"{}"),
+            )
+            .unwrap();
+        txn.commit().unwrap();
+
+        let col = Collection::load(col_id, "plain".into(), store.clone(), &config).unwrap();
+        let (docs, total, skipped) = col.list_documents_page(0, 20).unwrap();
+        assert_eq!((docs.len(), total, skipped), (9, 10, 1));
+        assert!(matches!(col.get_document(3), Err(HeatherError::Corrupt(_))));
+        let report = store.verify_collection("plain", col_id).unwrap();
+        assert_eq!(report.documents.corrupt, 1);
+    }
+
+    #[test]
+    fn plain_query_returns_as_many_documents_as_asked() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id, config, vectors) = plain_corpus(&dir, 400, 32);
+        let col = Collection::load(col_id, "plain".into(), store, &config).unwrap();
+        // One document per location: k * QUERY_CANDIDATE_FACTOR locations
+        // used to cap the answer well below 300.
+        assert_eq!(col.query_documents(&vectors[0], 300).unwrap().len(), 300);
+    }
+
+    #[test]
+    fn merging_a_plain_collection_keeps_its_documents_vectors() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id, mut config, vectors) = plain_corpus(&dir, 60, 16);
+        config.tau_merge = 0.0; // merge aggressively
+        let col = Collection::load(col_id, "plain".into(), store.clone(), &config).unwrap();
+        col.merge().unwrap();
+        for (doc_id, data) in store.list_documents(col_id).unwrap() {
+            assert!(!is_ref(&store, &data), "doc {doc_id} still a ref");
+        }
+        for (i, v) in vectors.iter().enumerate() {
+            assert_eq!(&col.get_document(i as u64).unwrap().unwrap().0, v);
+        }
+    }
+
+    #[test]
+    fn competitive_documents_keep_their_own_vectors() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let col = Collection::new(col_id, "test".into(), store.clone(), &test_config()).unwrap();
+        let mut rng = rand::thread_rng();
+        for _ in 0..20 {
+            col.write_with_metadata(&vec_ops::random_unit_vector(16, &mut rng), b"{}")
+                .unwrap();
+        }
+        for (_, data) in store.list_documents(col_id).unwrap() {
+            assert!(!is_ref(&store, &data));
+        }
     }
 
     fn setup_store(dir: &TempDir) -> (Arc<Store>, u32) {
@@ -2342,7 +3030,9 @@ mod tests {
 
         let mut config = EAMConfig::new(d).unwrap();
         config.l_0 = 8;
-        config.k = 8;
+        // 8 seeds + 4 documents, each document novel enough to spawn its own
+        // location: 12 locations, all of them activated.
+        config.k = 16;
         let col = Collection::new(col_id, "bids".into(), store, &config).unwrap();
 
         let mut rng = rand::thread_rng();
@@ -3256,6 +3946,399 @@ mod tests {
                 "document {id} written to a spawned location is unreachable"
             );
         }
+    }
+
+    /// A batched write stores and indexes every document exactly as one-by-one
+    /// writes do: ids in input order, metadata kept, each document findable by
+    /// its own vector, whether it spawned a location or joined one, including
+    /// a location created earlier in the same batch.
+    #[test]
+    fn batched_metadata_writes_index_every_document() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let mut config = EAMConfig::new(d).unwrap();
+        config.k = 1;
+        config.gamma = 0.0;
+        let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+
+        // Orthogonal patterns spawn locations; the repeats join the location
+        // their first copy created in this same batch.
+        let vs = [
+            basis_vec(d, 0),
+            basis_vec(d, 4),
+            basis_vec(d, 0),
+            basis_vec(d, 8),
+            basis_vec(d, 4),
+        ];
+        let items: Vec<(Vec<f64>, Vec<u8>)> = vs
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.clone(), format!(r#"{{"i":{i}}}"#).into_bytes()))
+            .collect();
+
+        let ids = col.write_batch_with_metadata(&items).unwrap();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+
+        for (i, (v, id)) in vs.iter().zip(&ids).enumerate() {
+            let got = col.query_documents(v, 10).unwrap();
+            assert!(
+                got.iter().any(|(g, _, _)| g == id),
+                "batched document {id} is unreachable"
+            );
+            let (vector, meta) = col.get_document(*id).unwrap().unwrap();
+            assert_eq!(&vector, v);
+            assert_eq!(meta, format!(r#"{{"i":{i}}}"#).into_bytes());
+        }
+
+        // A later write continues the document ids, and an empty batch is a no-op.
+        assert!(
+            col.write_batch_with_metadata(&Vec::<(Vec<f64>, Vec<u8>)>::new())
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            col.write_with_metadata(&basis_vec(d, 12), b"{}").unwrap(),
+            5
+        );
+    }
+
+    /// Everything a batched write persists survives a reload: locations,
+    /// documents, posting lists and the document id counter.
+    #[test]
+    fn batched_metadata_writes_survive_a_reload() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let mut config = EAMConfig::new(d).unwrap();
+        config.k = 1;
+        config.gamma = 0.0;
+        let vs = [
+            basis_vec(d, 0),
+            basis_vec(d, 4),
+            basis_vec(d, 8),
+            basis_vec(d, 0),
+        ];
+        let items: Vec<(Vec<f64>, &[u8])> =
+            vs.iter().map(|v| (v.clone(), b"{}" as &[u8])).collect();
+
+        let (ids, locations) = {
+            let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+            let ids = col.write_batch_with_metadata(&items).unwrap();
+            (ids, col.num_locations().unwrap())
+        };
+
+        let col = Collection::load(col_id, "docs".into(), store, &config).unwrap();
+        assert_eq!(col.num_locations().unwrap(), locations);
+        for (v, id) in vs.iter().zip(&ids) {
+            assert!(
+                col.query_documents(v, 10)
+                    .unwrap()
+                    .iter()
+                    .any(|(g, _, _)| g == id)
+            );
+        }
+        assert_eq!(
+            col.write_with_metadata(&basis_vec(d, 12), b"{}").unwrap(),
+            ids.len() as u64
+        );
+    }
+
+    /// A dimension mismatch anywhere in the batch rejects the whole batch
+    /// before anything is written.
+    #[test]
+    fn batched_metadata_writes_reject_a_bad_item_without_writing() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "docs".into(), store, &config).unwrap();
+        let items = vec![
+            (basis_vec(d, 0), b"{}".to_vec()),
+            (vec![1.0; 8], b"{}".to_vec()),
+        ];
+
+        assert!(col.write_batch_with_metadata(&items).is_err());
+        assert_eq!(col.write_with_metadata(&basis_vec(d, 0), b"{}").unwrap(), 0);
+    }
+
+    /// A document that no longer decodes is skipped (and counted) by
+    /// listings and queries; the others are still served.
+    #[test]
+    fn corrupt_documents_are_skipped_not_fatal() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let mut config = EAMConfig::new(d).unwrap();
+        config.k = 1;
+        config.gamma = 0.0;
+        let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+        for i in 0..3 {
+            col.write_with_metadata(&basis_vec(d, i * 4), format!(r#"{{"i":{i}}}"#).as_bytes())
+                .unwrap();
+        }
+
+        // Damage document 1 in place.
+        let mut txn = store.write_txn().unwrap();
+        store
+            .put_document(&mut txn, col_id, 1, b"not a record")
+            .unwrap();
+        txn.commit().unwrap();
+
+        let (docs, total, skipped) = col.list_documents_page(0, 10).unwrap();
+        assert_eq!((docs.len(), total, skipped), (2, 3, 1));
+        assert_eq!(col.list_documents().unwrap().len(), 2);
+        assert!(matches!(col.get_document(1), Err(HeatherError::Corrupt(_))));
+        // A query that reaches it still answers with the rest.
+        assert!(col.query_documents(&basis_vec(d, 0), 10).is_ok());
+        assert!(store.skipped_records() >= 2);
+    }
+
+    /// A location that no longer decodes is skipped when the collection is
+    /// opened, instead of keeping it from opening.
+    #[test]
+    fn corrupt_locations_do_not_stop_a_collection_opening() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let mut config = EAMConfig::new(d).unwrap();
+        config.k = 1;
+        config.gamma = 0.0;
+        let locations = {
+            let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+            for i in 0..4 {
+                col.write_with_metadata(&basis_vec(d, i * 4), b"{}")
+                    .unwrap();
+            }
+            col.num_locations().unwrap()
+        };
+
+        // Overwrite one stored location with garbage.
+        let first = store.load_all_locations(col_id).unwrap()[0].id.0;
+        let mut txn = store.write_txn().unwrap();
+        store
+            .put_raw_location(&mut txn, col_id, first, b"garbage")
+            .unwrap();
+        txn.commit().unwrap();
+
+        let col = Collection::load(col_id, "docs".into(), store.clone(), &config).unwrap();
+        assert_eq!(col.num_locations().unwrap(), locations - 1);
+        assert!(store.skipped_records() >= 1);
+    }
+
+    /// Every read path returns what was written, at both precisions (f32
+    /// within its rounding): writes one at a time and batched, get, list,
+    /// page, query, and the same after the collection is reopened.
+    #[test]
+    fn every_read_path_round_trips_at_both_precisions() {
+        use crate::config::Precision;
+
+        for precision in [Precision::F64, Precision::F32] {
+            let dir = TempDir::new().unwrap();
+            let store = Arc::new(Store::open_with_precision(dir.path(), 64, precision).unwrap());
+            let col_id = {
+                let mut txn = store.write_txn().unwrap();
+                let id = store.create_collection(&mut txn, "docs").unwrap();
+                txn.commit().unwrap();
+                id
+            };
+            let d = 16;
+            let mut config = EAMConfig::new(d).unwrap();
+            config.k = 1;
+            config.gamma = 0.0;
+            config.precision = precision;
+            let round = |v: &[f64]| -> Vec<f64> {
+                match precision {
+                    Precision::F64 => v.to_vec(),
+                    Precision::F32 => v.iter().map(|&x| f64::from(x as f32)).collect(),
+                }
+            };
+            let vectors: Vec<Vec<f64>> = (0..6)
+                .map(|i| {
+                    let mut v = basis_vec(d, (i * 3) % d);
+                    v[(i * 3 + 1) % d] = 0.1 * (i as f64 + 1.0) / 3.0;
+                    vec_ops::normalize(&v)
+                })
+                .collect();
+
+            let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+            for (i, v) in vectors.iter().take(3).enumerate() {
+                col.write_with_metadata(v, format!(r#"{{"i":{i}}}"#).as_bytes())
+                    .unwrap();
+            }
+            let batch: Vec<(Vec<f64>, Vec<u8>)> = vectors[3..]
+                .iter()
+                .enumerate()
+                .map(|(i, v)| (v.clone(), format!(r#"{{"i":{}}}"#, i + 3).into_bytes()))
+                .collect();
+            col.write_batch_with_metadata(&batch).unwrap();
+            let locations_before = col.num_locations().unwrap();
+
+            let check = |col: &Collection| {
+                for (i, v) in vectors.iter().enumerate() {
+                    let (got, meta) = col.get_document(i as u64).unwrap().unwrap();
+                    assert_eq!(got, round(v), "{precision:?} get {i}");
+                    assert_eq!(meta, format!(r#"{{"i":{i}}}"#).into_bytes());
+                }
+                let all = col.list_documents().unwrap();
+                assert_eq!(all.len(), vectors.len());
+                let (page, total, skipped) = col.list_documents_page(2, 3).unwrap();
+                assert_eq!(
+                    (page.iter().map(|d| d.0).collect::<Vec<_>>(), total, skipped),
+                    (vec![2, 3, 4], 6, 0)
+                );
+                let hits = col.query_documents(&vectors[4], 6).unwrap();
+                assert!(
+                    hits.iter().any(|(id, _, _)| *id == 4),
+                    "{precision:?} query finds its own vector"
+                );
+            };
+
+            check(&col);
+            drop(col);
+            let col = Collection::load(col_id, "docs".into(), store.clone(), &config).unwrap();
+            assert_eq!(
+                col.num_locations().unwrap(),
+                locations_before,
+                "{precision:?} reopen keeps every location"
+            );
+            check(&col);
+            assert_eq!(store.skipped_records(), 0);
+        }
+    }
+
+    /// `verify` counts current, legacy and damaged records and names the
+    /// damaged ones.
+    #[test]
+    fn verify_reports_damage_by_record() {
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 16;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "docs".into(), store.clone(), &config).unwrap();
+        for i in 0..3 {
+            col.write_with_metadata(&basis_vec(d, i * 4), b"{}")
+                .unwrap();
+        }
+        let clean = store.verify_collection("docs", col_id).unwrap();
+        assert!(clean.is_clean());
+        assert_eq!(clean.documents.current, 3);
+
+        let mut txn = store.write_txn().unwrap();
+        store.put_document(&mut txn, col_id, 1, b"garbage").unwrap();
+        let legacy = bincode::serialize(&(basis_vec(d, 1), b"{}".to_vec())).unwrap();
+        store.put_document(&mut txn, col_id, 2, &legacy).unwrap();
+        txn.commit().unwrap();
+
+        let report = store.verify_collection("docs", col_id).unwrap();
+        assert!(!report.is_clean());
+        assert_eq!(
+            (
+                report.documents.current,
+                report.documents.legacy,
+                report.documents.corrupt
+            ),
+            (1, 1, 1)
+        );
+        assert!(report.problems.iter().any(|p| p.starts_with("document 1:")));
+    }
+
+    /// A collection created empty and grown only by writes gets landmarks,
+    /// and they are re-selected as it keeps growing, so graph search has
+    /// entry points (regression: landmarks were chosen only on open, leaving
+    /// a growing collection with none).
+    #[test]
+    fn landmarks_follow_a_collection_grown_by_writes() {
+        use rand::{Rng, SeedableRng};
+
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 32;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "docs".into(), store, &config).unwrap();
+        assert!(
+            col.inner.read().unwrap().landmarks.is_empty(),
+            "starts with none"
+        );
+
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let vector = |rng: &mut rand::rngs::StdRng| -> Vec<f64> {
+            vec_ops::normalize(
+                &(0..d)
+                    .map(|_| rng.gen_range(-1.0..1.0))
+                    .collect::<Vec<f64>>(),
+            )
+        };
+
+        for _ in 0..400 {
+            col.write_with_metadata(&vector(&mut rng), b"{}").unwrap();
+        }
+
+        let (landmarks, at, len) = {
+            let inner = col.inner.read().unwrap();
+            (
+                inner.landmarks.clone(),
+                inner.landmarks_at,
+                inner.locations.len(),
+            )
+        };
+        assert_eq!(
+            landmarks.len(),
+            config.num_landmarks.min(len),
+            "a grown collection has a full set"
+        );
+        assert!(landmarks.iter().all(|&i| i < len));
+
+        // Grow well past 25%: they are selected again.
+        let items: Vec<(Vec<f64>, Vec<u8>)> = (0..2_000)
+            .map(|_| (vector(&mut rng), b"{}".to_vec()))
+            .collect();
+        col.write_batch_with_metadata(&items).unwrap();
+        let inner = col.inner.read().unwrap();
+        assert!(inner.locations.len() > len);
+        assert!(inner.landmarks_at > at, "re-selected after growth");
+        assert!(inner.landmarks.iter().all(|&i| i < inner.locations.len()));
+    }
+
+    /// A stored document is always found by its own vector, also once the
+    /// collection has grown a neighbour graph (regression: reads used the
+    /// approximate graph search and missed ~16% of exact matches).
+    #[test]
+    fn documents_are_found_by_their_own_vector() {
+        use rand::{Rng, SeedableRng};
+
+        let dir = TempDir::new().unwrap();
+        let (store, col_id) = setup_store(&dir);
+        let d = 64;
+        let config = EAMConfig::new(d).unwrap();
+        let col = Collection::new(col_id, "lookup".into(), store, &config).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(11);
+        let keys: Vec<Vec<f64>> = (0..3_000)
+            .map(|_| {
+                vec_ops::normalize(
+                    &(0..d)
+                        .map(|_| rng.gen_range(-1.0..1.0))
+                        .collect::<Vec<f64>>(),
+                )
+            })
+            .collect();
+        let items: Vec<(Vec<f64>, Vec<u8>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| (k.clone(), format!(r#"{{"i":{i}}}"#).into_bytes()))
+            .collect();
+        for chunk in items.chunks(500) {
+            col.write_batch_with_metadata(chunk).unwrap();
+        }
+
+        let misses = (0..keys.len())
+            .step_by(7)
+            .filter(|&i| {
+                let hits = col.query_documents(&keys[i], 5).unwrap();
+                !hits.iter().any(|(id, _, _)| *id == i as u64)
+            })
+            .count();
+        assert_eq!(misses, 0, "{misses} keys did not find their own document");
     }
 
     /// Deletion removes a document from retrieval and from every posting

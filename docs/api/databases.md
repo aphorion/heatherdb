@@ -46,7 +46,7 @@ Auth: Basic or Bearer, **root scope**.
 | `dimension` | integer | *required* | Immutable for the life of the database |
 | `map_size_mb` | integer | `4096` | LMDB ceiling for this database's env |
 | `mdl_gate` | boolean | `false` | Allocate by description length instead of `tau_split`/`tau_overload` |
-| `eam` | object | — | Partial `EAMConfig` override: `k`, `t_max`, `beta`, `neighbor_cap`, `num_landmarks`, `l_0`. Unset fields keep the engine default; the merged config is validated |
+| `eam` | object | — | Partial `EAMConfig` override: `k`, `t_max`, `beta`, `neighbor_cap`, `num_landmarks`, `l_0`, `competitive`, `precision`. Unset fields keep the engine default; the merged config is validated. `"competitive": false` makes every collection a plain store: writes append each vector as its own location with no activation, merge or migration, use it to retain individual observations, including similarity-based associative recall through attention. Competitive mode learns shared patterns and can adapt through graceful forgetting. See [Choose a memory mode](../how-to/choose-memory-mode.md). `"precision": "f32"` stores vectors in half the space (rounded to f32 when written; all math stays f64). Both are fixed for the database's lifetime, and `GET /db` / `GET /db/{db}` report them |
 
 ```bash
 curl -u admin:pw -X POST http://localhost:6380/db \
@@ -59,7 +59,8 @@ Responds with the same shape as [`GET /db/{db}`](#get-dbdb):
 
 ```json
 { "name": "movies", "created_at": 1767225600, "dimension": 384,
-  "map_size_mb": 32768, "collections": 0 }
+  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64",
+  "format_version": 1, "skipped_records": 0 }
 ```
 
 | Status | Cause |
@@ -83,7 +84,8 @@ curl -u admin:pw http://localhost:6380/db/movies
 
 ```json
 { "name": "movies", "created_at": 1767225600, "dimension": 384,
-  "map_size_mb": 32768, "collections": 0 }
+  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64",
+  "format_version": 1, "skipped_records": 0 }
 ```
 
 `collections` is `0` when the collection list cannot be read, not an error.
@@ -92,6 +94,11 @@ curl -u admin:pw http://localhost:6380/db/movies
 |---|---|
 | `403 Forbidden` | the caller is scoped to a different database |
 | `404 Not Found` | no `db.toml` for that name |
+| `409 Conflict` | (any `/db/{db}/...` route) the database is on disk in a format newer than this server reads; the message says which. See [Storage format](../reference/storage-format.md) |
+
+`format_version` is the database's on-disk format; `skipped_records` counts
+records reads have skipped since it was opened because they did not decode
+(non-zero means damage).
 
 ### DELETE /db/{db}
 
@@ -111,10 +118,17 @@ curl -u admin:pw -X DELETE http://localhost:6380/db/movies
 ```
 
 ```json
-{ "dropped": true }
+{ "dropped": true, "purged": false }
 ```
 
 `{"dropped": false}` when the database was not mounted.
+
+With `?purge=true` the database is deleted for good instead of kept in
+`_trash/` (it is still moved there first, so it is unmounted atomically):
+`{"dropped": true, "purged": true}`. Use it for data you will never
+recover, such as scratch databases or ones rebuilt from a log; trash is
+never emptied automatically, so repeated drops of large databases fill the
+disk. Without it, `purged` is `false`.
 
 | Status | Cause |
 |---|---|
@@ -122,3 +136,60 @@ curl -u admin:pw -X DELETE http://localhost:6380/db/movies
 | `403 Forbidden` | the caller is scoped to a different database, or the target is `default`, which cannot be dropped (the legacy routes target it) |
 
 See also [Backup and restore](../how-to/backup-and-restore.md).
+
+### GET /db/{db}/durability
+
+Whether the database syncs every commit to disk.
+
+Auth: Basic or Bearer, root or `Database(db)`.
+
+Request body: no body.
+
+```bash
+curl -u admin:pw http://localhost:6380/db/movies/durability
+```
+
+```json
+{ "database": "movies", "sync": true }
+```
+
+| Status | Cause |
+|---|---|
+| `403 Forbidden` | the caller is scoped to a different database |
+| `404 Not Found` | no such database |
+
+### PUT /db/{db}/durability
+
+Stops or restarts syncing every commit to disk. By default each commit is
+synced (LMDB's default), which is what makes a write durable, and on
+macOS it is a full device flush (`F_FULLFSYNC`) that can dominate write
+time. `{"sync": false}` lets commits reach the operating system without
+waiting for the disk (LMDB `NO_SYNC`): much faster bulk loads, at the cost
+that a **system** crash (not a server crash) can lose recent commits, or
+corrupt the database on file systems that reorder writes. Use it for data
+you can rebuild, such as a memory replayed from a log, and turn it back on
+when the load is done: `{"sync": true}` flushes everything written
+meanwhile before it answers.
+
+The setting is not persisted: a restarted server syncs every commit again.
+
+Auth: Basic or Bearer, root or `Database(db)`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `sync` | boolean | *required* |
+
+```bash
+curl -u admin:pw -X PUT http://localhost:6380/db/movies/durability \
+  -H 'content-type: application/json' -d '{"sync": false}'
+```
+
+```json
+{ "database": "movies", "sync": false }
+```
+
+| Status | Cause |
+|---|---|
+| `403 Forbidden` | the caller is scoped to a different database |
+| `404 Not Found` | no such database |
+| `500 Internal Server Error` | the flag could not be changed or the flush failed |

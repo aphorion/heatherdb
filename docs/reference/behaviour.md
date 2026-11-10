@@ -4,7 +4,9 @@ Behaviour a caller must know before it bites. The **Loud?** column is the one
 to read first: a loud behaviour returns a status code you can branch on, a
 silent one returns `200` and a plausible-looking result.
 
-`file:line` references are into this repository at `heather_server` 0.3.0.
+Historical `file:line` references identify the implementation areas; line
+numbers may shift. The [1.0 release contract](v1-release-contract.md) defines
+the stable guarantees.
 
 ## Silent — returns 200, does the wrong thing
 
@@ -20,10 +22,11 @@ silent one returns `200` and a plausible-looking result.
 | `role_pairs` do not steer recall. Ranking is plain full-bundle cosine against `query`; the pairs only score documents that already survived. A document that would rank well under your weighting can be absent from the candidate set entirely | silent | **Over-fetch.** Ask for an `n` far larger than you intend to display and re-rank in the consumer. No value of `n` makes this exact | `collection.rs:1746-1752` |
 | `DELETE …/documents/{id}` is a retrieval and citation tombstone. The write's contribution to the merged location addresses and counters stays; superposition is not invertible | silent | For material with an erasure obligation, use a separate collection or database so the unit of erasure is one the substrate can drop | `collection.rs:1573-1586` |
 | A cleanup read repairs a degraded query but does **not** verify it. Reading a deliberately corrupted vector back against a stored law recovers it to 1.000 — and reading *pure noise* against the same collection also returns 1.000, because a read always settles somewhere | silent | Never use "the read returned a high score" as evidence that the input was meaningful. Verification is a separate step: compare against a [null](../terms/null-model.md), and score on data the memory has never seen | measured against a live engine |
-| The competitive `write` path merges near-identical patterns, which destroys a per-item familiarity signal. Writing four distinct-but-similar items produced **2** locations, and a stored item then scored 0.49 against an unstored one at 0.48 — indistinguishable. `bulk_load` of the same four gives 4 locations and 1.00 against 0.50 | silent | When the question is "have I seen *this specific thing*", load the items with `bulk_load` so each is its own attractor. Use `write` when you want generalisation, which is the opposite need | measured against a live engine |
+| Competitive writes can combine related observations in shared locations. A novelty spawn leaves existing counters and addresses unchanged; joining writes update the activated representation | representation policy | Use competitive mode for associative completion and shared learning. Use plain mode when each vector must stay a separate location; use document IDs for exact record identity | [Choose a memory mode](../how-to/choose-memory-mode.md) |
+| A `read` returns a reconstructed vector, which can complete an individual pattern or express shared structure. It does not identify a document | result semantics | Use metadata-bearing writes with `documents/{id}` for exact ID/metadata lookup or `documents/query` for similarity-ranked records. These APIs work with either write mode | [Read endpoints](../api/reads.md) |
 | An `iterative` read's `analyze` weights and settled similarity are taken after the query has settled on an attractor, so they read alike for a stored and a never-stored query (top weight 0.81–0.85 vs 0.85–0.88; similarity 0.999 for both). The `fast` top weight on the same collection separates them (0.79–0.83 vs 0.06–0.10) | silent | Gate on `"strategy": "fast"`. Use `iterative` to recover items from corrupted queries, not to judge confidence. See [choose a read strategy](../how-to/choose-a-read-strategy.md) | measured against a live engine |
-| An overload split spawns the new location by perturbing the winner's address with a fresh random unit vector at 0.1 — location counts and ids are not reproducible run to run for the same input sequence | silent | Do not assert on `num_locations` in tests. Assert on recall, fidelity or description length | `write.rs:342` |
-| Neighbour pruning drops the *oldest* edges once a location exceeds its adaptive cap, so graph quality is a function of write order | silent | Interleave rather than block-load related patterns, or set `neighbor_cap = 0` and take the exhaustive scan when order is not controllable | `write.rs:281-284` |
+| An overload split spawns the new location by perturbing the winner's address with a fresh random unit vector at 0.1 — location counts and ids are not reproducible run to run for the same input sequence | silent | Do not assert on `num_locations` in tests. Assert on recall, fidelity or description length | `write.rs:355` |
+| Neighbour pruning drops the *oldest* edges once a location exceeds its adaptive cap, so graph quality is a function of write order | silent | Interleave rather than block-load related patterns, or set `neighbor_cap = 0` and take the exhaustive scan when order is not controllable | `write.rs:306-309` |
 | Turning off `[audit].enabled` silently stops recording who read what; nothing in a read response changes | silent | Check `GET /db` / `db.toml` as part of a deployment audit | `configuration.md` → `[audit]` |
 | A hard kill (SIGKILL, power loss) loses whatever audit records are still buffered — at most `flush_threshold` records or `flush_interval_secs` of activity. A graceful shutdown flushes | silent | Lower `flush_threshold` / `flush_interval_secs` if the log is compliance-bearing; accept the write contention that buys | `heather_db/src/audit.rs:59-64` |
 | `--map-size-mb` / `HEATHER_MAP_SIZE_MB` sizes only the auto-created `default` database, and only on the boot that creates it. It never sizes databases created through `POST /db`, and it is ignored for `default` once `db.toml` exists | silent | Set `map_size_mb` per database on `POST /db`, and verify with `GET /db` | `main.rs:68-78` |
@@ -42,9 +45,18 @@ silent one returns `200` and a plausible-looking result.
 
 | Behaviour | Notes | Source |
 |---|---|---|
-| A session token's scope is frozen at mint. Changing the user's scope in the user store leaves already-issued tokens on the old scope until they expire or are revoked | Revoke explicitly after any scope change | `tokens.rs:18-20` |
+| Deleting a user, changing its password or changing its scope invalidates existing bearer tokens on the next request | Mint a new token using the current credentials | `auth.rs`, `users.rs` |
 | `analyze` reports cosines in `similarity`; `attention` reports raw dot products `Q·Kᵢ` in the same field name | Do not compare the two, and do not threshold one with a constant tuned on the other | `models.rs:109-117` |
 | A read returns a *reconstruction*, which may be a vector nobody ever wrote | This is not a nearest-neighbour index. Fetch documents by id if you need the exact stored bytes | `explanation/associative-memory.md` |
+
+## Failed transactions
+
+A failed write returns an error. Before another operation can observe the
+collection, its cache is restored from committed storage. If that recovery
+also fails, collection operations fail closed until the storage is repaired
+and the engine restarted. Storage failures on the HTTP write route return
+`500`; invalid input returns `400`. A client timeout is an unknown outcome,
+not a rollback acknowledgement.
 
 ## Related
 

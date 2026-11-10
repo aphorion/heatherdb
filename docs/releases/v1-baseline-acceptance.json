@@ -1,0 +1,153 @@
+{
+  "recordedAt": "2026-11-05T05:38:50.140061+00:00",
+  "engineCommit": "0c9bc08750f312a022c646618f7c3af61eef925b",
+  "checks": [
+    {
+      "name": "SEC-01 authentication, scope and deleted-user token revocation",
+      "status": "fail",
+      "detail": "Deleted user bearer token still returns HTTP 200",
+      "seconds": 0.261
+    },
+    {
+      "name": "API-01 metadata write and exact document lookup",
+      "status": "pass",
+      "detail": {
+        "records": 2
+      },
+      "seconds": 0.067
+    },
+    {
+      "name": "API-02 invalid-item batch rollback",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.093
+    },
+    {
+      "name": "API-03 bounded concurrent read/write workload",
+      "status": "pass",
+      "detail": {
+        "operations": 40,
+        "clients": 4
+      },
+      "seconds": 0.328
+    },
+    {
+      "name": "OPS-02 live snapshot, restore and verification",
+      "status": "fail",
+      "detail": "Engine exited during startup: 101",
+      "seconds": 0.071
+    },
+    {
+      "name": "OPS-01 exclusive ownership and offline-tool refusal",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.017
+    },
+    {
+      "name": "MEM-02 document deletion",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.053
+    },
+    {
+      "name": "DUR-02 explicit durability modes, flush and restart default",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.207
+    },
+    {
+      "name": "DUR-01 acknowledged synchronous write survives process kill",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.15
+    },
+    {
+      "name": "OPS-02 cold full backup restores data and users",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.188
+    },
+    {
+      "name": "MEM-01 both storage precisions in plain mode",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.198
+    },
+    {
+      "name": "MEM-03 deterministic partial-cue quality measurement",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.857
+    },
+    {
+      "name": "API-02/OPS-03 map exhaustion leaves memory and disk unchanged",
+      "status": "fail",
+      "detail": "Failed storage transaction changed live memory; see map_exhaustion evidence",
+      "seconds": 0.279
+    },
+    {
+      "name": "FMT-01 unsupported database refused without rewriting",
+      "status": "pass",
+      "detail": null,
+      "seconds": 0.153
+    },
+    {
+      "name": "REL-01 binary version discoverability",
+      "status": "fail",
+      "detail": "Binary has no successful --version command",
+      "seconds": 0.008
+    }
+  ],
+  "observations": {
+    "deleted_user_bearer_http_status": 200,
+    "ids": [
+      0,
+      1
+    ],
+    "associative_quality": {
+      "seed": 20261105,
+      "patterns": 32,
+      "dimension": 64,
+      "erased_fraction": 0.25,
+      "mode": "competitive, default beta=5, iterative",
+      "mean_cosine": 0.1800967157158755,
+      "minimum_cosine": -0.0459223728924943,
+      "fraction_cosine_at_least_0_9": 0.0625,
+      "quality_threshold_is_not_a_release_guarantee": true
+    },
+    "map_exhaustion": {
+      "http_status": 400,
+      "error": {
+        "error": "storage error: MDB_MAP_FULL: Environment mapsize limit reached"
+      },
+      "before": {
+        "num_locations": 1,
+        "total_writes": 1.0,
+        "current_eta": 0.01,
+        "avg_write_count": 1.0,
+        "max_write_count": 1.0
+      },
+      "after_failed_write": {
+        "num_locations": 9,
+        "total_writes": 9.0,
+        "current_eta": 0.01,
+        "avg_write_count": 1.0,
+        "max_write_count": 1.0
+      },
+      "after_restart": {
+        "num_locations": 1,
+        "total_writes": 1.0,
+        "current_eta": 0.01,
+        "avg_write_count": 1.0,
+        "max_write_count": 1.0
+      }
+    },
+    "ready_with_refused_database": 200
+  },
+  "limits": [
+    "Local macOS run; not power-loss certification",
+    "40-operation concurrency check is not a soak or sustained load test",
+    "No pre-1.0 migration tested or required",
+    "No remote services or existing data directories used"
+  ]
+}

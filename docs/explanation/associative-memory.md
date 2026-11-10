@@ -1,9 +1,11 @@
 # How the memory works
 
-HeatherDB is not a key-value store and not a nearest-neighbour index. It stores
+In competitive mode (the default), HeatherDB learns a shared representation. It stores
 patterns distributed across a self-organising network of hard locations and
 reconstructs them from approximate queries. This page explains what that
-actually means mechanically, and what it costs.
+actually means mechanically, and what it costs. Plain writes (`competitive: false`)
+instead retain each vector as its own location. See [Choose a memory mode](../how-to/choose-memory-mode.md)
+for individual recall, adaptive learning and graceful forgetting.
 
 ## Hard locations
 
@@ -15,7 +17,8 @@ The unit of storage is a **hard location**, and it carries three things:
 
 Reading returns *patterns*, which are normalised counters. Routing uses
 addresses. Keeping the two separate is what lets a location move toward the
-data that keeps arriving without losing what it has already stored.
+data that keeps arriving while updating its learned content. Earlier patterns
+can lose influence as the representation adapts.
 
 The number of hard locations is not a setting. It is grown and pruned by the
 write rule, and it is best read as a **diagnostic of data complexity**: 200
@@ -52,7 +55,15 @@ becomes the first location.
 
 ### Update
 
-One pass over the activated set does two things at once.
+Whether the write joins or spawns is decided first: it joins when its best
+match is at least `tau_split`, and spawns otherwise (see the novelty split
+below). Only a joining write updates existing locations. A spawning write
+touches none of them — the activation weights are relative to the best match,
+so when nothing is close they are not small, and accumulating a novel input
+into its nearest locations would write it into memories it has nothing to do
+with.
+
+For a joining write, one pass over the activated set does two things at once.
 
 **Counter accumulation.** Each activated location adds `wⱼ · counter` to its
 counter and `wⱼ` to its write count. Content is superposed, not appended; this
@@ -74,19 +85,19 @@ move at 10% of that. The global learning rate decays multiplicatively by
 Topology maintenance, which is where the location count actually changes.
 
 **Novelty split.** If the best match was worse than `tau_split`, nothing in the
-memory covers this input, so a new location is spawned from it. It inherits the
-activated set as its initial neighbours.
+memory covers this input, so a new location is spawned from it and nothing else
+changes. It inherits the activated set as its initial neighbours.
 
-**Overload split.** If the winner's write count has passed `tau_overload`, it is
-saturated: a perturbed copy is spawned, and the parent's counter and write
-count are halved between the two. The default `tau_overload` is `max(d/32, 8)`,
-which tracks the measured per-read capacity wall — a location splits *as* it
-reaches the wall rather than well past it.
+**Overload split.** If the write joined and the winner's write count has passed
+`tau_overload`, it is saturated: a perturbed copy is spawned, and the parent's
+counter and write count are halved between the two. The default `tau_overload`
+is `max(d/32, 8)`, which tracks the measured per-read capacity wall — a location
+splits *as* it reaches the wall rather than well past it.
 
-**Local dedup.** If both splits fired and produced near-identical children, they
-are merged. Children are never merged back into existing locations: overload
-children are deliberately near their parent, and novelty children are far from
-everything.
+A write therefore adds at most one location: a novelty child when it spawns, an
+overload child when it joins a saturated winner. Children are never merged back
+into existing locations: overload children are deliberately near their parent,
+and novelty children are far from everything.
 
 ### The MDL gate
 
@@ -112,10 +123,17 @@ Capacity per location adapts: `max((k−1)·⌈ln L⌉, 2k)`. The logarithmic te
 supplies the long-range links that make the graph navigable in `O(log L)` hops;
 the `2k` floor keeps it connected while `L` is small.
 
-Reads use it once it is worth using — at least 100 locations and an average
-neighbour count of at least `k/2`. Below that, brute-force activation over a
-contiguous address matrix is faster than pointer-chasing, and the engine uses
-that instead.
+Activation does not search it. Graph search is approximate, and both reads and
+writes need the exact `k` nearest locations: a read that misses can fail to
+find a record by its own vector, and a write that misses its nearest location
+spawns a new one instead of joining it. On the demo's word-pair lexicon, writes
+through the graph made 53,394 locations where exact writes made 19,030.
+
+So activation scans every location. Reads scan a contiguous f64 address
+matrix. Writes scan an f32 copy of it, which is about twice as fast, and
+re-rank the locations the f32 rounding could have misordered (about `k` of
+them) in f64. The rounding error has a known bound, so the result is the same
+`k` an f64 scan finds.
 
 Graph search is a single greedy probe: enter at the landmark (one of the 32
 most-written locations) closest to the query, then descend through neighbour
