@@ -645,7 +645,7 @@ mod tests {
         loc
     }
 
-    /// Regression for #106: when values differ from their keys, the iterative
+    /// Regression for #108: when values differ from their keys, the iterative
     /// read must settle on the keys and return the matched key's value, not
     /// feed values back in and drift to another item.
     #[test]
