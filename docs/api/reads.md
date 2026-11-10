@@ -214,3 +214,64 @@ log.
 | `400 Bad Request` | empty `queries`, more than `--max-batch-queries` (default 1 000), unknown `strategy`, or a dimension mismatch |
 | `413 Payload Too Large` | body over `--max-body-size` |
 | `500 Internal Server Error` | the collection could not be opened, or a storage failure |
+
+### POST /db/{db}/collections/{name}/recall
+
+Recall with a selective-attention head. The database must have been created
+with `selective_attention` naming the head. Legacy:
+`POST /collections/{name}/recall`. Audited.
+
+| Field | Type | Default |
+|---|---|---|
+| `query` | array | *required*. Values in the head's own fields are ignored |
+| `head` | string | *required*. A head named at database creation |
+| `contributors` | integer | `10`. How many contributing rows to list |
+
+The stored rows are scored by attention-weighted squared distance over the
+fields the head does not fill in, `Σ_d α_d (q_d − x_d)²`, with the head's
+learned `α`. The nearest `k` (`selective_attention.k`) are blended by
+softmax of the negated distance, and the blend is returned with the head's
+fields filled in. Before the head has warmed up, attention is uniform.
+
+```bash
+curl -u admin:pw -X POST \
+  http://localhost:6380/db/crm/collections/customers/recall \
+  -H 'Content-Type: application/json' \
+  -d '{"query":[0.4,-1.2,0.0,0.0],"head":"outcome","contributors":3}'
+```
+
+```json
+{ "result": [0.38, -1.05, 0.21, 0.79],
+  "contributors": [ { "id": 812, "distance": 0.04, "weight": 0.11 } ] }
+```
+
+`contributors` are nearest first; over all blended rows the weights sum
+to 1.
+
+| Status | Cause |
+|---|---|
+| `400 Bad Request` | the database has no selective attention, the head is unknown, or a dimension mismatch |
+| `404 Not Found` | no such collection |
+
+### GET /db/{db}/collections/{name}/next
+
+The time-attended read of a collection's history: its rows weighted by the
+database's learned per-age attention, newest first, summed and
+unit-normalised. What the memory expects next. Legacy:
+`GET /collections/{name}/next`.
+
+```bash
+curl -u admin:pw http://localhost:6380/db/movies/collections/user_42/next
+```
+
+```json
+{ "result": [0.02, -0.11, 0.07] }
+```
+
+`{"result": null}` for an empty collection.
+
+| Status | Cause |
+|---|---|
+| `400 Bad Request` | the database has no selective attention, or was created without `time` |
+| `404 Not Found` | no such collection |
+

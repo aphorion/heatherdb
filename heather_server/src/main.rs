@@ -338,6 +338,9 @@ async fn serve(args: Args) -> std::process::ExitCode {
             post(routes::batch_analyze),
         )
         .route("/collections/{name}/fingerprint", get(routes::fingerprint))
+        .route("/collections/{name}/recall", post(routes::recall))
+        .route("/collections/{name}/next", get(routes::next))
+        .route("/selective-attention", get(routes::selective_attention))
         .route("/collections/{name}/documents", get(routes::get_documents))
         .route(
             "/collections/{name}/documents/query",
@@ -430,6 +433,15 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route(
             "/db/{db}/collections/{name}/fingerprint",
             get(routes_db::fingerprint),
+        )
+        .route(
+            "/db/{db}/collections/{name}/recall",
+            post(routes_db::recall),
+        )
+        .route("/db/{db}/collections/{name}/next", get(routes_db::next))
+        .route(
+            "/db/{db}/selective-attention",
+            get(routes_db::selective_attention),
         )
         .route(
             "/db/{db}/collections/{name}/documents",

@@ -57,6 +57,9 @@ Nine lessons in order, each turning on one result you produce yourself.
   surface: cosine sees direction only, and you choose what it sees.
 - [How the memory works](explanation/associative-memory.md) — the write
   pipeline, the Hopfield read, the graph, fidelity, capacity.
+- [Selective attention](explanation/selective-attention.md) — attention
+  over features and time, learned from prediction error while the memory
+  is written.
 - [Attention is a read](explanation/attention-is-a-read.md) — the settings
   under which a read reproduces transformer attention bit-exactly.
 - [Capacity and interference](explanation/capacity-and-interference.md) — what

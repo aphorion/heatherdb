@@ -64,6 +64,13 @@ pub struct EAMConfig {
     /// a database's lifetime, like its dimension.
     #[serde(default)]
     pub precision: Precision,
+    /// Selective attention, learned from prediction error while the
+    /// database is written (see [`crate::attention`]). `None` (the default,
+    /// and what a `db.toml` without an `[eam.selective_attention]` table reads as) is
+    /// the memory without it. Fixed for a database's lifetime. Plain
+    /// (`competitive = false`) databases only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selective_attention: Option<crate::attention::AttentionConfig>,
 }
 
 fn default_competitive() -> bool {
@@ -120,6 +127,7 @@ impl EAMConfig {
             mdl_gate: false,
             competitive: true,
             precision: Precision::F64,
+            selective_attention: None,
         };
         config.validate()?;
         Ok(config)
@@ -142,6 +150,14 @@ impl EAMConfig {
     pub fn validate(&self) -> Result<()> {
         if self.d == 0 {
             return Err(HeatherError::InvalidConfig("d must be > 0".into()));
+        }
+        if let Some(att) = &self.selective_attention {
+            if self.competitive {
+                return Err(HeatherError::InvalidConfig(
+                    "selective_attention needs a plain database (competitive: false)".into(),
+                ));
+            }
+            att.validate(self.d)?;
         }
         // l_0 == 0 is valid and is the default: the index is seeded from data
         // (first writes), not from random vectors.

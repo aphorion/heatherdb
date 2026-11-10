@@ -181,15 +181,7 @@ pub struct MultiRoleResults {
 /// writer.
 fn cleanup_read(inner: &EAMInner, v: &[f64], beta: f64) -> Vec<f64> {
     let k = inner.config.k.min(inner.locations.len());
-    let (indices, _sims) = read::activate_auto_full(
-        v,
-        &inner.locations,
-        k,
-        &inner.landmarks,
-        &inner.id_lookup,
-        &inner.address_matrix,
-        inner.config.d,
-    );
+    let (indices, _sims) = inner.activate(v, k);
     let logits: Vec<f64> = indices
         .iter()
         .map(|&i| {
@@ -258,10 +250,9 @@ pub(crate) struct EAMInner {
     pub(crate) landmarks_at: usize,
     /// Flat LocationId → index lookup array for O(1) graph traversal
     pub(crate) id_lookup: Vec<u32>,
-    /// Contiguous [L × D] address matrix for cache-friendly brute-force activation.
-    /// Row i = `locations[i].address`. Updated incrementally on writes.
-    pub(crate) address_matrix: Vec<f64>,
-    /// `address_matrix` in f32, for writes' k-nearest search (see [`scan`]).
+    /// Contiguous [L × D] f32 copy of the addresses (row i =
+    /// `locations[i].address`), for the k-nearest scans of writes and reads
+    /// (see [`scan`]) and the shadow index. Updated incrementally on writes.
     pub(crate) matrix32: Vec<f32>,
     /// An upper bound on the norm of every row of `matrix32`.
     pub(crate) max_norm: f64,
@@ -273,6 +264,21 @@ pub(crate) struct EAMInner {
 
 /// The f32 copy of these locations' addresses (see [`scan`]) and an upper
 /// bound on their norms.
+impl EAMInner {
+    /// The exact `k` nearest locations to `query` for a read, sorted
+    /// descending: the parallel f32 scan writes use (see [`scan`]), whose
+    /// candidates are re-ranked in f64, so the answer is the f64 scan's. It
+    /// falls back to the f64 scan when the f32 copy is not in step.
+    pub(crate) fn activate(&self, query: &[f64], k: usize) -> (Vec<usize>, Vec<f64>) {
+        scan::nearest(
+            query,
+            &self.locations,
+            k,
+            &write_scan(&self.matrix32, self.max_norm),
+        )
+    }
+}
+
 fn f32_rows(locations: &[HardLocation]) -> (Vec<f32>, f64) {
     let mut rows =
         Vec::with_capacity(locations.len() * locations.first().map_or(0, |l| l.address.len()));
@@ -293,7 +299,7 @@ fn write_scan(matrix32: &[f32], max_norm: f64) -> scan::Scan<'_> {
 }
 
 impl EAMInner {
-    /// Full rebuild of landmarks + id_lookup + address_matrix.
+    /// Full rebuild of landmarks + id_lookup + the f32 address matrix.
     pub(crate) fn rebuild_graph_cache(&mut self) {
         self.id_lookup = read::build_id_lookup(&self.locations);
         self.landmarks = read::select_landmarks(&self.locations, self.config.num_landmarks);
@@ -322,13 +328,8 @@ impl EAMInner {
         }
     }
 
-    /// Rebuild address matrix from locations.
+    /// Rebuild the f32 address matrix from locations.
     pub(crate) fn rebuild_address_matrix(&mut self) {
-        let d = self.config.d;
-        self.address_matrix = Vec::with_capacity(self.locations.len() * d);
-        for loc in &self.locations {
-            self.address_matrix.extend_from_slice(&loc.address);
-        }
         (self.matrix32, self.max_norm) = f32_rows(&self.locations);
     }
 
@@ -338,7 +339,6 @@ impl EAMInner {
         for &idx in indices {
             let start = idx * d;
             let address = &self.locations[idx].address;
-            self.address_matrix[start..start + d].copy_from_slice(address);
             for (x, &a) in self.matrix32[start..start + d].iter_mut().zip(address) {
                 *x = a as f32;
             }
@@ -351,7 +351,6 @@ impl EAMInner {
     pub(crate) fn append_addresses(&mut self, start_idx: usize) {
         for i in start_idx..self.locations.len() {
             let address = &self.locations[i].address;
-            self.address_matrix.extend_from_slice(address);
             self.matrix32.extend(address.iter().map(|&a| a as f32));
             self.max_norm = self.max_norm.max(vec_ops::l2_norm(address));
         }
@@ -377,12 +376,134 @@ impl EAMInner {
     }
 }
 
+/// An attention-head recall: the blended row and the stored rows behind it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttendedRecall {
+    pub result: Vec<f64>,
+    /// Nearest first. Weights sum to 1.
+    pub contributors: Vec<AttendedContributor>,
+}
+
+/// One stored row's share of an [`AttendedRecall`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct AttendedContributor {
+    /// The location (row) id.
+    pub id: u64,
+    /// Attention-weighted squared distance to the query.
+    pub distance: f64,
+    /// Softmax weight.
+    pub weight: f64,
+}
+
+/// A plain collection's stored rows in increasing id (write) order. Locations
+/// are kept in id order; a collection rebuilt out of order is sorted here.
+fn rows_by_id(locations: &[HardLocation]) -> Vec<&[f64]> {
+    ids_and_rows_by_id(locations).1
+}
+
+fn ids_and_rows_by_id(locations: &[HardLocation]) -> (Vec<u64>, Vec<&[f64]>) {
+    let mut refs: Vec<&HardLocation> = locations.iter().collect();
+    if !locations.windows(2).all(|w| w[0].id.0 < w[1].id.0) {
+        refs.sort_by_key(|l| l.id.0);
+    }
+    (
+        refs.iter().map(|l| l.id.0).collect(),
+        refs.iter().map(|l| l.counter.as_slice()).collect(),
+    )
+}
+
+type AttentionTxn<'a> = Option<(
+    std::sync::MutexGuard<'a, crate::attention::AttentionState>,
+    crate::attention::AttentionState,
+    Vec<(String, Vec<bool>)>,
+)>;
+
+/// Writes the updated attention state into the write's own transaction.
+fn put_attention_state(store: &Store, txn: &mut heed::RwTxn, att: &AttentionTxn<'_>) -> Result<()> {
+    if let Some((_, state, _)) = att {
+        store.put_metadata(
+            txn,
+            crate::attention::STATE_SCOPE,
+            crate::attention::STATE_KEY,
+            &bincode::serialize(state)?,
+        )?;
+    }
+    Ok(())
+}
+
+/// After the commit: the learned state becomes the database's.
+fn publish_attention_state(att: AttentionTxn<'_>) {
+    if let Some((mut guard, state, _)) = att {
+        *guard = state;
+    }
+}
+
 /// A single EAM collection, scoped to a collection_id within a shared Store.
 pub struct Collection {
     collection_id: u32,
     name: String,
     inner: RwLock<EAMInner>,
     store: Arc<Store>,
+    /// The database's selective attention, shared by its collections; `None`
+    /// unless the database opted in. See [`crate::attention`].
+    attention: Option<Arc<crate::attention::SharedAttention>>,
+    /// Exact k-nearest index for document queries on plain collections,
+    /// built on first use (see [`crate::shadow`]). Not persisted.
+    shadow: std::sync::Mutex<Option<Arc<crate::shadow::ShadowIndex>>>,
+}
+
+impl Collection {
+    /// The exact `k` nearest locations for a document query: the shadow
+    /// index on a large plain collection, otherwise [`EAMInner::activate`].
+    /// Both return the same rows in the same order. Plain collections only
+    /// append, so rows written after the index was built are scanned
+    /// directly, and the index is rebuilt once they pass
+    /// [`crate::shadow::REBUILD_FRACTION`] of it or the indexed prefix changes.
+    fn activate_indexed(
+        &self,
+        inner: &EAMInner,
+        query: &[f64],
+        k: usize,
+    ) -> (Vec<usize>, Vec<f64>) {
+        use crate::shadow::{MIN_ROWS, REBUILD_FRACTION, ShadowIndex};
+        let n = inner.locations.len();
+        let d = inner.config.d;
+        if inner.config.competitive
+            || n < MIN_ROWS
+            || k == 0
+            || k > n
+            || inner.matrix32.len() != n * d
+        {
+            return inner.activate(query, k);
+        }
+        let usable = |idx: &ShadowIndex| {
+            idx.indexed <= n
+                && inner.locations[0].id.0 == idx.first_id
+                && inner.locations[idx.indexed - 1].id.0 == idx.last_id
+                && ((n - idx.indexed) as f64) <= REBUILD_FRACTION * idx.indexed as f64
+        };
+        let index = {
+            let Ok(mut slot) = self.shadow.lock() else {
+                return inner.activate(query, k);
+            };
+            match slot.as_ref() {
+                Some(idx) if usable(idx) => idx.clone(),
+                _ => {
+                    let built = Arc::new(ShadowIndex::build(
+                        &inner.matrix32,
+                        n,
+                        d,
+                        inner.locations[0].id.0,
+                        inner.locations[n - 1].id.0,
+                    ));
+                    *slot = Some(built.clone());
+                    built
+                }
+            }
+        };
+        let q = vec_ops::normalize(query);
+        index.nearest(&q, k, n, |r| inner.locations[r].address.as_slice())
+    }
 }
 
 /// Hold the collection lock through persistence and recovery. Successful writes
@@ -537,12 +658,6 @@ impl Collection {
 
         let id_lookup = read::build_id_lookup(&locations);
         let landmarks = read::select_landmarks(&locations, config.num_landmarks);
-        let d = config.d;
-        let mut address_matrix = Vec::with_capacity(locations.len() * d);
-        for loc in &locations {
-            address_matrix.extend_from_slice(&loc.address);
-        }
-
         let landmarks_at = locations.len();
         let (matrix32, max_norm) = f32_rows(&locations);
         Ok(Collection {
@@ -558,12 +673,13 @@ impl Collection {
                 landmarks_at,
                 landmarks,
                 id_lookup,
-                address_matrix,
                 matrix32,
                 max_norm,
                 version: 0,
             }),
             store,
+            attention: None,
+            shadow: std::sync::Mutex::new(None),
         })
     }
 
@@ -606,12 +722,6 @@ impl Collection {
 
         let id_lookup = read::build_id_lookup(&locations);
         let landmarks = read::select_landmarks(&locations, config.num_landmarks);
-        let d = config.d;
-        let mut address_matrix = Vec::with_capacity(locations.len() * d);
-        for loc in &locations {
-            address_matrix.extend_from_slice(&loc.address);
-        }
-
         let landmarks_at = locations.len();
         let (matrix32, max_norm) = f32_rows(&locations);
         Ok(Collection {
@@ -627,12 +737,13 @@ impl Collection {
                 landmarks_at,
                 landmarks,
                 id_lookup,
-                address_matrix,
                 matrix32,
                 max_norm,
                 version: 0,
             }),
             store,
+            attention: None,
+            shadow: std::sync::Mutex::new(None),
         })
     }
 
@@ -819,12 +930,122 @@ impl Collection {
         Ok(())
     }
 
+    /// Gives this collection its database's shared attention (see
+    /// [`crate::attention`]). Called by the hive when it opens the collection.
+    pub fn with_attention(
+        mut self,
+        attention: Option<Arc<crate::attention::SharedAttention>>,
+    ) -> Self {
+        self.attention = attention;
+        self
+    }
+
+    /// Locks the database's attention for a write and clones its state, so a
+    /// failed write leaves the shared state untouched. Taken before the
+    /// collection lock: attention, then collection, everywhere.
+    fn attention_begin(&self) -> Result<AttentionTxn<'_>> {
+        let Some(shared) = self.attention.as_ref() else {
+            return Ok(None);
+        };
+        let guard = shared
+            .state
+            .lock()
+            .map_err(|_| HeatherError::LockPoisoned)?;
+        let state = guard.clone();
+        Ok(Some((guard, state, shared.masks())))
+    }
+
+    /// Predict-then-learn for one incoming row, before it is stored.
+    fn attention_learn(
+        &self,
+        att: &mut AttentionTxn<'_>,
+        locations: &[HardLocation],
+        input: &[f64],
+    ) {
+        if let (Some(shared), Some((_, state, masks))) = (self.attention.as_ref(), att.as_mut()) {
+            let rows = rows_by_id(locations);
+            crate::attention::learn_from_rows(&shared.config, masks, state, &rows, input);
+        }
+    }
+
+    /// Recall `query` with an attention head: the stored rows nearest under
+    /// the head's learned attention, blended, with the head's fields filled
+    /// in. The query's values in those fields are ignored.
+    pub fn attention_recall(&self, query: &[f64], head: &str) -> Result<AttendedRecall> {
+        vec_ops::validate_vector(query)?;
+        let shared = self.attention.as_ref().ok_or_else(|| {
+            HeatherError::InvalidInput(
+                "this database was created without selective attention".into(),
+            )
+        })?;
+        if query.len() != shared.d {
+            return Err(HeatherError::DimensionMismatch {
+                expected: shared.d,
+                got: query.len(),
+            });
+        }
+        let mask = shared
+            .config
+            .mask(head, shared.d)
+            .map_err(|e| HeatherError::InvalidInput(e.to_string()))?;
+        let head_state = shared
+            .state
+            .lock()
+            .map_err(|_| HeatherError::LockPoisoned)?
+            .heads
+            .get(head)
+            .cloned()
+            .unwrap_or_default();
+        let inner = self.read_inner()?;
+        let (ids, rows) = ids_and_rows_by_id(&inner.locations);
+        let r = crate::attention::recall(&head_state, query, &rows, &mask, shared.config.k)?;
+        Ok(AttendedRecall {
+            result: r.result,
+            contributors: r
+                .contributors
+                .into_iter()
+                .map(|c| AttendedContributor {
+                    id: ids[c.row],
+                    distance: c.distance,
+                    weight: c.weight,
+                })
+                .collect(),
+        })
+    }
+
+    /// The time-attended read of this collection's history: what the
+    /// database's learned recency expects next, unit-normalised. `None` when
+    /// the collection is empty.
+    pub fn attention_next(&self) -> Result<Option<Vec<f64>>> {
+        let shared = self.attention.as_ref().ok_or_else(|| {
+            HeatherError::InvalidInput(
+                "this database was created without selective attention".into(),
+            )
+        })?;
+        if !shared.config.time {
+            return Err(HeatherError::InvalidInput(
+                "this database's selective attention was created without `time`".into(),
+            ));
+        }
+        let time = shared
+            .state
+            .lock()
+            .map_err(|_| HeatherError::LockPoisoned)?
+            .time
+            .clone();
+        let inner = self.read_inner()?;
+        let rows = rows_by_id(&inner.locations);
+        let history: Vec<&[f64]> = rows.iter().rev().copied().collect();
+        Ok(crate::attention::time_read(&time, &history, shared.d).map(|v| vec_ops::normalize(&v)))
+    }
+
     /// Batch write multiple patterns under a single lock + transaction.
     pub fn write_batch(&self, inputs: &[impl AsRef<[f64]>]) -> Result<()> {
         for input in inputs {
             vec_ops::validate_vector(input.as_ref())?;
         }
 
+        let mut att = self.attention_begin()?;
         let mut inner = self.atomic_mutation()?;
 
         // No EmptyMemory guard: data-seeded index is seeded by the first write.
@@ -847,6 +1068,7 @@ impl Collection {
 
         for input in inputs {
             let input = input.as_ref();
+            self.attention_learn(&mut att, &inner.locations, input);
             let result = {
                 let EAMInner {
                     ref config,
@@ -915,10 +1137,12 @@ impl Collection {
             "eta",
             &bincode::serialize(&inner.eta)?,
         )?;
+        put_attention_state(&self.store, &mut txn, &att)?;
 
         txn.commit()?;
 
         inner.commit();
+        publish_attention_state(att);
         Ok(())
     }
 
@@ -941,15 +1165,7 @@ impl Collection {
         }
 
         let k = inner.config.k.min(inner.locations.len());
-        let (indices, _sims) = read::activate_auto_full(
-            query,
-            &inner.locations,
-            k,
-            &inner.landmarks,
-            &inner.id_lookup,
-            &inner.address_matrix,
-            inner.config.d,
-        );
+        let (indices, _sims) = inner.activate(query, k);
 
         match strategy {
             ReadStrategy::HopfieldIter => {
@@ -1086,15 +1302,7 @@ impl Collection {
 
         let (mut indices, _sims) = match allowed {
             Some(allowed) => read::activate_subset(query, &inner.locations, allowed, k),
-            None => read::activate_auto_full(
-                query,
-                &inner.locations,
-                k,
-                &inner.landmarks,
-                &inner.id_lookup,
-                &inner.address_matrix,
-                inner.config.d,
-            ),
+            None => inner.activate(query, k),
         };
         if let Some(ex) = exclude {
             indices.retain(|&i| i != ex);
@@ -1375,15 +1583,7 @@ impl Collection {
         }
 
         let k = inner.config.k.min(inner.locations.len());
-        let (indices, _sims) = read::activate_auto_full(
-            query,
-            &inner.locations,
-            k,
-            &inner.landmarks,
-            &inner.id_lookup,
-            &inner.address_matrix,
-            inner.config.d,
-        );
+        let (indices, _sims) = inner.activate(query, k);
 
         // Unit-norm activated keys — kernel geometry needs the cosine sphere.
         let keys: Vec<Vec<f64>> = indices
@@ -1800,6 +2000,7 @@ impl Collection {
             vec_ops::validate_vector(input.as_ref())?;
         }
 
+        let mut att = self.attention_begin()?;
         let mut inner = self.atomic_mutation()?;
 
         let d = inner.config.d;
@@ -1828,6 +2029,7 @@ impl Collection {
 
         for (input, metadata) in items {
             let input = input.as_ref();
+            self.attention_learn(&mut att, &inner.locations, input);
             let result = {
                 let EAMInner {
                     ref config,
@@ -1927,10 +2129,12 @@ impl Collection {
             "doc_next_id",
             &bincode::serialize(&inner.doc_next_id)?,
         )?;
+        put_attention_state(&self.store, &mut txn, &att)?;
 
         txn.commit()?;
 
         inner.commit();
+        publish_attention_state(att);
         Ok(documents.into_iter().map(|(id, _)| id).collect())
     }
 
@@ -2135,15 +2339,7 @@ impl Collection {
         let k = (inner.config.k * QUERY_CANDIDATE_FACTOR)
             .max(n)
             .min(inner.locations.len());
-        let (indices, _sims) = read::activate_auto_full(
-            query,
-            &inner.locations,
-            k,
-            &inner.landmarks,
-            &inner.id_lookup,
-            &inner.address_matrix,
-            inner.config.d,
-        );
+        let (indices, _sims) = self.activate_indexed(&inner, query, k);
 
         // Step 2: Gather candidate doc IDs from posting lists (deduplicated)
         let mut candidate_ids = std::collections::HashSet::new();
@@ -2286,15 +2482,7 @@ impl Collection {
         let k = (inner.config.k * QUERY_CANDIDATE_FACTOR)
             .max(n)
             .min(inner.locations.len());
-        let (indices, _sims) = read::activate_auto_full(
-            query,
-            &inner.locations,
-            k,
-            &inner.landmarks,
-            &inner.id_lookup,
-            &inner.address_matrix,
-            d,
-        );
+        let (indices, _sims) = self.activate_indexed(&inner, query, k);
 
         // The cleanup temperature is a property of the codebook's geometry,
         // not of any one recovered filler, so it is selected once per query
@@ -2630,15 +2818,7 @@ impl Collection {
         }
 
         let k = inner.config.k.min(inner.locations.len());
-        let (indices, sims) = read::activate_auto_full(
-            query,
-            &inner.locations,
-            k,
-            &inner.landmarks,
-            &inner.id_lookup,
-            &inner.address_matrix,
-            inner.config.d,
-        );
+        let (indices, sims) = inner.activate(query, k);
 
         match strategy {
             ReadStrategy::HopfieldIter => {

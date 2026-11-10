@@ -33,6 +33,7 @@
 //! [`Hive`] and [`Collection`] are `Send + Sync`. All methods take `&self` —
 //! reads acquire a shared lock, writes acquire an exclusive lock.
 
+pub mod attention;
 pub mod audit;
 pub mod codec;
 pub mod collection;
@@ -46,6 +47,7 @@ pub mod nearest;
 pub mod read;
 pub mod scan;
 pub mod server;
+pub mod shadow;
 pub mod store;
 pub mod vec_ops;
 pub mod verify;

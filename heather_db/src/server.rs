@@ -785,4 +785,44 @@ mod format_tests {
             FORMAT_VERSION
         );
     }
+
+    /// A format-1 database (written before selective attention) is migrated
+    /// on launch by raising its format marker; its data is read unchanged.
+    #[test]
+    fn a_format_1_database_migrates_on_launch_and_keeps_its_data() {
+        let dir = tempfile::tempdir().unwrap();
+        let v = vec![0.5, -0.25, 0.75, 0.0, 0.1, 0.2, 0.3, 0.4];
+        {
+            let server = Server::open(dir.path(), 8).unwrap();
+            server
+                .create_database(DbConfig::new("old", 8).unwrap())
+                .unwrap();
+            let hive = server.database("old").unwrap();
+            hive.get_or_create_collection("c")
+                .unwrap()
+                .write_batch(std::slice::from_ref(&v))
+                .unwrap();
+        }
+        let path = dir.path().join("db").join("old").join("db.toml");
+        let mut cfg = DbConfig::load(&path).unwrap();
+        cfg.format_version = 1;
+        cfg.save(&path).unwrap();
+
+        let server = Server::open(dir.path(), 8).unwrap();
+        assert_eq!(
+            server.database_config("old").unwrap().format_version,
+            FORMAT_VERSION
+        );
+        assert_eq!(
+            DbConfig::load(&path).unwrap().format_version,
+            FORMAT_VERSION
+        );
+        let hive = server.database("old").unwrap();
+        assert!(
+            hive.attention().is_none(),
+            "migration never turns attention on"
+        );
+        let stats = hive.get_collection("c").unwrap().unwrap().stats().unwrap();
+        assert!(stats.num_locations >= 1);
+    }
 }

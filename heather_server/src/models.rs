@@ -312,6 +312,9 @@ pub struct EamConfigOverride {
     pub competitive: Option<bool>,
     /// `"f32"` stores vectors in half the space (math stays f64).
     pub precision: Option<heather_db::Precision>,
+    /// Selective attention, learned from prediction error while the database
+    /// is written. Needs `competitive: false`. Fixed for the database's life.
+    pub selective_attention: Option<heather_db::attention::AttentionConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -330,6 +333,9 @@ pub struct DatabaseInfo {
     /// Records reads skipped since the database was opened because they did
     /// not decode; non-zero means something is corrupt (`heather verify`).
     pub skipped_records: u64,
+    /// Selective attention settings; absent when the database has none.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selective_attention: Option<heather_db::attention::AttentionConfig>,
 }
 
 #[derive(Debug, Serialize)]
@@ -428,6 +434,72 @@ pub struct BatchAnalyzeResponse {
 #[derive(Debug, Serialize)]
 pub struct FingerprintResponse {
     pub fingerprint: Option<Vec<f64>>,
+}
+
+/// `POST .../recall`: recall with an attention head.
+#[derive(Debug, Deserialize)]
+pub struct RecallRequest {
+    /// The query. Values in the head's own fields are ignored.
+    pub query: Vec<f64>,
+    /// The attention head to read with (its fields are filled in).
+    pub head: String,
+    /// How many contributing rows to list (nearest first). Default 10.
+    pub contributors: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecallContributor {
+    /// Location (row) id.
+    pub id: u64,
+    /// Attention-weighted squared distance to the query.
+    pub distance: f64,
+    /// Softmax weight; over all blended rows the weights sum to 1.
+    pub weight: f64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RecallResponse {
+    pub result: Vec<f64>,
+    pub contributors: Vec<RecallContributor>,
+}
+
+/// `GET .../next`: the time-attended read of a collection's history.
+#[derive(Debug, Serialize)]
+pub struct NextResponse {
+    /// Unit-normalised; `null` for an empty collection.
+    pub result: Option<Vec<f64>>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttentionHeadInfo {
+    /// The fields this head fills in.
+    pub dims: Vec<usize>,
+    /// Attention per dimension (the head's own fields are 0), or `null`
+    /// before the head has warmed up.
+    pub weights: Option<Vec<f64>>,
+    /// Gradient steps taken.
+    pub updates: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct AttentionTimeInfo {
+    /// First lag of each bucket (1 = newest row); the last bucket is open.
+    pub bucket_starts: Vec<usize>,
+    /// The consolidated weights reads use, one per bucket.
+    pub weights: Vec<f64>,
+    /// Gradient steps taken.
+    pub updates: u64,
+}
+
+/// `GET /db/{db}/selective-attention`: what the database has learned about
+/// where to look.
+#[derive(Debug, Serialize)]
+pub struct SelectiveAttentionResponse {
+    pub k: usize,
+    pub warmup: usize,
+    pub heads: std::collections::BTreeMap<String, AttentionHeadInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time: Option<AttentionTimeInfo>,
 }
 
 #[derive(Debug, Serialize)]
