@@ -7,7 +7,7 @@ The conventional stack for this is an autoencoder or an isolation forest
 trained on normal data, a validation set to pick a cut, a serving process, and
 a retraining schedule for when normal drifts. The memory replaces the trained
 model and the retraining: normal observations are loaded directly, the score
-is the read's own reconstruction fidelity, and drift is a reload. You still
+is the memory's own novelty read, and drift is a reload. You still
 choose an encoding, and you still derive the threshold from held-out data.
 
 ## Design decisions
@@ -16,9 +16,9 @@ choose an encoding, and you still derive the threshold from held-out data.
 |---|---|---|
 | An item is | one observation — a request, a charge, a sensor window | the unit you want a verdict on |
 | Similar means | agreeing on the encoded fields, weighted | see [Encode tabular data](encode-tabular-data.md) |
-| A pool is | one collection per entity being modelled | fidelity means "normal *for this entity*" |
+| A pool is | one collection per entity being modelled | novelty means "new *for this entity*" |
 | Loading | `bulk_load` | the taught points must be the only attractors |
-| Answer resolves to | the nearest cached normal to the reconstruction | that is the expected observation |
+| Score with | `novelty` (default); reconstruction fidelity for the expected observation | novelty is relative to local normal, so it holds in dense and sparse regions |
 | Abstain when | the entity has too few normals loaded | a thin baseline reconstructs everything badly |
 
 ## Encode the observation
@@ -81,9 +81,35 @@ orphans the document index, so keep this collection document-free and resolve
 against a sidecar cache instead: [Resolve a reconstruction to a
 thing](resolve-reconstructions.md).
 
-## Score by reconstruction fidelity
+## Score by novelty
 
-One read per observation. The score is the cosine between what you sent and
+Novelty is the default check: how new an observation is, relative to what
+is normal around it in memory. About `1` means it fits its surroundings;
+higher means it stands out. It is relative, not absolute, so a
+rare-but-legitimate observation in a sparse region of normal activity is
+not mistaken for an anomaly, which distance to the nearest normal cannot
+tell apart. One request scores a batch:
+
+```python
+# Store standardised features: novelty compares Euclidean distances.
+r = call("POST", col(entity) + "/novelty",
+         {"queries": [encode(o) for o in batch], "k": 50})
+scores = [x["novelty"] for x in r["results"]]   # ~1 normal, higher = new
+```
+
+On the credit-card fraud benchmark in `benchmarks/h2h/` (50,000 normal
+transactions, 142,404 test transactions), novelty reaches PR-AUC 0.582,
+against 0.199 for distance to the nearest normal and 0.482 for a local
+outlier factor model at its default 20 neighbours. Today novelty is
+computed as the local outlier factor inside the memory, so at equal `k` it
+matches that model. Derive the threshold from held-out normals as below.
+
+## Or score by reconstruction fidelity
+
+Use fidelity when you want the memory's expected observation alongside the
+score ([below](#report-the-expected-observation-beside-the-observed-one)).
+It measures distance to normal, not novelty relative to local normal. One
+read per observation. The score is the cosine between what you sent and
 what came back — the caller computes it, there is no `fidelity` field on the
 wire.
 

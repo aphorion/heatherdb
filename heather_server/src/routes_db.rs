@@ -518,6 +518,19 @@ pub async fn selective_attention(
     routes::selective_attention(State(hive)).await
 }
 
+pub async fn novelty(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col)): Path<(String, String)>,
+    ctx: AuditCtx,
+    Json(req): Json<NoveltyRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::novelty(State(hive), Path(col), ctx.for_db(&db_name), Json(req)).await
+}
+
 pub async fn analyze(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
@@ -1204,5 +1217,73 @@ mod selective_attention_tests {
         .unwrap();
         let resp = create_database(Extension(server.clone()), Json(req)).await;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod novelty_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn novelty_scores_a_batch_and_audits_returned_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Server::open(dir.path(), 8).unwrap());
+        let req: CreateDatabaseRequest = serde_json::from_value(serde_json::json!({
+            "name": "risk", "dimension": 2, "eam": {"competitive": false}
+        }))
+        .unwrap();
+        assert!(
+            create_database(Extension(server.clone()), Json(req))
+                .await
+                .status()
+                .is_success()
+        );
+        let vectors: Vec<Vec<f64>> = (0..100)
+            .map(|i| vec![(i % 10) as f64 / 10.0, (i / 10) as f64 / 10.0])
+            .collect();
+        let resp = write(
+            Extension(server.clone()),
+            Path(("risk".into(), "normal".into())),
+            Json(WriteRequest {
+                metadata: None,
+                vectors,
+                vectors_b64: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let ctx = AuditCtx {
+            user: "alice".into(),
+            scope: "root".into(),
+            db: "default".into(),
+        };
+        let req: NoveltyRequest = serde_json::from_value(serde_json::json!({
+            "queries": [[0.45, 0.45], [5.0, 5.0]], "k": 10, "nearest": 2
+        }))
+        .unwrap();
+        let resp = novelty(
+            Extension(server.clone()),
+            Path(("risk".into(), "normal".into())),
+            ctx,
+            Json(req),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v: serde_json::Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
+        let a = v["results"][0]["novelty"].as_f64().unwrap();
+        let b = v["results"][1]["novelty"].as_f64().unwrap();
+        assert!(a < 1.5 && b > 5.0, "{v}");
+        assert_eq!(v["results"][1]["nearest"].as_array().unwrap().len(), 2);
+
+        let hive = server.database("risk").unwrap();
+        let entries = hive.query_audit(&heather_db::AuditQuery::new(10)).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.route == "novelty" && e.result_count == 4)
+        );
     }
 }

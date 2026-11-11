@@ -275,3 +275,63 @@ curl -u admin:pw http://localhost:6380/db/movies/collections/user_42/next
 | `400 Bad Request` | the database has no selective attention, or was created without `time` |
 | `404 Not Found` | no such collection |
 
+### POST /db/{db}/collections/{name}/novelty
+
+How new each query is, relative to what is normal around it in memory.
+About `1` means it fits its surroundings; higher means it stands out from
+them. Novelty is relative, not absolute: the same distance can be ordinary
+in a sparse region and alarming in a dense one. It is the default way to
+ask "is this an anomaly?", "is this new?", "should I abstain?" or "has
+normal moved?". Legacy: `POST /collections/{name}/novelty`. Audited when
+`nearest` asks for stored rows back.
+
+| Field | Type | Default |
+|---|---|---|
+| `queries` | array of arrays | *required*, non-empty, at most `--max-batch-queries` |
+| `k` | integer | `50`. Neighbours compared |
+| `nearest` | integer | `0`. How many nearest stored rows to return per query |
+
+How it is computed today: the local outlier factor over the collection's
+rows. Every stored row gets a *spread*, the distance to its `k`-th nearest
+other row. A query's novelty is the mean familiarity of its `k` nearest
+rows divided by its own, where familiarity is the inverse mean distance to
+those neighbours, each distance floored at the neighbour's spread.
+Distances are Euclidean over the stored rows, so store standardised
+features.
+
+Neighbours are found by the exact int8 scan (`Euclidean` metric), which
+reads only a few dozen candidate rows back from storage in shadow
+residency. The spreads are computed on the first call for a given `k`, by an
+exact blocked all-pairs search, and kept in memory. After that, writes that
+only append rows (plain collections) update them in place, so later calls
+never rebuild; any other change (a bulk load, a delete, a merge) leaves
+them stale and the next call rebuilds. Measured on credit-card fraud rows
+(29 fields, `k` 50):
+
+| Rows stored | First call | Each later query | Each appended row | Peak memory |
+|---|---|---|---|---|
+| 50,000 | 4 s | 0.2 ms | 0.6 ms | 200 MB |
+| 284,315 | 152 s | 0.6 ms | 3.1 ms | 1.0 GB |
+
+The first call grows with the square of the rows (one search per row), and
+the kept state costs about 1.3 KB per row at 29 fields: the rows themselves,
+each row's neighbour list, and who lists it. While the state exists, every
+appended row costs one distance per stored row.
+
+```bash
+curl -u admin:pw -X POST \
+  http://localhost:6380/db/risk/collections/normal_card_activity/novelty \
+  -H 'Content-Type: application/json' \
+  -d '{"queries":[[0.1,-0.3,0.2],[4.1,3.8,-5.0]],"k":50,"nearest":1}'
+```
+
+```json
+{ "results": [ { "novelty": 1.02, "nearest": [ { "id": 812, "distance": 0.31 } ] },
+               { "novelty": 7.9,  "nearest": [ { "id": 40,  "distance": 6.2 } ] } ] }
+```
+
+| Status | Cause |
+|---|---|
+| `400 Bad Request` | empty `queries`, more than `--max-batch-queries`, `k` of 0, fewer than 2 stored rows, or a dimension mismatch |
+| `404 Not Found` | no such collection |
+
