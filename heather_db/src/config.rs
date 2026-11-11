@@ -71,6 +71,28 @@ pub struct EAMConfig {
     /// (`competitive = false`) databases only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selective_attention: Option<crate::attention::AttentionConfig>,
+    /// Where vectors live while the database is open: `memory` (the
+    /// default) keeps every address in RAM; `shadow` keeps only the int8
+    /// shadow the scans read (see [`crate::scan`]) and reads exact vectors
+    /// from storage when an answer needs them. Plain (`competitive = false`)
+    /// databases only. See [`Residency`].
+    #[serde(default)]
+    pub residency: Residency,
+}
+
+/// Where a database's vectors live while it is open.
+///
+/// `Shadow` keeps a few bytes per dimension in memory instead of eight: the
+/// scans need only the shadow, and the exact rows an answer needs are read
+/// from storage. Whole-collection operations (fingerprint, snapshots,
+/// compress, dreaming, `locations?full`) stream the rows from storage in
+/// chunks rather than holding them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Residency {
+    #[default]
+    Memory,
+    Shadow,
 }
 
 fn default_competitive() -> bool {
@@ -128,6 +150,7 @@ impl EAMConfig {
             competitive: true,
             precision: Precision::F64,
             selective_attention: None,
+            residency: Residency::Memory,
         };
         config.validate()?;
         Ok(config)
@@ -150,6 +173,20 @@ impl EAMConfig {
     pub fn validate(&self) -> Result<()> {
         if self.d == 0 {
             return Err(HeatherError::InvalidConfig("d must be > 0".into()));
+        }
+        if self.residency == Residency::Shadow && self.competitive {
+            return Err(HeatherError::InvalidConfig(
+                "residency \"shadow\" needs a plain database (competitive: false): \
+                 competitive writes move addresses, so they need them in memory"
+                    .into(),
+            ));
+        }
+        if self.residency == Residency::Shadow && self.selective_attention.is_some() {
+            return Err(HeatherError::InvalidConfig(
+                "selective_attention reads every stored row on each write and recall, so it \
+                 needs residency \"memory\""
+                    .into(),
+            ));
         }
         if let Some(att) = &self.selective_attention {
             if self.competitive {

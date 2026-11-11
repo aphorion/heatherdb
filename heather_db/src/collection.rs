@@ -4,7 +4,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
 use realfft::num_complex::Complex;
 
-use crate::config::EAMConfig;
+use crate::config::{EAMConfig, Residency};
 use crate::error::{HeatherError, Result};
 use crate::location::{HardLocation, LocationId};
 use crate::merge;
@@ -179,23 +179,24 @@ pub struct MultiRoleResults {
 /// written against a borrowed `EAMInner` because the caller already holds the
 /// read lock and re-entering it would risk deadlocking against a queued
 /// writer.
-fn cleanup_read(inner: &EAMInner, v: &[f64], beta: f64) -> Vec<f64> {
+fn cleanup_read(col: &Collection, inner: &EAMInner, v: &[f64], beta: f64) -> Result<Vec<f64>> {
     let k = inner.config.k.min(inner.locations.len());
-    let (indices, _sims) = inner.activate(v, k);
-    let logits: Vec<f64> = indices
+    let (indices, _sims) = col.activate(inner, v, k)?;
+    let rows = col.hydrate(inner, &indices)?;
+    let locs = &rows.locations;
+    let logits: Vec<f64> = rows
+        .idx
         .iter()
-        .map(|&i| {
-            beta * vec_ops::dot(v, &inner.locations[i].address)
-                + inner.locations[i].write_count.max(0.0).ln()
-        })
+        .map(|&i| beta * vec_ops::dot(v, &locs[i].address) + locs[i].write_count.max(0.0).ln())
         .collect();
     let alpha = vec_ops::softmax(&logits, 1.0);
-    let values: Vec<Vec<f64>> = indices
+    let values: Vec<Vec<f64>> = rows
+        .idx
         .iter()
-        .map(|&i| inner.locations[i].normalized_pattern())
+        .map(|&i| locs[i].normalized_pattern())
         .collect();
     let value_refs: Vec<&[f64]> = values.iter().map(|x| x.as_slice()).collect();
-    vec_ops::weighted_sum(&value_refs, &alpha)
+    Ok(vec_ops::weighted_sum(&value_refs, &alpha))
 }
 
 /// Statistics about the current state of an EAM collection.
@@ -424,9 +425,246 @@ struct AtomicMutation<'a> {
 }
 
 impl AtomicMutation<'_> {
+    /// Marks the mutation durable. In shadow residency this is where newly
+    /// written rows give up their vectors: only after the transaction that
+    /// stored them has committed, so a hollow row is never what gets written.
     fn commit(&mut self) {
         self.committed = true;
+        if self.inner.config.residency == Residency::Shadow {
+            self.inner.locations.iter_mut().for_each(hollow);
+        }
     }
+}
+
+/// Drops a location's vectors from memory (shadow residency): its address
+/// and counter live in storage and in the int8 shadow. Ids, write counts and
+/// neighbours stay.
+fn hollow(loc: &mut HardLocation) {
+    if !is_hollow(loc) {
+        // Test builds fill hollow vectors with NaN instead of leaving them
+        // empty: a path that reads one without fetching the row then fails
+        // loudly instead of scoring an empty vector as 0. Stored vectors
+        // never hold NaN (writes reject it).
+        #[cfg(test)]
+        let (address, counter) = (vec![f64::NAN; loc.address.len()], Vec::new());
+        #[cfg(not(test))]
+        let (address, counter) = (Vec::new(), Vec::new());
+        loc.address = address;
+        loc.counter = counter;
+    }
+}
+
+/// Whether a location's vectors were dropped for shadow residency.
+fn is_hollow(loc: &HardLocation) -> bool {
+    loc.address.is_empty() || loc.address[0].is_nan()
+}
+
+/// Rows with their vectors, for code that indexes a location slice (the
+/// [`read`] helpers). Resident collections lend their own rows; shadow
+/// residency fetches just the requested rows from storage, numbered from 0.
+/// Either way `locations[idx[j]]` is the j-th requested row, and
+/// [`Rows::original`] maps an index into `locations` back to the
+/// collection's.
+pub(crate) struct Rows<'a> {
+    pub(crate) locations: std::borrow::Cow<'a, [HardLocation]>,
+    pub(crate) idx: Vec<usize>,
+    /// The collection index of each fetched row; empty when lent.
+    original: Vec<usize>,
+}
+
+impl Rows<'_> {
+    /// The collection index of `locations[i]`.
+    pub(crate) fn original(&self, i: usize) -> usize {
+        if self.original.is_empty() {
+            i
+        } else {
+            self.original[i]
+        }
+    }
+}
+
+impl Collection {
+    /// The rows at `indices` (collection order), with their vectors.
+    pub(crate) fn hydrate<'a>(&self, inner: &'a EAMInner, indices: &[usize]) -> Result<Rows<'a>> {
+        if inner.config.residency != Residency::Shadow {
+            return Ok(Rows {
+                locations: std::borrow::Cow::Borrowed(&inner.locations),
+                idx: indices.to_vec(),
+                original: Vec::new(),
+            });
+        }
+        let txn = self.store.read_txn()?;
+        let mut fetched = Vec::with_capacity(indices.len());
+        for &i in indices {
+            let loc = &inner.locations[i];
+            fetched.push(if is_hollow(loc) {
+                self.store
+                    .get_location_txn(&txn, self.collection_id, loc.id.0)?
+                    .ok_or_else(|| {
+                        HeatherError::Corrupt(format!(
+                            "location {} is in memory but not in storage",
+                            loc.id.0
+                        ))
+                    })?
+            } else {
+                loc.clone()
+            });
+        }
+        Ok(Rows {
+            locations: std::borrow::Cow::Owned(fetched),
+            idx: (0..indices.len()).collect(),
+            original: indices.to_vec(),
+        })
+    }
+
+    /// Every row with its vectors, in collection order, in chunks of up to
+    /// `chunk`: slices of memory when resident; in shadow residency, rows
+    /// decoded from storage a chunk at a time and dropped after `f` returns,
+    /// so at most one chunk of vectors is held. Chunk `c` starts at
+    /// collection index `start`, the first argument.
+    pub(crate) fn for_each_chunk(
+        &self,
+        inner: &EAMInner,
+        chunk: usize,
+        mut f: impl FnMut(usize, &[HardLocation]) -> Result<()>,
+    ) -> Result<()> {
+        if inner.config.residency != Residency::Shadow {
+            for (c, rows) in inner.locations.chunks(chunk.max(1)).enumerate() {
+                f(c * chunk.max(1), rows)?;
+            }
+            return Ok(());
+        }
+        let mut start = 0;
+        self.store
+            .for_each_location_chunk(self.collection_id, chunk, |rows| {
+                f(start, rows)?;
+                start += rows.len();
+                Ok(())
+            })?;
+        if start != inner.locations.len() {
+            return Err(HeatherError::Corrupt(format!(
+                "collection {} holds {} locations in memory but {start} in storage",
+                self.name,
+                inner.locations.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Runs `f` over every row with its vectors at once: the collection's own
+    /// rows when resident; in shadow residency, rows streamed from storage
+    /// into a temporary list that is dropped when `f` returns. For the
+    /// whole-collection algorithms that need every row together (all-pairs
+    /// compress, merge, temperature calibration): in shadow residency they
+    /// hold the full vectors only while they run.
+    pub(crate) fn with_rows<R>(
+        &self,
+        inner: &EAMInner,
+        f: impl FnOnce(&[HardLocation]) -> Result<R>,
+    ) -> Result<R> {
+        if inner.config.residency != Residency::Shadow {
+            return f(&inner.locations);
+        }
+        let mut all = Vec::with_capacity(inner.locations.len());
+        self.for_each_chunk(inner, crate::store::LOCATION_CHUNK, |_, rows| {
+            all.extend_from_slice(rows);
+            Ok(())
+        })?;
+        f(&all)
+    }
+
+    /// Gives a shadow-resident collection its vectors back in memory, for a
+    /// whole-collection mutation (merge, compress) that rewrites locations
+    /// in place. The mutation's commit hollows them again; a failed one is
+    /// rolled back by reloading, which hollows them too. No-op when resident.
+    fn rehydrate(&self, inner: &mut EAMInner) -> Result<()> {
+        if inner.config.residency != Residency::Shadow {
+            return Ok(());
+        }
+        let mut full = Vec::with_capacity(inner.locations.len());
+        self.for_each_chunk(inner, crate::store::LOCATION_CHUNK, |_, rows| {
+            full.extend_from_slice(rows);
+            Ok(())
+        })?;
+        if full.iter().zip(&inner.locations).any(|(a, b)| a.id != b.id) {
+            return Err(HeatherError::Corrupt(format!(
+                "collection {} lists its locations in a different order in storage",
+                self.name
+            )));
+        }
+        inner.locations = full;
+        Ok(())
+    }
+
+    /// The exact `k` nearest rows to `query`, sorted descending, as
+    /// [`EAMInner::activate`]: in shadow residency the int8 shadow names the
+    /// candidates and only those rows are read from storage and ranked.
+    pub(crate) fn activate(
+        &self,
+        inner: &EAMInner,
+        query: &[f64],
+        k: usize,
+    ) -> Result<(Vec<usize>, Vec<f64>)> {
+        if inner.config.residency != Residency::Shadow {
+            return Ok(inner.activate(query, k));
+        }
+        let n = inner.locations.len();
+        let Some(cands) = scan::candidates(query, n, k, &inner.scan) else {
+            return Err(HeatherError::Corrupt(
+                "the int8 shadow is out of step with the collection".into(),
+            ));
+        };
+        let rows = self.hydrate(inner, &cands)?;
+        let (local, sims) = scan::rank(query, &rows.idx, k, |j| &rows.locations[j].address);
+        Ok((local.into_iter().map(|j| rows.original(j)).collect(), sims))
+    }
+}
+
+/// Test builds only: `HEATHER_TEST_RESIDENCY=shadow` opens every plain
+/// collection in shadow residency, so the whole suite exercises it.
+#[cfg(test)]
+fn test_residency(config: &EAMConfig) -> std::borrow::Cow<'_, EAMConfig> {
+    if !config.competitive
+        && config.selective_attention.is_none()
+        && std::env::var("HEATHER_TEST_RESIDENCY").as_deref() == Ok("shadow")
+    {
+        let mut c = config.clone();
+        c.residency = Residency::Shadow;
+        std::borrow::Cow::Owned(c)
+    } else {
+        std::borrow::Cow::Borrowed(config)
+    }
+}
+
+/// A collection's rows as stored, with their int8 shadow. In memory
+/// residency every row keeps its vectors; in shadow residency the rows are
+/// streamed from storage in chunks, each shadowed and then hollowed, so the
+/// full vectors are never all in memory at once. Rows are checked against
+/// the configured dimension on the way.
+fn load_rows(
+    store: &Store,
+    collection_id: u32,
+    config: &EAMConfig,
+) -> Result<(Vec<HardLocation>, scan::Scan)> {
+    let mut locations = Vec::new();
+    let mut scan = scan::Scan::default();
+    store.for_each_location_chunk(collection_id, crate::store::LOCATION_CHUNK, |chunk| {
+        for mut loc in chunk.drain(..) {
+            if loc.address.len() != config.d {
+                return Err(HeatherError::DimensionMismatch {
+                    expected: config.d,
+                    got: loc.address.len(),
+                });
+            }
+            scan.push(&loc.address);
+            if config.residency == Residency::Shadow {
+                hollow(&mut loc);
+            }
+            locations.push(loc);
+        }
+        Ok(())
+    })?;
+    Ok((locations, scan))
 }
 
 impl Deref for AtomicMutation<'_> {
@@ -532,6 +770,8 @@ impl Collection {
         store: Arc<Store>,
         config: &EAMConfig,
     ) -> Result<Self> {
+        #[cfg(test)]
+        let config = &*test_residency(config);
         let mut rng = rand::thread_rng();
 
         let mut locations = Vec::with_capacity(config.l_0);
@@ -567,6 +807,9 @@ impl Collection {
         let landmarks = read::select_landmarks(&locations, config.num_landmarks);
         let landmarks_at = locations.len();
         let scan = scan::Scan::from_locations(&locations);
+        if config.residency == Residency::Shadow {
+            locations.iter_mut().for_each(hollow);
+        }
         Ok(Collection {
             collection_id,
             name,
@@ -595,7 +838,9 @@ impl Collection {
         store: Arc<Store>,
         config: &EAMConfig,
     ) -> Result<Self> {
-        let locations = store.load_all_locations(collection_id)?;
+        #[cfg(test)]
+        let config = &*test_residency(config);
+        let (locations, scan) = load_rows(&store, collection_id, config)?;
 
         let next_id: u64 = store
             .load_metadata(collection_id, "next_id")?
@@ -615,20 +860,9 @@ impl Collection {
             .transpose()?
             .unwrap_or(0);
 
-        // Verify dimensionality
-        if let Some(first) = locations.first()
-            && first.address.len() != config.d
-        {
-            return Err(HeatherError::DimensionMismatch {
-                expected: config.d,
-                got: first.address.len(),
-            });
-        }
-
         let id_lookup = read::build_id_lookup(&locations);
         let landmarks = read::select_landmarks(&locations, config.num_landmarks);
         let landmarks_at = locations.len();
-        let scan = scan::Scan::from_locations(&locations);
         Ok(Collection {
             collection_id,
             name,
@@ -1042,21 +1276,23 @@ impl Collection {
         }
 
         let k = inner.config.k.min(inner.locations.len());
-        let (indices, _sims) = inner.activate(query, k);
+        let (indices, _sims) = self.activate(&inner, query, k)?;
+        let rows = self.hydrate(&inner, &indices)?;
+        let (locations, indices) = (&rows.locations, &rows.idx);
 
         match strategy {
             ReadStrategy::HopfieldIter => {
-                read::hopfield_iter_from(query, &inner.locations, &inner.config, &indices)
+                read::hopfield_iter_from(query, locations, &inner.config, indices)
             }
             ReadStrategy::HopfieldSS => {
                 let sims: Vec<f64> = indices
                     .iter()
-                    .map(|&i| vec_ops::cosine_similarity(query, &inner.locations[i].address))
+                    .map(|&i| vec_ops::cosine_similarity(query, &locations[i].address))
                     .collect();
                 let alpha = vec_ops::softmax(&sims, inner.config.beta);
                 let patterns: Vec<Vec<f64>> = indices
                     .iter()
-                    .map(|&i| inner.locations[i].normalized_pattern())
+                    .map(|&i| locations[i].normalized_pattern())
                     .collect();
                 let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
                 Ok(vec_ops::normalize(&vec_ops::weighted_sum(
@@ -1113,7 +1349,7 @@ impl Collection {
 
         Self::check_query(&inner, query)?;
 
-        Self::attention_locked(&inner, query, scale, exclude, None)
+        self.attention_locked(&inner, query, scale, exclude, None)
     }
 
     /// [`read_attention`](Self::read_attention) with a *set* of locations barred from answering.
@@ -1145,7 +1381,7 @@ impl Collection {
         if allowed.is_empty() {
             return Err(HeatherError::EmptyMemory);
         }
-        Self::attention_locked(&inner, query, scale, None, Some(&allowed))
+        self.attention_locked(&inner, query, scale, None, Some(&allowed))
     }
 
     /// Per-query dimension / non-empty checks, factored out so the single-query
@@ -1169,23 +1405,34 @@ impl Collection {
     /// dropped and the list re-truncated to `config.k`, so an excluded
     /// location costs nothing.
     fn activate_locked(
+        &self,
         inner: &EAMInner,
         query: &[f64],
         exclude: Option<usize>,
         allowed: Option<&[usize]>,
-    ) -> Vec<usize> {
+    ) -> Result<Vec<usize>> {
         let want = inner.config.k + exclude.is_some() as usize;
         let k = want.min(inner.locations.len());
 
         let (mut indices, _sims) = match allowed {
+            Some(allowed) if inner.config.residency == Residency::Shadow => {
+                let allowed: Vec<usize> = allowed
+                    .iter()
+                    .copied()
+                    .filter(|&i| i < inner.locations.len())
+                    .collect();
+                let rows = self.hydrate(inner, &allowed)?;
+                let (local, sims) = scan::rank(query, &rows.idx, k, |j| &rows.locations[j].address);
+                (local.into_iter().map(|j| rows.original(j)).collect(), sims)
+            }
             Some(allowed) => read::activate_subset(query, &inner.locations, allowed, k),
-            None => inner.activate(query, k),
+            None => self.activate(inner, query, k)?,
         };
         if let Some(ex) = exclude {
             indices.retain(|&i| i != ex);
             indices.truncate(inner.config.k);
         }
-        indices
+        Ok(indices)
     }
 
     /// The whole attention read for one query, under an already-held read
@@ -1194,13 +1441,17 @@ impl Collection {
     /// [`read_attention_excluding`](Self::read_attention_excluding) call it,
     /// so neither can drift from the single-query numbers.
     fn attention_locked(
+        &self,
         inner: &EAMInner,
         query: &[f64],
         scale: f64,
         exclude: Option<usize>,
         allowed: Option<&[usize]>,
     ) -> Result<AttentionTrace> {
-        let indices = Self::activate_locked(inner, query, exclude, allowed);
+        let indices = self.activate_locked(inner, query, exclude, allowed)?;
+        let rows = self.hydrate(inner, &indices)?;
+        // `row(i)` is the i-th activated location, with its vectors.
+        let row = |i: usize| &rows.locations[rows.idx[i]];
 
         // Count-weighted raw-dot scores: a merged engram represents
         // write_count tokens, so it enters the softmax with that multiplicity
@@ -1208,20 +1459,17 @@ impl Collection {
         // scale·Q·Kᵢ + ln(write_countᵢ). With write_count == 1 everywhere this
         // is exactly softmax(Q·Kᵢ · scale); with merged engrams it reconstructs
         // the attention the un-merged tokens would have produced.
-        let dots: Vec<f64> = indices
-            .iter()
-            .map(|&i| vec_ops::dot(query, &inner.locations[i].address))
+        let dots: Vec<f64> = (0..indices.len())
+            .map(|j| vec_ops::dot(query, &row(j).address))
             .collect();
-        let logits: Vec<f64> = indices
-            .iter()
+        let logits: Vec<f64> = (0..indices.len())
             .zip(&dots)
-            .map(|(&i, &dot)| scale * dot + inner.locations[i].write_count.max(0.0).ln())
+            .map(|(j, &dot)| scale * dot + row(j).write_count.max(0.0).ln())
             .collect();
         let alpha = vec_ops::softmax(&logits, 1.0);
         // raw values (V = counter / write_count), NO output normalization
-        let values: Vec<Vec<f64>> = indices
-            .iter()
-            .map(|&i| inner.locations[i].normalized_pattern())
+        let values: Vec<Vec<f64>> = (0..indices.len())
+            .map(|j| row(j).normalized_pattern())
             .collect();
         let value_refs: Vec<&[f64]> = values.iter().map(|v| v.as_slice()).collect();
         let result = vec_ops::weighted_sum(&value_refs, &alpha);
@@ -1284,7 +1532,9 @@ impl Collection {
                 vec_ops::validate_vector(query)?;
                 Self::check_query(&inner, query)?;
                 let exclude = excludes.and_then(|ex| ex[qi]);
-                Ok(Self::attention_locked(&inner, query, scale, exclude, None)?.result)
+                Ok(self
+                    .attention_locked(&inner, query, scale, exclude, None)?
+                    .result)
             })
             .collect()
     }
@@ -1296,7 +1546,7 @@ impl Collection {
         vec_ops::validate_vector(query)?;
         let inner = self.read_inner()?;
         Self::check_query(&inner, query)?;
-        Self::top_location_locked(&inner, query)
+        self.top_location_locked(&inner, query)
     }
 
     /// Batched [`top_location`](Self::top_location) — one lock, one fan-out.
@@ -1311,13 +1561,13 @@ impl Collection {
             .map(|query| {
                 vec_ops::validate_vector(query)?;
                 Self::check_query(&inner, query)?;
-                Self::top_location_locked(&inner, query)
+                self.top_location_locked(&inner, query)
             })
             .collect()
     }
 
-    fn top_location_locked(inner: &EAMInner, query: &[f64]) -> Result<usize> {
-        let indices = Self::activate_locked(inner, query, None, None);
+    fn top_location_locked(&self, inner: &EAMInner, query: &[f64]) -> Result<usize> {
+        let indices = self.activate_locked(inner, query, None, None)?;
         indices.first().copied().ok_or(HeatherError::EmptyMemory)
     }
 
@@ -1346,8 +1596,10 @@ impl Collection {
             .map(|query| {
                 vec_ops::validate_vector(query)?;
                 Self::check_query(&inner, query)?;
-                let own = Self::top_location_locked(&inner, query)?;
-                Ok(Self::attention_locked(&inner, query, scale, Some(own), None)?.result)
+                let own = self.top_location_locked(&inner, query)?;
+                Ok(self
+                    .attention_locked(&inner, query, scale, Some(own), None)?
+                    .result)
             })
             .collect()
     }
@@ -1371,50 +1623,46 @@ impl Collection {
             return Ok((inner.config.beta, 0.0));
         }
         let k = inner.config.k.min(n - 1);
-        let vals: Vec<Vec<f64>> = inner
-            .locations
-            .iter()
-            .map(|l| l.normalized_pattern())
-            .collect();
+        let config_beta = inner.config.beta;
+        self.with_rows(&inner, |locations| {
+            let vals: Vec<Vec<f64>> = locations.iter().map(|l| l.normalized_pattern()).collect();
 
-        // top-k key-neighbours of each location (excluding itself), with the
-        // raw dot logit Kⱼ·Kᵢ that read_attention scales by β.
-        let neighbours: Vec<Vec<(usize, f64)>> = (0..n)
-            .map(|j| {
-                let mut sims: Vec<(usize, f64)> = (0..n)
-                    .filter(|&i| i != j)
-                    .map(|i| {
-                        (
-                            i,
-                            vec_ops::dot(&inner.locations[j].address, &inner.locations[i].address),
-                        )
-                    })
-                    .collect();
-                sims.sort_by(|a, b| b.1.total_cmp(&a.1));
-                sims.truncate(k);
-                sims
-            })
-            .collect();
+            // top-k key-neighbours of each location (excluding itself), with the
+            // raw dot logit Kⱼ·Kᵢ that read_attention scales by β.
+            let neighbours: Vec<Vec<(usize, f64)>> = (0..n)
+                .map(|j| {
+                    let mut sims: Vec<(usize, f64)> = (0..n)
+                        .filter(|&i| i != j)
+                        .map(|i| {
+                            (
+                                i,
+                                vec_ops::dot(&locations[j].address, &locations[i].address),
+                            )
+                        })
+                        .collect();
+                    sims.sort_by(|a, b| b.1.total_cmp(&a.1));
+                    sims.truncate(k);
+                    sims
+                })
+                .collect();
 
-        let mut best = (
-            betas.first().copied().unwrap_or(inner.config.beta),
-            f64::INFINITY,
-        );
-        for &beta in betas {
-            let mut dl = 0.0;
-            for (j, nb) in neighbours.iter().enumerate() {
-                let logits: Vec<f64> = nb.iter().map(|&(_, s)| beta * s).collect();
-                let alpha = vec_ops::softmax(&logits, 1.0);
-                let refs: Vec<&[f64]> = nb.iter().map(|&(i, _)| vals[i].as_slice()).collect();
-                let recon = vec_ops::weighted_sum(&refs, &alpha);
-                let p = vec_ops::dot(&vals[j], &recon).max(1e-12);
-                dl -= p.ln();
+            let mut best = (betas.first().copied().unwrap_or(config_beta), f64::INFINITY);
+            for &beta in betas {
+                let mut dl = 0.0;
+                for (j, nb) in neighbours.iter().enumerate() {
+                    let logits: Vec<f64> = nb.iter().map(|&(_, s)| beta * s).collect();
+                    let alpha = vec_ops::softmax(&logits, 1.0);
+                    let refs: Vec<&[f64]> = nb.iter().map(|&(i, _)| vals[i].as_slice()).collect();
+                    let recon = vec_ops::weighted_sum(&refs, &alpha);
+                    let p = vec_ops::dot(&vals[j], &recon).max(1e-12);
+                    dl -= p.ln();
+                }
+                if dl < best.1 {
+                    best = (beta, dl);
+                }
             }
-            if dl < best.1 {
-                best = (beta, dl);
-            }
-        }
-        Ok(best)
+            Ok(best)
+        })
     }
 
     /// Self-calibrating attention read. The softmax inverse-temperature is a
@@ -1460,30 +1708,29 @@ impl Collection {
         }
 
         let k = inner.config.k.min(inner.locations.len());
-        let (indices, _sims) = inner.activate(query, k);
+        let (indices, _sims) = self.activate(&inner, query, k)?;
+        let rows = self.hydrate(&inner, &indices)?;
+        // `row(j)` is the j-th activated location, with its vectors.
+        let row = |j: usize| &rows.locations[rows.idx[j]];
 
         // Unit-norm activated keys — kernel geometry needs the cosine sphere.
-        let keys: Vec<Vec<f64>> = indices
-            .iter()
-            .map(|&i| vec_ops::normalize(&inner.locations[i].address))
+        let keys: Vec<Vec<f64>> = (0..indices.len())
+            .map(|j| vec_ops::normalize(&row(j).address))
             .collect();
         let beta = select_beta_mdl(&keys, inner.config.d, inner.config.beta);
 
         // Read at β*: count-weighted raw-dot attention, identical form to
         // `read_attention` but with the self-selected temperature.
-        let dots: Vec<f64> = indices
-            .iter()
-            .map(|&i| vec_ops::dot(query, &inner.locations[i].address))
+        let dots: Vec<f64> = (0..indices.len())
+            .map(|j| vec_ops::dot(query, &row(j).address))
             .collect();
-        let logits: Vec<f64> = indices
-            .iter()
+        let logits: Vec<f64> = (0..indices.len())
             .zip(&dots)
-            .map(|(&i, &dot)| beta * dot + inner.locations[i].write_count.max(0.0).ln())
+            .map(|(j, &dot)| beta * dot + row(j).write_count.max(0.0).ln())
             .collect();
         let alpha = vec_ops::softmax(&logits, 1.0);
-        let values: Vec<Vec<f64>> = indices
-            .iter()
-            .map(|&i| inner.locations[i].normalized_pattern())
+        let values: Vec<Vec<f64>> = (0..indices.len())
+            .map(|j| row(j).normalized_pattern())
             .collect();
         let value_refs: Vec<&[f64]> = values.iter().map(|v| v.as_slice()).collect();
         let result = vec_ops::weighted_sum(&value_refs, &alpha);
@@ -1514,6 +1761,7 @@ impl Collection {
     pub fn merge(&self) -> Result<usize> {
         let mut inner = self.atomic_mutation()?;
         self.materialize_document_refs(&inner)?;
+        self.rehydrate(&mut inner)?;
         inner.version += 1;
         let EAMInner {
             ref config,
@@ -1554,6 +1802,18 @@ impl Collection {
                 self.store
                     .delete_location(&mut txn, self.collection_id, LocationId(id))?;
             }
+            // Survivors absorbed the removed locations: store what they hold
+            // now, so storage (and shadow residency, which reads it) agrees
+            // with memory.
+            let survivors: std::collections::HashSet<u64> =
+                result.merge_map.iter().map(|&(_, s)| s).collect();
+            for loc in inner
+                .locations
+                .iter()
+                .filter(|l| survivors.contains(&l.id.0))
+            {
+                self.store.put_location(&mut txn, self.collection_id, loc)?;
+            }
             txn.commit()?;
         }
 
@@ -1590,6 +1850,7 @@ impl Collection {
     pub fn compress(&self, kappa: f64, lambda: f64) -> Result<CompressResult> {
         let mut inner = self.atomic_mutation()?;
         self.materialize_document_refs(&inner)?;
+        self.rehydrate(&mut inner)?;
         let w: f64 = inner
             .locations
             .iter()
@@ -1708,7 +1969,8 @@ impl Collection {
         let inner = self.read_inner()?;
 
         let mut txn = self.store.write_txn()?;
-        for loc in &inner.locations {
+        // Hollow rows (shadow residency) are already durable in storage.
+        for loc in inner.locations.iter().filter(|l| !is_hollow(l)) {
             self.store.put_location(&mut txn, self.collection_id, loc)?;
         }
         self.store.put_metadata(
@@ -2003,7 +2265,7 @@ impl Collection {
         match self.store.get_document(self.collection_id, write_index)? {
             Some(data) => {
                 let inner = self.read_inner()?;
-                Ok(Some(self.resolve_document(&inner, &data)?))
+                Ok(Some(self.resolve_document(&inner, &data, None)?))
             }
             None => Ok(None),
         }
@@ -2012,15 +2274,36 @@ impl Collection {
     /// A stored document's vector and metadata, its vector resolved from its
     /// location when it is stored by reference. A reference to a location
     /// that does not exist is [`HeatherError::Corrupt`].
-    fn resolve_document(&self, inner: &EAMInner, data: &[u8]) -> Result<(Vec<f64>, Vec<u8>)> {
+    ///
+    /// `txn`, when the caller already holds a read transaction, is used for
+    /// any vector read from storage (LMDB allows one read transaction per
+    /// thread).
+    fn resolve_document(
+        &self,
+        inner: &EAMInner,
+        data: &[u8],
+        txn: Option<&heed::RoTxn>,
+    ) -> Result<(Vec<f64>, Vec<u8>)> {
         match self.store.decode_document_parts(data)? {
             (DocVector::Inline(vector), metadata) => Ok((vector, metadata)),
-            (DocVector::Location(id), metadata) => match inner.location_address(id) {
-                Some(address) => Ok((address.to_vec(), metadata)),
-                None => Err(HeatherError::Corrupt(format!(
-                    "document refers to location {id}, which does not exist"
-                ))),
-            },
+            (DocVector::Location(id), metadata) => {
+                let missing = || {
+                    HeatherError::Corrupt(format!(
+                        "document refers to location {id}, which does not exist"
+                    ))
+                };
+                let address = inner.location_address(id).ok_or_else(missing)?;
+                if !address.is_empty() && !address[0].is_nan() {
+                    return Ok((address.to_vec(), metadata));
+                }
+                // Shadow residency: the vector is in storage, not memory.
+                let loc = match txn {
+                    Some(txn) => self.store.get_location_txn(txn, self.collection_id, id)?,
+                    None => self.store.get_location(self.collection_id, id)?,
+                }
+                .ok_or_else(missing)?;
+                Ok((loc.address, metadata))
+            }
         }
     }
 
@@ -2034,8 +2317,9 @@ impl Collection {
         let mut rewritten = Vec::new();
         for (doc_id, data) in self.store.list_documents(self.collection_id)? {
             if let Ok((DocVector::Location(_), _)) = self.store.decode_document_parts(&data)
-                && let Some((vector, metadata)) =
-                    self.store.tolerate(self.resolve_document(inner, &data))?
+                && let Some((vector, metadata)) = self
+                    .store
+                    .tolerate(self.resolve_document(inner, &data, None))?
             {
                 rewritten.push((doc_id, self.store.encode_document(&vector, &metadata)?));
             }
@@ -2118,7 +2402,10 @@ impl Collection {
         let mut docs = Vec::with_capacity(raw.len());
         let mut skipped = 0;
         for (id, data) in raw {
-            match self.store.tolerate(self.resolve_document(&inner, &data))? {
+            match self
+                .store
+                .tolerate(self.resolve_document(&inner, &data, None))?
+            {
                 Some((vec, meta)) => docs.push((id, vec, meta)),
                 None => skipped += 1,
             }
@@ -2199,7 +2486,7 @@ impl Collection {
         let k = (inner.config.k * QUERY_CANDIDATE_FACTOR)
             .max(n)
             .min(inner.locations.len());
-        let (indices, _sims) = inner.activate(query, k);
+        let (indices, _sims) = self.activate(&inner, query, k)?;
 
         // Step 2: Gather candidate doc IDs from posting lists (deduplicated)
         let mut candidate_ids = std::collections::HashSet::new();
@@ -2220,7 +2507,8 @@ impl Collection {
                 .get_document_txn(&rtxn, self.collection_id, doc_id)?
             {
                 let Some((vec, meta)) =
-                    self.store.tolerate(self.resolve_document(&inner, &data))?
+                    self.store
+                        .tolerate(self.resolve_document(&inner, &data, Some(&rtxn)))?
                 else {
                     continue;
                 };
@@ -2342,7 +2630,7 @@ impl Collection {
         let k = (inner.config.k * QUERY_CANDIDATE_FACTOR)
             .max(n)
             .min(inner.locations.len());
-        let (indices, _sims) = inner.activate(query, k);
+        let (indices, _sims) = self.activate(&inner, query, k)?;
 
         // The cleanup temperature is a property of the codebook's geometry,
         // not of any one recovered filler, so it is selected once per query
@@ -2350,9 +2638,11 @@ impl Collection {
         let cleanup_beta = match cleanup {
             RoleCleanup::Off => None,
             RoleCleanup::Mdl => {
-                let keys: Vec<Vec<f64>> = indices
+                let rows = self.hydrate(&inner, &indices)?;
+                let keys: Vec<Vec<f64>> = rows
+                    .idx
                     .iter()
-                    .map(|&i| vec_ops::normalize(&inner.locations[i].address))
+                    .map(|&i| vec_ops::normalize(&rows.locations[i].address))
                     .collect();
                 Some(select_beta_mdl(&keys, d, inner.config.beta))
             }
@@ -2398,7 +2688,8 @@ impl Collection {
                 continue;
             };
             let Some((vec, metadata)) =
-                self.store.tolerate(self.resolve_document(&inner, &data))?
+                self.store
+                    .tolerate(self.resolve_document(&inner, &data, Some(&rtxn)))?
             else {
                 continue;
             };
@@ -2410,24 +2701,26 @@ impl Collection {
             let role_scores: Vec<f64> = pairs
                 .iter()
                 .enumerate()
-                .map(|(i, (_, filler))| match cleanup_beta {
-                    // Cleanup needs the recovered filler as a vector, so the
-                    // inverse transform comes back.
-                    Some(beta) => {
-                        let recovered =
-                            vec_ops::unbind_by_spectra(&doc_spectrum, &role_spectra[i], d);
-                        let cleaned = cleanup_read(&inner, &recovered, beta);
-                        vec_ops::cosine_similarity(&cleaned, filler)
-                    }
-                    None => vec_ops::role_scoped_similarity_spectra(
-                        &doc_spectrum,
-                        &role_spectra[i],
-                        &filler_spectra[i],
-                        filler_norms[i],
-                        d,
-                    ),
+                .map(|(i, (_, filler))| -> Result<f64> {
+                    Ok(match cleanup_beta {
+                        // Cleanup needs the recovered filler as a vector, so the
+                        // inverse transform comes back.
+                        Some(beta) => {
+                            let recovered =
+                                vec_ops::unbind_by_spectra(&doc_spectrum, &role_spectra[i], d);
+                            let cleaned = cleanup_read(self, &inner, &recovered, beta)?;
+                            vec_ops::cosine_similarity(&cleaned, filler)
+                        }
+                        None => vec_ops::role_scoped_similarity_spectra(
+                            &doc_spectrum,
+                            &role_spectra[i],
+                            &filler_spectra[i],
+                            filler_norms[i],
+                            d,
+                        ),
+                    })
                 })
-                .collect();
+                .collect::<Result<_>>()?;
 
             hits.push(MultiRoleHit {
                 doc_id,
@@ -2493,11 +2786,9 @@ impl Collection {
     /// Get summary of all hard locations for UI display.
     pub fn locations_summary(&self) -> Result<Vec<LocationSummary>> {
         let inner = self.read_inner()?;
-        Ok(inner
-            .locations
-            .iter()
-            .enumerate()
-            .map(|(i, loc)| {
+        let mut out = Vec::with_capacity(inner.locations.len());
+        self.for_each_chunk(&inner, crate::store::LOCATION_CHUNK, |start, rows| {
+            out.extend(rows.iter().enumerate().map(|(j, loc)| {
                 let avg_mag = if loc.counter.is_empty() {
                     0.0
                 } else {
@@ -2505,12 +2796,14 @@ impl Collection {
                     sum / loc.counter.len() as f64
                 };
                 LocationSummary {
-                    id: i,
+                    id: start + j,
                     write_count: loc.write_count,
                     avg_counter_magnitude: avg_mag,
                 }
-            })
-            .collect())
+            }));
+            Ok(())
+        })?;
+        Ok(out)
     }
 
     /// Compute the emergent fingerprint of this collection.
@@ -2531,24 +2824,32 @@ impl Collection {
 
         let d = inner.config.d;
 
-        // Step 1: Weighted centroid of hard location patterns
+        // Step 1: Weighted centroid of hard location patterns (streamed)
         let mut centroid = vec![0.0_f64; d];
-        for loc in &inner.locations {
-            if loc.write_count < 1e-10 {
-                continue;
+        self.for_each_chunk(&inner, crate::store::LOCATION_CHUNK, |_, rows| {
+            for loc in rows {
+                if loc.write_count < 1e-10 {
+                    continue;
+                }
+                let pattern = loc.normalized_pattern();
+                let weight = loc.write_count;
+                for (c, &p) in centroid.iter_mut().zip(pattern.iter()) {
+                    *c += weight * p;
+                }
             }
-            let pattern = loc.normalized_pattern();
-            let weight = loc.write_count;
-            for (c, &p) in centroid.iter_mut().zip(pattern.iter()) {
-                *c += weight * p;
-            }
-        }
+            Ok(())
+        })?;
 
         // Normalize centroid to unit vector
         centroid = vec_ops::normalize(&centroid);
 
-        // Step 2: Refine via Hopfield iterative read
-        let refined = read::hopfield_iter(&centroid, &inner.locations, &inner.config)?;
+        // Step 2: Refine via Hopfield iterative read over the centroid's
+        // nearest locations (the same set read::hopfield_iter activates).
+        let k = inner.config.k.min(inner.locations.len());
+        let (indices, _sims) = self.activate(&inner, &centroid, k)?;
+        let rows = self.hydrate(&inner, &indices)?;
+        let refined =
+            read::hopfield_iter_from(&centroid, &rows.locations, &inner.config, &rows.idx)?;
 
         Ok(Some(refined))
     }
@@ -2557,14 +2858,16 @@ impl Collection {
     /// The snapshot is fully decoupled from persistence.
     pub fn snapshot(&self) -> Result<(Vec<HardLocation>, EAMConfig)> {
         let inner = self.read_inner()?;
-        Ok((inner.locations.clone(), inner.config.clone()))
+        let locations = self.with_rows(&inner, |rows| Ok(rows.to_vec()))?;
+        Ok((locations, inner.config.clone()))
     }
 
     /// Like [`snapshot`](Self::snapshot), but also returns the mutation
     /// version, for handing to [`load_snapshot_checked`](Self::load_snapshot_checked).
     pub fn snapshot_versioned(&self) -> Result<(Vec<HardLocation>, EAMConfig, u64)> {
         let inner = self.read_inner()?;
-        Ok((inner.locations.clone(), inner.config.clone(), inner.version))
+        let locations = self.with_rows(&inner, |rows| Ok(rows.to_vec()))?;
+        Ok((locations, inner.config.clone(), inner.version))
     }
 
     /// Current mutation version. Bumped on every write-locked mutation
@@ -2678,24 +2981,26 @@ impl Collection {
         }
 
         let k = inner.config.k.min(inner.locations.len());
-        let (indices, sims) = inner.activate(query, k);
+        let (indices, sims) = self.activate(&inner, query, k)?;
+        let rows = self.hydrate(&inner, &indices)?;
 
         match strategy {
             ReadStrategy::HopfieldIter => {
                 // Settle on the keys of the (possibly graph-found) activation
                 // set, then read the values once.
-                Ok(read::trace_settled(
-                    query,
-                    &inner.locations,
-                    &inner.config,
-                    &indices,
-                ))
+                let mut trace =
+                    read::trace_settled(query, &rows.locations, &inner.config, &rows.idx);
+                for a in &mut trace.activated_locations {
+                    a.id = rows.original(a.id);
+                }
+                Ok(trace)
             }
             ReadStrategy::HopfieldSS => {
                 let alpha = vec_ops::softmax(&sims, inner.config.beta);
-                let patterns: Vec<Vec<f64>> = indices
+                let patterns: Vec<Vec<f64>> = rows
+                    .idx
                     .iter()
-                    .map(|&i| inner.locations[i].normalized_pattern())
+                    .map(|&i| rows.locations[i].normalized_pattern())
                     .collect();
                 let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
                 let result = vec_ops::normalize(&vec_ops::weighted_sum(&pattern_refs, &alpha));
@@ -3434,8 +3739,8 @@ mod tests {
                 .map(|l| vec_ops::cosine_similarity(v, &l.normalized_pattern()))
                 .fold(f64::MIN, f64::max)
         };
-        let soft = nearest(&cleanup_read(&inner, &recovered, 1.0));
-        let sharp = nearest(&cleanup_read(&inner, &recovered, 5000.0));
+        let soft = nearest(&cleanup_read(&col, &inner, &recovered, 1.0).unwrap());
+        let sharp = nearest(&cleanup_read(&col, &inner, &recovered, 5000.0).unwrap());
 
         assert!(
             sharp > soft + 1e-6,
@@ -3569,7 +3874,7 @@ mod tests {
         for q in &queries {
             let activated = {
                 let inner = col.inner.read().unwrap();
-                Collection::activate_locked(&inner, q, None, None)
+                col.activate_locked(&inner, q, None, None).unwrap()
             };
             let n = col.num_locations().unwrap();
             let outsider = (0..n).find(|i| !activated.contains(i)).unwrap();
@@ -3697,10 +4002,10 @@ mod tests {
             "weights must sum to 1, got {total}"
         );
 
-        let inner = col.inner.read().unwrap();
+        let rows = col.snapshot().unwrap().0;
         for c in &trace.contributors {
             // `similarity` is the RAW dot product Q·Kᵢ — not a cosine, not βQ·Kᵢ.
-            let raw = vec_ops::dot(&query, &inner.locations[c.id].address);
+            let raw = vec_ops::dot(&query, &rows[c.id].address);
             assert!(
                 (c.similarity - raw).abs() < 1e-12,
                 "similarity {} != raw dot {raw}",
@@ -3711,7 +4016,7 @@ mod tests {
         // The contributors fully account for the value: Σ weightᵢ · Vᵢ == result.
         let mut recon = vec![0.0; d];
         for c in &trace.contributors {
-            let v = inner.locations[c.id].normalized_pattern();
+            let v = rows[c.id].normalized_pattern();
             for (r, x) in recon.iter_mut().zip(&v) {
                 *r += c.weight * x;
             }
@@ -3795,10 +4100,10 @@ mod tests {
             "weights must sum to 1, got {total}"
         );
 
-        let inner = col.inner.read().unwrap();
+        let rows = col.snapshot().unwrap().0;
         for c in &trace.contributors {
             // `similarity` is the RAW dot product Q·Kᵢ — not scaled by β*.
-            let raw = vec_ops::dot(&query, &inner.locations[c.id].address);
+            let raw = vec_ops::dot(&query, &rows[c.id].address);
             assert!(
                 (c.similarity - raw).abs() < 1e-12,
                 "similarity {} != raw dot {raw}",
@@ -3809,7 +4114,7 @@ mod tests {
         // Σ weightᵢ · Vᵢ == result, at the self-selected temperature.
         let mut recon = vec![0.0; d];
         for c in &trace.contributors {
-            let v = inner.locations[c.id].normalized_pattern();
+            let v = rows[c.id].normalized_pattern();
             for (r, x) in recon.iter_mut().zip(&v) {
                 *r += c.weight * x;
             }
@@ -4765,5 +5070,143 @@ mod tests {
         q[0] = 1.0;
         let res = col.read(&q, ReadStrategy::HopfieldSS).unwrap();
         assert!(vec_ops::dot(&vec_ops::normalize(&res), &q) > 0.5);
+    }
+}
+
+#[cfg(test)]
+mod shadow_residency_tests {
+    use rand::rngs::StdRng;
+    use rand::{Rng, SeedableRng};
+
+    use super::*;
+    use crate::Hive;
+
+    fn config(residency: Residency) -> EAMConfig {
+        let mut c = EAMConfig::new(32).unwrap();
+        c.competitive = false;
+        c.residency = residency;
+        c
+    }
+
+    fn corpus(n: usize, d: usize) -> Vec<(Vec<f64>, Vec<u8>)> {
+        let mut rng = StdRng::seed_from_u64(21);
+        (0..n)
+            .map(|i| {
+                let scale = rng.gen_range(0.5..3.0);
+                let v: Vec<f64> = (0..d).map(|_| scale * rng.gen_range(-1.0..1.0)).collect();
+                (v, format!("{{\"i\":{i}}}").into_bytes())
+            })
+            .collect()
+    }
+
+    /// Everything a shadow-resident collection answers is what the same data
+    /// answers in memory, before and after reopening, while it holds no
+    /// vectors in memory.
+    #[test]
+    fn shadow_answers_exactly_what_memory_answers() {
+        let items = corpus(3000, 32);
+        let (dm, ds) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mem_hive = Hive::open(dm.path(), config(Residency::Memory), 64).unwrap();
+        let mem = mem_hive.get_or_create_collection("c").unwrap();
+        let shadow_hive = Hive::open(ds.path(), config(Residency::Shadow), 64).unwrap();
+        let shadow = shadow_hive.get_or_create_collection("c").unwrap();
+        for chunk in items.chunks(500) {
+            mem.write_batch_with_metadata(chunk).unwrap();
+            shadow.write_batch_with_metadata(chunk).unwrap();
+        }
+
+        let compare = |a: &Collection, b: &Collection| {
+            let mut rng = StdRng::seed_from_u64(5);
+            for _ in 0..25 {
+                let q: Vec<f64> = (0..32).map(|_| rng.gen_range(-1.0..1.0)).collect();
+                let (qa, qb) = (
+                    a.query_documents(&q, 10).unwrap(),
+                    b.query_documents(&q, 10).unwrap(),
+                );
+                assert_eq!(
+                    qa.iter().map(|h| (h.0, h.1)).collect::<Vec<_>>(),
+                    qb.iter().map(|h| (h.0, h.1)).collect::<Vec<_>>()
+                );
+                for s in [ReadStrategy::HopfieldIter, ReadStrategy::HopfieldSS] {
+                    assert_eq!(a.read(&q, s).unwrap(), b.read(&q, s).unwrap());
+                    let (ta, tb) = (
+                        a.analyze_read(&q, s).unwrap(),
+                        b.analyze_read(&q, s).unwrap(),
+                    );
+                    assert_eq!(ta.result, tb.result);
+                    let ids = |t: &ReadTrace| {
+                        t.activated_locations
+                            .iter()
+                            .map(|x| x.id)
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(ids(&ta), ids(&tb));
+                }
+            }
+            assert_eq!(a.fingerprint().unwrap(), b.fingerprint().unwrap());
+            let (sa, sb) = (a.snapshot().unwrap().0, b.snapshot().unwrap().0);
+            assert_eq!(sa.len(), sb.len());
+            assert!(
+                sa.iter()
+                    .zip(&sb)
+                    .all(|(x, y)| x.id == y.id && x.address == y.address)
+            );
+            let (la, lb) = (
+                a.locations_summary().unwrap(),
+                b.locations_summary().unwrap(),
+            );
+            assert!(
+                la.iter()
+                    .zip(&lb)
+                    .all(|(x, y)| x.avg_counter_magnitude == y.avg_counter_magnitude)
+            );
+            assert_eq!(a.get_document(1234).unwrap(), b.get_document(1234).unwrap());
+        };
+        compare(&mem, &shadow);
+        assert!(shadow.inner.read().unwrap().locations.iter().all(is_hollow));
+
+        drop(shadow);
+        drop(shadow_hive);
+        let reopened_hive = Hive::open(ds.path(), config(Residency::Shadow), 64).unwrap();
+        let reopened = reopened_hive.get_or_create_collection("c").unwrap();
+        assert!(
+            reopened
+                .inner
+                .read()
+                .unwrap()
+                .locations
+                .iter()
+                .all(is_hollow)
+        );
+        compare(&mem, &reopened);
+
+        // A flush must not overwrite stored rows with hollow ones.
+        reopened.flush().unwrap();
+        compare(&mem, &reopened);
+    }
+
+    #[test]
+    fn storage_refuses_a_location_without_its_vectors() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path(), 16).unwrap();
+        let mut txn = store.write_txn().unwrap();
+        let empty = HardLocation::new(LocationId(1), Vec::new());
+        assert!(store.put_location(&mut txn, 0, &empty).is_err());
+        let nan = HardLocation::new(LocationId(2), vec![f64::NAN; 4]);
+        assert!(store.put_location(&mut txn, 0, &nan).is_err());
+    }
+
+    #[test]
+    fn shadow_residency_needs_a_plain_database_without_attention() {
+        let mut c = EAMConfig::new(8).unwrap();
+        c.residency = Residency::Shadow;
+        assert!(
+            c.validate().is_err(),
+            "competitive + shadow must be refused"
+        );
+        c.competitive = false;
+        assert!(c.validate().is_ok());
+        c.selective_attention = Some(toml::from_str("heads = { y = [7] }").unwrap());
+        assert!(c.validate().is_err(), "attention + shadow must be refused");
     }
 }

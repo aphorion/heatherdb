@@ -315,6 +315,10 @@ pub struct EamConfigOverride {
     /// Selective attention, learned from prediction error while the database
     /// is written. Needs `competitive: false`. Fixed for the database's life.
     pub selective_attention: Option<heather_db::attention::AttentionConfig>,
+    /// `"shadow"` keeps only an int8 shadow of each vector in memory and
+    /// reads exact vectors from storage when an answer needs them. Needs
+    /// `competitive: false`. Fixed for the database's life.
+    pub residency: Option<heather_db::Residency>,
 }
 
 #[derive(Debug, Serialize)]
@@ -327,6 +331,8 @@ pub struct DatabaseInfo {
     /// `false`: a plain store (see `EamConfigOverride::competitive`).
     pub competitive: bool,
     pub precision: heather_db::Precision,
+    /// Where vectors live while the database is open: `memory` or `shadow`.
+    pub residency: heather_db::Residency,
     /// The on-disk format version (`heather_db::FORMAT_VERSION` for new
     /// databases).
     pub format_version: u32,

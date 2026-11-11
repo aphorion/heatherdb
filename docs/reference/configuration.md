@@ -149,6 +149,7 @@ edit and a restart.
 | `num_landmarks` | `32` | Landmark entry points for graph search |
 | `mdl_gate` | `false` | Allocate by description length (`surprise·recurrence > engram bits`) instead of `tau_split` / `tau_overload` |
 | `competitive` | `true` | Adaptive learning of shared patterns by default. `false` appends individual vectors without activation, merge or migration. Choose at database creation; see [Choose a memory mode](../how-to/choose-memory-mode.md) |
+| `residency` | `"memory"` | Where vectors live while the database is open. `"shadow"` keeps only an int8 shadow of each vector in memory (a quarter of an f32 copy) and reads exact vectors from storage when an answer needs them; every answer is identical to `"memory"`. Whole-collection operations (fingerprint, `locations`, snapshots) stream rows from storage; `compress`, `merge` and `calibrate_beta` hold the full vectors only while they run. Needs `competitive = false` and no `[eam.selective_attention]`. Fixed at database creation |
 
 ## `[eam.selective_attention]`
 

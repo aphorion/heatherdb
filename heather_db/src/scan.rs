@@ -172,12 +172,21 @@ pub fn nearest(
     k: usize,
     scan: &Scan,
 ) -> (Vec<usize>, Vec<f64>) {
-    let n = locations.len();
+    match candidates(query, locations.len(), k, scan) {
+        Some(cands) => rank(query, &cands, k, |i| &locations[i].address),
+        None => read::activate(query, locations, k),
+    }
+}
+
+/// The rows the int8 shadow cannot rule out of the exact top `k` for
+/// `query`: a superset of the true top k, usually a few dozen rows. `None`
+/// when the shadow is not in step with the `n` rows, so the caller falls back
+/// to an exact scan.
+pub fn candidates(query: &[f64], n: usize, k: usize, scan: &Scan) -> Option<Vec<usize>> {
     let d = query.len();
     if !(k > 0 && k <= n && scan.len() == n && scan.d == d) {
-        return read::activate(query, locations, k);
+        return None;
     }
-
     let q = vec_ops::normalize(query);
     let (cq, tq, eq, _) = quantise(&q);
     let qn = vec_ops::l2_norm(&q);
@@ -194,12 +203,29 @@ pub fn nearest(
     let mut lows: Vec<f64> = bounds.iter().map(|b| b.0).collect();
     let (_, kth, _) = lows.select_nth_unstable_by(k - 1, |a, b| b.total_cmp(a));
     let floor = *kth;
+    Some(
+        bounds
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| b.1 >= floor)
+            .map(|(i, _)| i)
+            .collect(),
+    )
+}
 
-    let mut best: Vec<(usize, f64)> = bounds
+/// The exact top `k` of `rows` by f64 dot with the normalised `query`,
+/// sorted descending, ties broken by lower row: [`read::activate`]'s order.
+/// `address(row)` gives a row's address.
+pub fn rank<'a>(
+    query: &[f64],
+    rows: &[usize],
+    k: usize,
+    address: impl Fn(usize) -> &'a [f64],
+) -> (Vec<usize>, Vec<f64>) {
+    let q = vec_ops::normalize(query);
+    let mut best: Vec<(usize, f64)> = rows
         .iter()
-        .enumerate()
-        .filter(|(_, b)| b.1 >= floor)
-        .map(|(i, _)| (i, vec_ops::dot(&q, &locations[i].address)))
+        .map(|&i| (i, vec_ops::dot(&q, address(i))))
         .collect();
     best.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     best.truncate(k);

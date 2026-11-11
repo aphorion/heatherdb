@@ -6,7 +6,10 @@ rust-version = "1.88"
 license = "AGPL-3.0-only"
 
 [dependencies]
-heed = "0.20"
+# `read-txn-no-tls`: read slots belong to transactions, not threads, so a
+# path that fetches a row while its caller holds a read transaction (shadow
+# residency) cannot hit MDB_BAD_RSLOT.
+heed = { version = "0.20", features = ["read-txn-no-tls"] }
 rand = "0.8"
 rand_distr = "0.4"
 thiserror = "2"

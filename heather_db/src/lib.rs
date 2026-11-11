@@ -57,7 +57,7 @@ pub use collection::{
     Collection, CompressResult, EAMStats, LocationSummary, MIN_CLEANUP_BETA, MultiRoleHit,
     MultiRoleResults, ReadStrategy, RoleCleanup,
 };
-pub use config::{EAMConfig, Precision};
+pub use config::{EAMConfig, Precision, Residency};
 pub use db_config::{
     DEFAULT_MAP_SIZE_MB, DbConfig, DreamConfig, DreamMode, FORMAT_VERSION, validate_db_name,
 };
