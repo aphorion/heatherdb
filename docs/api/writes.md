@@ -1,7 +1,8 @@
 # Write endpoints
 
-Two ways to put vectors into a collection: `write`, which learns
-competitively, and `bulk_load`, which does not.
+Three ways to put data into a collection: `rows`, by column name, for a
+database declared with columns; `write`, vectors with competitive learning;
+and `bulk_load`, vectors without it.
 
 Both have a legacy form without the `/db/{db}` prefix that targets the
 `default` database. Auth for both: Basic or Bearer, root or `Database(db)`
@@ -17,7 +18,8 @@ splits, address migration. Legacy: `POST /collections/{name}/write`.
 |---|---|---|
 | `vectors` | array of arrays | Each must match the database's dimension. *Required* unless `vectors_b64` is sent |
 | `vectors_b64` | array of strings | Instead of `vectors`: each vector's little-endian f64 bytes, base64-encoded (standard alphabet, padded). About half the bytes of JSON numbers and no float parsing. Send one of the two, not both |
-| `metadata` | array of JSON values | Optional. Length must equal the number of vectors |
+| `metadata` | array of JSON values | Optional. Length must equal the number of vectors. Not with `symbols` yet |
+| `symbols` | array of objects | For a database with [symbol fields](../how-to/encode-identities-as-symbols.md): one `{field: value}` map per row, every field present. `vectors` then holds each row's numeric part, and may be omitted when there is none. Required on such a database: raw vectors are refused |
 
 ```bash
 curl -u admin:pw -X POST \
@@ -52,6 +54,37 @@ transaction; the response carries the assigned ids:
 A rejected write does not leave partial learned state visible. Storage failures
 return `500`; invalid input returns `400`. A disconnected or timed-out client
 must treat the outcome as unknown and must not assume an automatic rollback.
+
+### POST /db/{db}/collections/{name}/rows
+
+Write rows by column name, for a database created with
+[`columns`](databases.md#post-db). Legacy: `POST /collections/{name}/rows`.
+
+| Field | Type | Notes |
+|---|---|---|
+| `rows` | array of objects | *Required*, not empty. Each row gives every column: a string or number for a category, a number (or `true`/`false`) for a number, an array of numbers for a vector |
+
+```bash
+curl -u admin:pw -X POST \
+  http://localhost:6380/db/access/collections/requests/rows \
+  -H 'Content-Type: application/json' \
+  -d '{"rows":[{"role":"R-117","amount":120,"granted":1},
+               {"role":"R-212","amount":8,"granted":0}]}'
+```
+
+```json
+{ "count": 2 }
+```
+
+Each row is learned from before it is stored, and number columns are put on
+a common scale by the database's running statistics. The whole request is
+one transaction: a bad row rejects it, and nothing is stored or learned.
+`write` and `bulk_load` are refused on a database declared with columns.
+
+| Status | Cause |
+|---|---|
+| `400 Bad Request` | the database was not declared with columns, empty `rows`, an unknown column, a missing column, or a value of the wrong type |
+| `500 Internal Server Error` | the collection could not be opened, or a storage failure |
 
 ### POST /db/{db}/collections/{name}/bulk_load
 

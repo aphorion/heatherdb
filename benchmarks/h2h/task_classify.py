@@ -118,3 +118,35 @@ def run_heather_sa(h, Xtr, ytr, Xte, yte):
             p[i] = pos / (pos + neg + 1e-12)
     return {"system": "HeatherDB (selective attention)", **metrics(p, yte),
             "fit_s": fit.wall, "score_us_per_row": sc.wall / len(Q) * 1e6}
+
+
+def run_heather_sym(h, Xtr, ytr, Xte, yte):
+    """HeatherDB declared by columns: the 9 categorical columns as categories
+    (learned codes, no one-hot), the numeric columns as raw numbers (the
+    database scales them itself) and `outcome` as the number to predict."""
+    from sklearn.datasets import fetch_openml
+
+    df = fetch_openml(data_id=1461, as_frame=True, data_home=str(data.DATA / "openml"),
+                      parser="liac-arff").frame
+    y = (df["Class"].astype(str) == "2").to_numpy().astype(np.int64)
+    df = df.drop(columns=["Class"])
+    num_cols = [c for c in df.columns if df[c].dtype.kind == "f"]
+    columns = {c.lower(): ("number" if c in num_cols else "category") for c in df.columns}
+    rows = [{c.lower(): (float(v) if c in num_cols else str(v)) for c, v in zip(df.columns, r)}
+            for r in df.itertuples(index=False)]
+    tr, te = train_test_split(np.arange(len(y)), test_size=0.3, stratify=y, random_state=0)
+    h.create_columns_db("propensity_sym", {**columns, "outcome": "number"}, predict=["outcome"])
+    col = "/db/propensity_sym/collections/customers"
+    order = tr[np.random.default_rng(0).permutation(len(tr))]
+    with Meter() as fit:
+        for i in range(0, len(order), 500):
+            idx = order[i:i + 500]
+            h.call("POST", col + "/rows", {"rows": [{**rows[j], "outcome": int(y[j])} for j in idx]})
+    p = np.empty(len(te))
+    with Meter() as sc:
+        for i, j in enumerate(te):
+            p[i] = h.call("POST", col + "/predict",
+                          {"row": rows[j], "column": "outcome", "contributors": 0}
+                          )["predicted"]["outcome"]
+    return {"system": "HeatherDB (selective attention, learned symbols)", **metrics(p, y[te]),
+            "fit_s": fit.wall, "score_us_per_row": sc.wall / len(te) * 1e6}

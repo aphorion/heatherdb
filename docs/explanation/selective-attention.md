@@ -43,6 +43,18 @@ the learned ones. The latest weights carry the noise of the latest step;
 the average does not. (Brains separate fast learning from slow
 consolidation for the same reason.)
 
+## Learning what things are, too
+
+Attention decides which features and moments matter. The same loop can
+also decide what an identity means. A database can declare
+[symbol fields](../how-to/encode-identities-as-symbols.md): a product, a
+merchant, a job title is written as a value, and the database keeps a small
+code per value that each prediction error moves. A head's miss moves the
+codes of the values that made the prediction. A history's next value is
+scored against a few likely alternatives, so codes learn to tell values
+apart. Where values are many and each is rare, this does what fixed random
+codes cannot: a rarely seen value borrows from the values that behave like it.
+
 ## Is it supervised?
 
 Time attention is self-supervised: the target is the next write. Feature

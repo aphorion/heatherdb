@@ -27,6 +27,10 @@ system is used.
   memory is measured with every database loaded at once. Each incumbent runs
   in its own process or container and is measured alone, as it would be
   deployed.
+- Loads run as a bulk import: each HeatherDB database is created with
+  per-commit sync off (`PUT /db/{db}/durability`), as Postgres `COPY` with
+  `synchronous_commit=off`. The incumbents load into memory with no
+  per-write sync either. Reads are unaffected.
 - Incumbents use their library defaults or standard settings; no per-task
   tuning that HeatherDB doesn't also get.
 - Any step done client-side rather than in the engine is labelled in the

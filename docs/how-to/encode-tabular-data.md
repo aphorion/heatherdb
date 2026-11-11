@@ -12,7 +12,7 @@ only thing a read can ever see.
 
 | Class | Example column | Encoding |
 |---|---|---|
-| Identity | `category`, `merchant`, `country` | hash-seeded random symbol |
+| Identity | `category`, `merchant`, `country` | a [symbol field](encode-identities-as-symbols.md) the database learns; otherwise a hash-seeded random symbol |
 | Magnitude | `amount`, `duration`, `count` | one-hot bucket, weighted |
 | Cycle | `hour`, `weekday`, `heading` | `(sin, cos)` pair |
 | Set | `genres`, `tags`, `roles` | bundle the symbols, then normalise |
@@ -43,6 +43,13 @@ a gradient instead, use
 [fractional power encoding](encode-quantities-and-time.md).
 
 ## Identity columns become namespaced random symbols
+
+On a database with selective attention, prefer a
+[symbol field](encode-identities-as-symbols.md): send the value, and the
+database starts from this same hashed symbol and then learns what the value
+means. Measured on MovieLens and Amazon Employee Access, learned codes beat
+fixed random ones and matched one-hot on a small vocabulary. Hand-encode
+as below when the database does not learn symbols.
 
 Hash the feature string to a seed, draw a unit vector from it. Two different
 strings give near-orthogonal vectors; the same string always gives the same

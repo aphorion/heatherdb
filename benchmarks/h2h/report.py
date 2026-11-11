@@ -18,6 +18,7 @@ SPEC = {
     "recs":      ("ndcg@10", "hr@10", "Recommendations", "recommender model"),
     "fraud":     ("pr_auc", "roc_auc", "Fraud / anomaly detection", "outlier model"),
     "classify":  ("roc_auc", "pr_auc", "Propensity classification", "supervised model"),
+    "access":    ("roc_auc", "fit_s", "Access control", "supervised model on ids"),
 }
 LOWER_BETTER = {"p50_ms"}
 
@@ -41,6 +42,8 @@ def fmt(x, nd=3):
 lines = ["# Head-to-head: one HeatherDB vs the specialist stack", "",
          f"Run {R['started']} to {R['finished']} on {R['machine']['platform']}. "
          f"Engine `{R['heather']['version']}` at `{R['heather']['commit']} ({R['heather'].get('branch', '')})`.", ""]
+if R.get("merged"):
+    lines += [R["merged"], ""]
 
 # ---------------------------------------------------------------- accuracy
 lines += ["## Accuracy, same data, same task", "",
@@ -115,6 +118,8 @@ lines += [f"| **Specialist stack** | {n_sys} systems + a retraining scheduler | 
           f"HeatherDB serves all {len(R['tasks'])} capabilities from one process; its peak memory is "
           f"measured with every database loaded at once. Ratio: {total / h_cost:.1f}x lower monthly "
           f"infrastructure, {n_sys + 1} systems to 1."]
+if fp.get("estimate_note"):
+    lines += ["", f"HeatherDB peak memory, estimated in part: {fp['estimate_note']}."]
 
 (HERE / "results/REPORT.md").write_text("\n".join(lines) + "\n")
 print("\n".join(lines))

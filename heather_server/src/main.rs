@@ -341,6 +341,8 @@ async fn serve(args: Args) -> std::process::ExitCode {
         .route("/collections/{name}/recall", post(routes::recall))
         .route("/collections/{name}/novelty", post(routes::novelty))
         .route("/collections/{name}/next", get(routes::next))
+        .route("/collections/{name}/rows", post(routes::rows))
+        .route("/collections/{name}/predict", post(routes::predict))
         .route("/selective-attention", get(routes::selective_attention))
         .route("/collections/{name}/documents", get(routes::get_documents))
         .route(
@@ -440,6 +442,11 @@ async fn serve(args: Args) -> std::process::ExitCode {
             post(routes_db::recall),
         )
         .route("/db/{db}/collections/{name}/next", get(routes_db::next))
+        .route("/db/{db}/collections/{name}/rows", post(routes_db::rows))
+        .route(
+            "/db/{db}/collections/{name}/predict",
+            post(routes_db::predict),
+        )
         .route(
             "/db/{db}/collections/{name}/novelty",
             post(routes_db::novelty),

@@ -58,12 +58,22 @@ impl Hive {
         let attention = match &config.selective_attention {
             None => None,
             Some(att) => {
-                let state = match store
+                let mut state: crate::attention::AttentionState = match store
                     .load_metadata(crate::attention::STATE_SCOPE, crate::attention::STATE_KEY)?
                 {
                     Some(bytes) => bincode::deserialize(&bytes)?,
                     None => crate::attention::AttentionState::default(),
                 };
+                if let Some(bytes) = store
+                    .load_metadata(crate::attention::STATE_SCOPE, crate::attention::SCALES_KEY)?
+                {
+                    state.scales = bincode::deserialize(&bytes)?;
+                }
+                if let Some(sym) = &att.symbols {
+                    let records =
+                        store.load_metadata_prefix(crate::attention::STATE_SCOPE, "sym/")?;
+                    state.symbols = crate::symbols::SymbolTable::from_records(sym, &records)?;
+                }
                 Some(Arc::new(crate::attention::SharedAttention::new(
                     att.clone(),
                     config.d,
@@ -483,6 +493,8 @@ mod tests {
             feature_rate: 0.01,
             time_rate: 0.002,
             heads: [("y".to_string(), vec![d - 1])].into_iter().collect(),
+            symbols: None,
+            columns: None,
         });
         config.validate().unwrap();
         config
@@ -608,5 +620,330 @@ mod tests {
             after[0].novelty
         );
         assert!(col.novelty(std::slice::from_ref(&outside), 0).is_err());
+    }
+
+    fn symbol_config(
+        d: usize,
+        fields: &[&str],
+        heads: &[(&str, Vec<usize>)],
+        time: bool,
+    ) -> EAMConfig {
+        let mut config = EAMConfig::new(d).unwrap();
+        config.competitive = false;
+        config.selective_attention = Some(crate::attention::AttentionConfig {
+            time,
+            k: 50,
+            warmup: 16,
+            feature_rate: 0.01,
+            time_rate: 0.01,
+            heads: heads
+                .iter()
+                .map(|(n, d)| (n.to_string(), d.clone()))
+                .collect(),
+            symbols: Some(crate::symbols::SymbolConfig {
+                fields: fields.iter().map(|f| f.to_string()).collect(),
+                dims: 4,
+                rate: 0.05,
+                negatives: 5,
+            }),
+            columns: None,
+        });
+        config.validate().unwrap();
+        config
+    }
+
+    /// Rows: a noise number, an outcome slot, and a symbol `colour` with 200
+    /// rare values (about 7 rows each) in two hidden groups that decide the
+    /// outcome. A recall finds few rows with its own value, so it has to lean
+    /// on similar values; random starting codes cannot know which those are,
+    /// and the head's error must teach them.
+    #[test]
+    fn a_head_learns_symbol_codes_and_they_persist() {
+        use rand::{Rng, SeedableRng};
+        use std::collections::BTreeMap;
+        let dir = TempDir::new().unwrap();
+        // d = 2 numeric (noise, outcome) + 1 symbol slot.
+        let config = symbol_config(3, &["colour"], &[("y", vec![1])], false);
+        let mut rng = rand::rngs::StdRng::seed_from_u64(3);
+        let row = |rng: &mut rand::rngs::StdRng| {
+            let c = rng.gen_range(0..200u32);
+            let y = if c < 100 { 1.0 } else { 0.0 };
+            (
+                vec![rng.gen_range(-1.0..1.0), y],
+                BTreeMap::from([("colour".to_string(), format!("c{c}"))]),
+            )
+        };
+        let learned = {
+            let hive = Hive::open(dir.path(), config.clone(), 256).unwrap();
+            let col = hive.get_or_create_collection("rows").unwrap();
+            for _ in 0..30 {
+                let (nums, vals): (Vec<Vec<f64>>, Vec<BTreeMap<String, String>>) =
+                    (0..50).map(|_| row(&mut rng)).unzip();
+                col.write_batch_symbols(&nums, &vals).unwrap();
+            }
+            // A raw vector write cannot say which values it means.
+            assert!(col.write_batch(&[vec![0.0, 1.0, 0.0]]).is_err());
+            // A bad batch adds no value.
+            let before = hive
+                .attention()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .symbols
+                .clone();
+            let bad = vec![BTreeMap::from([("nope".to_string(), "x".to_string())])];
+            assert!(col.write_batch_symbols(&[vec![0.0, 1.0]], &bad).is_err());
+            assert_eq!(
+                hive.attention().unwrap().state.lock().unwrap().symbols,
+                before
+            );
+
+            // Codes learned the hidden groups: the groups separate.
+            let st = hive.attention().unwrap().state.lock().unwrap();
+            let sym = config
+                .selective_attention
+                .as_ref()
+                .unwrap()
+                .symbols
+                .as_ref()
+                .unwrap();
+            let learned_code = |c: u32| {
+                st.symbols
+                    .code(sym, 0, st.symbols.fields[0].ids[&format!("c{c}")])
+                    .to_vec()
+            };
+            let initial = |c: u32| crate::symbols::initial_code("colour", &format!("c{c}"), 4);
+            // Separation: squared gap between the groups' mean codes over the
+            // mean squared spread within a group.
+            let separation = |code: &dyn Fn(u32) -> Vec<f64>| {
+                let mean = |r: std::ops::Range<u32>| {
+                    let mut m = vec![0.0; 4];
+                    for c in r.clone() {
+                        for (a, x) in m.iter_mut().zip(code(c)) {
+                            *a += x / 100.0;
+                        }
+                    }
+                    m
+                };
+                let (ma, mb) = (mean(0..100), mean(100..200));
+                let gap: f64 = ma.iter().zip(&mb).map(|(a, b)| (a - b).powi(2)).sum();
+                let spread: f64 = (0..200u32)
+                    .map(|c| {
+                        let m = if c < 100 { &ma } else { &mb };
+                        code(c)
+                            .iter()
+                            .zip(m)
+                            .map(|(x, y)| (x - y).powi(2))
+                            .sum::<f64>()
+                    })
+                    .sum::<f64>()
+                    / 200.0;
+                gap / spread
+            };
+            let (before, after) = (separation(&initial), separation(&learned_code));
+            assert!(
+                after > 3.0 * before,
+                "separation before {before} after {after}"
+            );
+            st.clone()
+        };
+        let hive = Hive::open(dir.path(), config, 256).unwrap();
+        assert_eq!(*hive.attention().unwrap().state.lock().unwrap(), learned);
+        let col = hive.get_or_create_collection("rows").unwrap();
+        let mut right = 0;
+        for c in 0..200u32 {
+            let vals = BTreeMap::from([("colour".to_string(), format!("c{c}"))]);
+            let r = col
+                .attention_recall_symbols(&[0.0, 0.5], "y", &vals)
+                .unwrap();
+            assert_eq!(r.result.len(), 2, "the result is the numeric part");
+            if (r.result[1] > 0.5) == (c < 100) {
+                right += 1;
+            }
+        }
+        assert!(right >= 190, "{right}/200");
+    }
+
+    /// Per-user collections of an `item` symbol where item 2k is followed
+    /// by 2k+1: next-value learning, shared across collections, ranks the
+    /// follower first.
+    #[test]
+    fn next_values_rank_the_learned_follower() {
+        use rand::{Rng, SeedableRng};
+        use std::collections::BTreeMap;
+        let dir = TempDir::new().unwrap();
+        let config = symbol_config(1, &["item"], &[], true);
+        let hive = Hive::open(dir.path(), config, 256).unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        for u in 0..2000 {
+            let col = hive.get_or_create_collection(&format!("user_{u}")).unwrap();
+            let mut vals = Vec::new();
+            for _ in 0..6 {
+                let a = 2 * rng.gen_range(0..20u32);
+                for x in [a, a + 1] {
+                    vals.push(BTreeMap::from([("item".to_string(), format!("i{x}"))]));
+                }
+            }
+            let nums = vec![Vec::<f64>::new(); vals.len()];
+            col.write_batch_symbols(&nums, &vals).unwrap();
+        }
+        let mut right = 0;
+        for k in 0..20u32 {
+            let col = hive
+                .get_or_create_collection(&format!("probe_{k}"))
+                .unwrap();
+            for x in [2 * ((k + 7) % 20), 2 * k] {
+                let vals = vec![BTreeMap::from([("item".to_string(), format!("i{x}"))])];
+                col.write_batch_symbols(&[Vec::<f64>::new()], &vals)
+                    .unwrap();
+            }
+            let top = col.attention_next_values("item", 1, true).unwrap();
+            if top[0].0 == format!("i{}", 2 * k + 1) {
+                right += 1;
+            }
+        }
+        assert!(right >= 16, "{right}/20");
+        assert!(
+            hive.get_or_create_collection("user_0")
+                .unwrap()
+                .attention_next()
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A database declared by columns: rows written by name, a category that
+    /// decides the outcome, a heavy-tailed number that does not, and the
+    /// outcome predicted by name. Scales persist and a bad row changes nothing.
+    #[test]
+    fn a_column_database_predicts_by_name() {
+        use crate::columns::{Cell, Column, Row, plan};
+        use rand::{Rng, SeedableRng};
+        let dir = TempDir::new().unwrap();
+        let cols = vec![
+            Column::category("role"),
+            Column::number("amount"),
+            Column::number("granted"),
+        ];
+        let (d, att) = plan(cols, &["granted".into()], false).unwrap();
+        let mut config = EAMConfig::new(d).unwrap();
+        config.competitive = false;
+        config.selective_attention = Some(att);
+        config.validate().unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(5);
+        let row = |rng: &mut rand::rngs::StdRng| -> Row {
+            let r = rng.gen_range(0..40u32);
+            Row::from([
+                ("role".into(), Cell::Text(format!("r{r}"))),
+                (
+                    "amount".into(),
+                    Cell::Number(10f64.powf(rng.gen_range(0.0..6.0))),
+                ),
+                (
+                    "granted".into(),
+                    Cell::Number(if r < 20 { 1.0 } else { 0.0 }),
+                ),
+            ])
+        };
+        let ask = |r: u32| {
+            Row::from([
+                ("role".into(), Cell::Text(format!("r{r}"))),
+                ("amount".into(), Cell::Number(500.0)),
+            ])
+        };
+        let (scales, probe) = {
+            let hive = Hive::open(dir.path(), config.clone(), 256).unwrap();
+            let col = hive.get_or_create_collection("requests").unwrap();
+            for _ in 0..30 {
+                let batch: Vec<Row> = (0..50).map(|_| row(&mut rng)).collect();
+                col.write_rows(&batch).unwrap();
+            }
+            let scales = hive
+                .attention()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .scales
+                .clone();
+            assert!(scales["amount"].scale(1000.0).abs() < 1.0);
+            assert!(
+                !scales.contains_key("granted"),
+                "a predicted column keeps its units"
+            );
+            let mut bad = row(&mut rng);
+            bad.remove("role");
+            assert!(col.write_rows(&[row(&mut rng), bad]).is_err());
+            assert_eq!(
+                hive.attention().unwrap().state.lock().unwrap().scales,
+                scales,
+                "a failed write leaves the statistics as they were"
+            );
+            let mut right = 0;
+            for r in 0..40u32 {
+                let (p, _) = col.predict(&ask(r), "granted").unwrap();
+                if (p > 0.5) == (r < 20) {
+                    right += 1;
+                }
+            }
+            assert!(right >= 36, "{right}/40");
+            assert!(
+                col.predict(&ask(0), "role").is_err(),
+                "only declared columns"
+            );
+            assert!(
+                col.write_batch(&[vec![0.0; d]]).is_err(),
+                "rows by name only"
+            );
+
+            // Novelty by row: an ordinary request fits, a strange one stands out.
+            let usual = Row::from([
+                ("role".into(), Cell::Text("r3".into())),
+                ("amount".into(), Cell::Number(300.0)),
+            ]);
+            let odd = Row::from([
+                ("role".into(), Cell::Text("never-seen".into())),
+                ("amount".into(), Cell::Number(1e12)),
+            ]);
+            let nov = col.novelty_rows(&[usual.clone(), odd.clone()], 20).unwrap();
+            assert!(nov[0].novelty < 1.5, "usual: {}", nov[0].novelty);
+            assert!(
+                nov[1].novelty > 2.0 * nov[0].novelty,
+                "odd: {}",
+                nov[1].novelty
+            );
+            assert_eq!(nov[0].nearest.len(), 20);
+            let mut partial = usual.clone();
+            partial.remove("amount");
+            assert!(
+                col.novelty_rows(&[partial], 20).is_err(),
+                "every feature column"
+            );
+            assert!(
+                col.novelty(&[vec![0.0; d]], 20).is_err(),
+                "vectors mean nothing here"
+            );
+            // A write moves what is learned: the cached neighbourhood follows.
+            col.write_rows(&[row(&mut rng)]).unwrap();
+            let again = col.novelty_rows(&[odd], 20).unwrap();
+            assert!(again[0].novelty > 2.0 * nov[0].novelty);
+            let now = hive
+                .attention()
+                .unwrap()
+                .state
+                .lock()
+                .unwrap()
+                .scales
+                .clone();
+            (now, col.predict(&ask(3), "granted").unwrap().0)
+        };
+        let hive = Hive::open(dir.path(), config, 256).unwrap();
+        assert_eq!(
+            hive.attention().unwrap().state.lock().unwrap().scales,
+            scales
+        );
+        let col = hive.get_or_create_collection("requests").unwrap();
+        assert_eq!(col.predict(&ask(3), "granted").unwrap().0, probe);
     }
 }

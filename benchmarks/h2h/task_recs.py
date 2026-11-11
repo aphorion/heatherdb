@@ -252,3 +252,50 @@ def run_als_recency(R, test_item, eval_users):
     res = evaluate(lambda u: itf @ uf[u], R, test_item, eval_users)
     return {"system": "ALS + recency (time-decayed confidence)", **res, "fit_s": fit.wall,
             "retrain_to_add_new_user_s": fit.wall}
+
+
+
+
+def run_heather_sym(h, R, test_item, eval_users, hist):
+    """HeatherDB with selective attention and the item as a learned symbol:
+    no item encoding at all. Every user's training interactions (all users,
+    the data ALS trains on) are written in global time order as
+    `{"item": id}` rows, one collection per user; the database learns item
+    codes and recency from predicting each next write. `next?field=item`
+    ranks the catalogue."""
+    r = data.movielens_1m()
+    _, u_idx = np.unique(r[:, 0], return_inverse=True)
+    _, i_idx = np.unique(r[:, 1], return_inverse=True)
+    o = np.lexsort((i_idx, r[:, 3], u_idx))
+    last = np.zeros(len(r), bool)
+    last[o[np.r_[np.nonzero(np.diff(u_idx[o]))[0], len(o) - 1]]] = True
+    keep = ~last
+    stream = np.lexsort((i_idx[keep], u_idx[keep], r[keep, 3]))
+    su, si = u_idx[keep][stream], i_idx[keep][stream]
+    h.create_columns_db("recs_sym", {"item": "category"}, sequence=True)
+    with Meter() as load_t:
+        i = 0
+        while i < len(su):
+            j = i
+            while j < len(su) and su[j] == su[i]:
+                j += 1
+            h.call("POST", f"/db/recs_sym/collections/user_{su[i]}/rows",
+                   {"rows": [{"item": str(x)} for x in si[i:j]]})
+            i = j
+    n_items = R.shape[1]
+
+    def score(u):
+        res = h.call("GET", f"/db/recs_sym/collections/user_{u}/next?column=item&n={n_items}")
+        s = np.full(n_items, -np.inf)
+        for v in res["values"]:
+            s[int(v["value"])] = v["score"]
+        return s
+
+    with Meter() as serve:
+        res = evaluate(score, R, test_item, eval_users)
+    learned = h.call("GET", "/db/recs_sym/selective-attention")["time"]
+    return {"system": "HeatherDB (learned item symbols)", **res, "load_s": load_t.wall,
+            "serve_ms_per_user": serve.wall / len(eval_users) * 1000,
+            "learned_time_weights": [round(w / max(learned["weights"][0], 1e-12), 3)
+                                     for w in learned["weights"]],
+            "time_updates": learned["updates"]}

@@ -20,6 +20,9 @@ records the checks, evidence and remaining release conditions.
 - **[Getting started](getting-started.md)** — install the engine on macOS,
   Linux, Windows or Docker, or embed it as a Rust library; boot it and read a
   corrupted vector back. Ten minutes.
+- **[HeatherDB in 10 minutes](tutorials/heatherdb-in-10-minutes.md)** — score
+  customers and recommend the next song from rows you write, with no model
+  and no encoding.
 
 ## Tutorials
 
@@ -87,6 +90,10 @@ Nine lessons in order, each turning on one result you produce yourself.
 
 ### Designing an encoding
 
+- [Describe your data with columns](how-to/describe-your-data-with-columns.md) —
+  name your columns and what to predict; HeatherDB does the encoding.
+- [Encode identities as symbols](how-to/encode-identities-as-symbols.md) —
+  send ids and categories as values; the database learns their codes.
 - [Encode tabular data](how-to/encode-tabular-data.md) — identity, magnitude,
   cycle, set: one column at a time.
 - [Encode text](how-to/encode-text.md) — embedding, hashed, or self-formed.

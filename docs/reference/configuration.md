@@ -180,6 +180,33 @@ outcome = [51, 52]
 
 At least one head or `time = true` is required.
 
+Symbol fields, learned identities (see
+[Encode identities as symbols](../how-to/encode-identities-as-symbols.md)),
+take the last slots of each row:
+
+```toml
+[eam.selective_attention.symbols]
+fields = ["resource", "manager"]
+dims = 8
+rate = 0.01
+negatives = 5
+```
+
+The numeric part is the first `d − len(fields)` dimensions; heads name only
+numeric dimensions.
+
+A database created with `columns` (see
+[Describe your data with columns](../how-to/describe-your-data-with-columns.md))
+records them here. HeatherDB writes this section and the heads, symbols and
+`time` it implies; don't edit it by hand:
+
+```toml
+[[eam.selective_attention.columns]]
+name = "amount"
+kind = "number"
+size = 1
+```
+
 Validation, enforced whenever a config is built or merged:
 
 - `d > 0`, `k > 0`, `t_max > 0`

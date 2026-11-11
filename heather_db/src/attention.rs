@@ -64,9 +64,33 @@ pub struct AttentionConfig {
     #[serde(default = "default_time_rate")]
     pub time_rate: f64,
     /// Named fields to predict: head name → the dimensions it fills in.
-    /// Last, so it serialises as a TOML table after the scalars.
+    /// After the scalars, so it serialises as a TOML table.
     #[serde(default)]
     pub heads: BTreeMap<String, Vec<usize>>,
+    /// Symbol fields whose codes the memory learns (see [`crate::symbols`]).
+    /// They take the last slots of each row; heads name numeric dimensions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbols: Option<crate::symbols::SymbolConfig>,
+    /// The columns the database was declared with (see [`crate::columns`]);
+    /// `None` for a database written as vectors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub columns: Option<Vec<crate::columns::Column>>,
+}
+
+impl Default for AttentionConfig {
+    /// No heads, no time: add at least one before use.
+    fn default() -> Self {
+        AttentionConfig {
+            time: false,
+            k: default_k(),
+            warmup: default_warmup(),
+            feature_rate: default_feature_rate(),
+            time_rate: default_time_rate(),
+            heads: BTreeMap::new(),
+            symbols: None,
+            columns: None,
+        }
+    }
 }
 
 fn default_k() -> usize {
@@ -91,6 +115,20 @@ impl AttentionConfig {
         }
         if self.k == 0 {
             return bad("attention.k must be > 0".into());
+        }
+        let numeric = match &self.symbols {
+            Some(sym) => {
+                sym.validate(d)?;
+                sym.numeric(d)
+            }
+            None => d,
+        };
+        for (name, dims) in &self.heads {
+            if let Some(&i) = dims.iter().find(|&&i| i >= numeric && i < d) {
+                return bad(format!(
+                    "attention head {name:?} names dimension {i}, a symbol slot; heads fill numeric dimensions"
+                ));
+            }
         }
         for (rate, name) in [
             (self.feature_rate, "feature_rate"),
@@ -136,11 +174,19 @@ impl AttentionConfig {
     }
 
     /// A boolean mask over `d` dimensions: `true` where `head` fills in.
+    /// Width of the rows attention compares: `d`, or with symbols the
+    /// numeric part plus every field's code.
+    pub fn width(&self, d: usize) -> usize {
+        self.symbols.as_ref().map_or(d, |s| s.width(d))
+    }
+
+    /// A boolean mask over the compared row (see [`Self::width`]): `true`
+    /// where `head` fills in.
     pub fn mask(&self, head: &str, d: usize) -> Result<Vec<bool>> {
         let dims = self.heads.get(head).ok_or_else(|| {
             HeatherError::InvalidConfig(format!("no attention head named {head:?}"))
         })?;
-        let mut m = vec![false; d];
+        let mut m = vec![false; self.width(d)];
         for &i in dims {
             m[i] = true;
         }
@@ -226,6 +272,32 @@ impl Default for TimeState {
 pub struct AttentionState {
     pub heads: BTreeMap<String, HeadState>,
     pub time: TimeState,
+    /// Learned symbols: the live table. Saved as per-value records (see
+    /// [`crate::symbols::SymbolTable::changed_records`]), not in this record,
+    /// and never copied by a write: writes change it in place under the
+    /// lock and undo it on failure.
+    #[serde(skip)]
+    pub symbols: crate::symbols::SymbolTable,
+    /// Running statistics of the number columns (see [`crate::columns`]).
+    /// Saved under [`SCALES_KEY`], beside this record.
+    #[serde(skip)]
+    pub scales: crate::columns::Scales,
+    /// Committed writes since the database opened: what is learned changes
+    /// only when this does. Not saved.
+    #[serde(skip)]
+    pub generation: Generation,
+}
+
+/// A count of committed writes, for telling when cached views of what is
+/// learned are stale. Not itself something learned: it takes no part in
+/// comparing states, and a reopened database starts it again.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Generation(pub u64);
+
+impl PartialEq for Generation {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 /// One row's share of a recall.
@@ -365,6 +437,26 @@ pub fn learn_head(
     mask: &[bool],
     cfg: &AttentionConfig,
 ) -> Option<f64> {
+    learn_head_ex(head, x, rows, mask, cfg).map(|(loss, _)| loss)
+}
+
+/// What one head step says about the rows themselves: the loss gradient with
+/// respect to the query row and to each neighbour row that made the
+/// prediction. Symbol learning moves codes along these.
+#[derive(Debug, Clone, Default)]
+pub struct RowGrads {
+    pub query: Vec<f64>,
+    pub rows: Vec<(usize, Vec<f64>)>,
+}
+
+/// [`learn_head`], also returning [`RowGrads`].
+pub fn learn_head_ex(
+    head: &mut HeadState,
+    x: &[f64],
+    rows: &[&[f64]],
+    mask: &[bool],
+    cfg: &AttentionConfig,
+) -> Option<(f64, RowGrads)> {
     if rows.len() < cfg.warmup.max(2) {
         return None;
     }
@@ -391,6 +483,10 @@ pub fn learn_head(
     //   2 w_l Σ_j err_j (row_lj − pred_j)
     // and dD_l/dθ_d = α_d (x_d − row_ld)², so dL/dθ_d = −α_d Σ_l g_l (x_d − row_ld)².
     let mut grad = vec![0.0; d];
+    let mut rg = RowGrads {
+        query: vec![0.0; d],
+        rows: Vec::with_capacity(cands.len()),
+    };
     for (c, &wi) in cands.iter().zip(&w) {
         let row = rows[c.0];
         let g: f64 = 2.0
@@ -404,17 +500,23 @@ pub fn learn_head(
         if g == 0.0 {
             continue;
         }
+        // Score s_l = −D_l with D_l = Σ α_j (x_j − row_lj)²:
+        // dL/dx_j += g·(−2α_j (x_j − row_lj)), dL/drow_lj = g·2α_j (x_j − row_lj).
+        let mut gr = vec![0.0; d];
         for j in (0..d).filter(|&j| !mask[j]) {
             let diff = x[j] - row[j];
             grad[j] -= g * alpha[j] * diff * diff;
+            rg.query[j] -= g * 2.0 * alpha[j] * diff;
+            gr[j] = g * 2.0 * alpha[j] * diff;
         }
+        rg.rows.push((c.0, gr));
     }
     head.adam.update(&mut head.theta, &grad, cfg.feature_rate);
     for t in head.theta.iter_mut() {
         *t = t.clamp(-THETA_BOUND, THETA_BOUND);
     }
     head.updates += 1;
-    Some(loss)
+    Some((loss, rg))
 }
 
 /// Bucket sums of a history given newest first: row `b` is the sum of the
@@ -478,7 +580,14 @@ pub fn learn_time(
         .iter()
         .map(|fb| 2.0 * fb.iter().zip(&err).map(|(a, e)| a * e).sum::<f64>())
         .collect();
-    time.adam.update(&mut time.tau, &grad, rate);
+    step_time(time, &grad, rate);
+    Some(loss)
+}
+
+/// One Adam step on the time attention from a bucket gradient, then
+/// consolidation.
+pub fn step_time(time: &mut TimeState, grad: &[f64], rate: f64) {
+    time.adam.update(&mut time.tau, grad, rate);
     for t in time.tau.iter_mut() {
         *t = t.max(0.0);
     }
@@ -487,7 +596,6 @@ pub fn learn_time(
     for (c, t) in time.consolidated.iter_mut().zip(&time.tau) {
         *c += (t - *c) * r;
     }
-    Some(loss)
 }
 
 /// Where a database keeps its attention state: per-collection metadata under
@@ -495,6 +603,8 @@ pub fn learn_time(
 pub const STATE_SCOPE: u32 = u32::MAX;
 /// The metadata key of the attention state.
 pub const STATE_KEY: &str = "attention";
+/// Metadata key of the number columns' running statistics.
+pub const SCALES_KEY: &str = "scales";
 
 /// A database's attention: its fixed configuration and its learned state,
 /// shared by every collection of the database.
@@ -512,6 +622,20 @@ impl SharedAttention {
             config,
             state: std::sync::Mutex::new(state),
             d,
+        }
+    }
+
+    /// Width of the rows attention compares.
+    pub fn width(&self) -> usize {
+        self.config.width(self.d)
+    }
+
+    /// The numeric slots a column database scales (see [`crate::columns`]);
+    /// empty for a database written as vectors.
+    pub fn scaled_slots(&self) -> Vec<(usize, String)> {
+        match &self.config.columns {
+            Some(cols) => crate::columns::scaled_slots(cols, &self.config.heads),
+            None => Vec::new(),
         }
     }
 
@@ -537,9 +661,14 @@ pub fn learn_from_rows(
     config: &AttentionConfig,
     masks: &[(String, Vec<bool>)],
     state: &mut AttentionState,
+    symbols: &mut crate::symbols::SymbolTable,
     rows_by_id: &[&[f64]],
     x: &[f64],
 ) {
+    if let Some(sym) = &config.symbols {
+        learn_symbolic(config, sym, masks, state, symbols, rows_by_id, x);
+        return;
+    }
     for (name, mask) in masks {
         let head = state.heads.entry(name.clone()).or_default();
         learn_head(head, x, rows_by_id, mask, config);
@@ -547,6 +676,68 @@ pub fn learn_from_rows(
     if config.time {
         let history: Vec<&[f64]> = rows_by_id.iter().rev().copied().collect();
         learn_time(&mut state.time, x, &history, config.time_rate);
+    }
+}
+
+/// [`learn_from_rows`] for a database with symbols: stored rows carry value
+/// ids in their symbol slots. Heads learn on the assembled rows (numeric part
+/// plus current codes) and their error also moves the codes; with `time`,
+/// each symbol field takes a next-value step and the numeric part (if any)
+/// a time step.
+fn learn_symbolic(
+    config: &AttentionConfig,
+    sym: &crate::symbols::SymbolConfig,
+    masks: &[(String, Vec<bool>)],
+    state: &mut AttentionState,
+    table: &mut crate::symbols::SymbolTable,
+    rows_by_id: &[&[f64]],
+    x: &[f64],
+) {
+    use crate::symbols::SymbolTable;
+    let fields = sym.fields.len();
+    let dn = x.len() - fields;
+    if !masks.is_empty() {
+        let assembled: Vec<Vec<f64>> = rows_by_id.iter().map(|r| table.assemble(sym, r)).collect();
+        let refs: Vec<&[f64]> = assembled.iter().map(|r| r.as_slice()).collect();
+        let xa = table.assemble(sym, x);
+        let mut grads = vec![BTreeMap::new(); fields];
+        for (name, mask) in masks {
+            let head = state.heads.entry(name.clone()).or_default();
+            if let Some((_, rg)) = learn_head_ex(head, &xa, &refs, mask, config) {
+                SymbolTable::accumulate(sym, x, &rg.query, &mut grads);
+                for (r, g) in &rg.rows {
+                    SymbolTable::accumulate(sym, rows_by_id[*r], g, &mut grads);
+                }
+            }
+        }
+        for (f, g) in grads.iter().enumerate() {
+            table.step(sym, f, g);
+        }
+    }
+    if config.time && rows_by_id.len() >= 2 {
+        let newest_first: Vec<&[f64]> = rows_by_id.iter().rev().copied().collect();
+        if dn > 0 {
+            let numeric: Vec<&[f64]> = newest_first.iter().map(|r| &r[..dn]).collect();
+            learn_time(&mut state.time, &x[..dn], &numeric, config.time_rate);
+        }
+        let mut g_tau = vec![0.0; TIME_BUCKETS];
+        let mut any = false;
+        for f in 0..fields {
+            let hist: Vec<u32> = newest_first.iter().map(|r| r[dn + f] as u32).collect();
+            let seed = state.time.updates.wrapping_mul(31).wrapping_add(f as u64);
+            let tau = state.time.tau.clone();
+            if let Some(g) =
+                crate::symbols::learn_next(sym, table, f, &tau, &hist, x[dn + f] as u32, seed)
+            {
+                for (a, b) in g_tau.iter_mut().zip(&g) {
+                    *a += b;
+                }
+                any = true;
+            }
+        }
+        if any {
+            step_time(&mut state.time, &g_tau, config.time_rate);
+        }
     }
 }
 
@@ -567,6 +758,8 @@ mod tests {
             warmup: default_warmup(),
             feature_rate: default_feature_rate(),
             time_rate: default_time_rate(),
+            symbols: None,
+            columns: None,
         }
     }
 

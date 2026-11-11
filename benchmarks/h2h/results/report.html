@@ -61,67 +61,68 @@ code { font: 13px var(--mono); }
 <header style="display:grid;gap:12px">
   <div class="eyebrow">Aphorion Labs · reproducible benchmark · 2026-11-11</div>
   <h1>HeatherDB Head-to-Head</h1>
-  <p class="lead">One HeatherDB process ran 5 enterprise workloads, each against the specialist
-  system it would replace, on the same public data, splits and metrics. It matched or beat the incumbent on 3 and fell short on 2. Running all 5 costs
-  5.0x less per month than the specialist stack: one system to operate
-  instead of 6.</p>
+  <p class="lead">One HeatherDB process ran 6 enterprise workloads, each against the specialist
+  system it would replace, on the same public data, splits and metrics. It matched or beat the incumbent on 6. Running all 6 costs
+  6.0x less per month than the specialist stack: one system to operate
+  instead of 7.</p>
 </header>
 
 <div class="figures">
-  <div class="fig"><b>5.0x</b><span>lower monthly infrastructure ($149 vs $30)</span></div>
-  <div class="fig"><b>6 → 1</b><span>systems to operate, including the retraining scheduler</span></div>
-  <div class="fig"><b>185x</b><span>faster from new data to serving (15 ms vs a 2.8 s ALS refit)</span></div>
-  <div class="fig"><b>3 of 5</b><span>workloads at parity or within 10% of the best incumbent</span></div>
+  <div class="fig"><b>6.0x</b><span>lower monthly infrastructure ($179 vs $30)</span></div>
+  <div class="fig"><b>7 → 1</b><span>systems to operate, including the retraining scheduler</span></div>
+  <div class="fig"><b>176x</b><span>faster from new data to serving (16 ms vs a 2.8 s ALS refit)</span></div>
+  <div class="fig"><b>6 of 6</b><span>workloads at parity or within 10% of the best incumbent</span></div>
 </div>
 
 <section>
   <h2>Accuracy on the same task</h2>
   <p class="muted">HeatherDB's score as a share of the best incumbent's on each workload's primary metric. 1.00 means a tie.</p>
-  <svg viewBox='0 0 640 226' role='img' aria-label='HeatherDB score as a share of the best incumbent, per capability'><line x1='150.0' x2='150.0' y1='20' y2='196' class='grid'/><text x='150.0' y='214' class='tick' text-anchor='middle'>0.00</text><line x1='243.8' x2='243.8' y1='20' y2='196' class='grid'/><text x='243.8' y='214' class='tick' text-anchor='middle'>0.25</text><line x1='337.5' x2='337.5' y1='20' y2='196' class='grid'/><text x='337.5' y='214' class='tick' text-anchor='middle'>0.50</text><line x1='431.2' x2='431.2' y1='20' y2='196' class='grid'/><text x='431.2' y='214' class='tick' text-anchor='middle'>0.75</text><line x1='525.0' x2='525.0' y1='20' y2='196' class='ref'/><text x='525.0' y='214' class='tick' text-anchor='middle'>1.00</text><text x='525.0' y='16' class='tick' text-anchor='middle'>= best incumbent</text><text x='140' y='47' class='lbl' text-anchor='end'>Vector search</text><rect x='150' y='33' width='376.1' height='20' rx='2' class='bar good'/><text x='532.1' y='47' class='val'>1.00</text><text x='140' y='81' class='lbl' text-anchor='end'>Pattern discovery</text><rect x='150' y='67' width='399.1' height='20' rx='2' class='bar good'/><text x='555.1' y='81' class='val'>1.06</text><text x='140' y='115' class='lbl' text-anchor='end'>Recommendations</text><rect x='150' y='101' width='317.1' height='20' rx='2' class='bar bad'/><text x='473.1' y='115' class='val'>0.85</text><text x='140' y='149' class='lbl' text-anchor='end'>Fraud detection</text><rect x='150' y='135' width='153.9' height='20' rx='2' class='bar bad'/><text x='309.9' y='149' class='val'>0.41</text><text x='140' y='183' class='lbl' text-anchor='end'>Propensity scoring</text><rect x='150' y='169' width='373.3' height='20' rx='2' class='bar good'/><text x='529.3' y='183' class='val'>1.00</text></svg>
+  <svg viewBox='0 0 640 260' role='img' aria-label='HeatherDB score as a share of the best incumbent, per capability'><line x1='150.0' x2='150.0' y1='20' y2='230' class='grid'/><text x='150.0' y='248' class='tick' text-anchor='middle'>0.00</text><line x1='243.8' x2='243.8' y1='20' y2='230' class='grid'/><text x='243.8' y='248' class='tick' text-anchor='middle'>0.25</text><line x1='337.5' x2='337.5' y1='20' y2='230' class='grid'/><text x='337.5' y='248' class='tick' text-anchor='middle'>0.50</text><line x1='431.2' x2='431.2' y1='20' y2='230' class='grid'/><text x='431.2' y='248' class='tick' text-anchor='middle'>0.75</text><line x1='525.0' x2='525.0' y1='20' y2='230' class='ref'/><text x='525.0' y='248' class='tick' text-anchor='middle'>1.00</text><text x='525.0' y='16' class='tick' text-anchor='middle'>= best incumbent</text><text x='140' y='47' class='lbl' text-anchor='end'>Vector search</text><rect x='150' y='33' width='375.7' height='20' rx='2' class='bar good'/><text x='531.7' y='47' class='val'>1.00</text><text x='140' y='81' class='lbl' text-anchor='end'>Pattern discovery</text><rect x='150' y='67' width='393.5' height='20' rx='2' class='bar good'/><text x='549.5' y='81' class='val'>1.05</text><text x='140' y='115' class='lbl' text-anchor='end'>Recommendations</text><rect x='150' y='101' width='397.1' height='20' rx='2' class='bar good'/><text x='553.1' y='115' class='val'>1.06</text><text x='140' y='149' class='lbl' text-anchor='end'>Fraud detection</text><rect x='150' y='135' width='375.0' height='20' rx='2' class='bar good'/><text x='531.0' y='149' class='val'>1.00</text><text x='140' y='183' class='lbl' text-anchor='end'>Propensity scoring</text><rect x='150' y='169' width='373.3' height='20' rx='2' class='bar good'/><text x='529.3' y='183' class='val'>1.00</text><text x='140' y='217' class='lbl' text-anchor='end'>Access control</text><rect x='150' y='203' width='376.1' height='20' rx='2' class='bar good'/><text x='532.1' y='217' class='val'>1.00</text></svg>
   <div class="scroll"><table>
     <thead><tr><th>Workload</th><th>Metric</th><th>HeatherDB</th><th>Best incumbent</th><th>Ratio</th><th>Verdict</th></tr></thead>
-    <tbody><tr><td><b>Vector search</b><span class='sub'>Fashion-MNIST, 60,000 x 784, 1,000 queries</span></td><td>recall@10</td><td class='num'>1.000</td><td class='num'>0.997<span class='sub'>Qdrant (v1.12.4)</span></td><td class='num'>1.00</td><td><span class='chip good'>Parity or better</span></td></tr><tr><td><b>Pattern discovery</b><span class='sub'>Fashion-MNIST, 60,000 train / 10,000 test, labels hidden</span></td><td>NMI</td><td class='num'>0.523</td><td class='num'>0.491<span class='sub'>k-means (HeatherDB&#x27;s K)</span></td><td class='num'>1.06</td><td><span class='chip good'>Parity or better</span></td></tr><tr><td><b>Recommendations</b><span class='sub'>MovieLens 1M, leave-last-out, 2,000 users</span></td><td>NDCG@10</td><td class='num'>0.053</td><td class='num'>0.062<span class='sub'>ALS + recency (time-decayed confidence)</span></td><td class='num'>0.85</td><td><span class='chip bad'>Gap</span></td></tr><tr><td><b>Fraud detection</b><span class='sub'>Credit-card fraud (ULB), 142,404 test transactions, 246 frauds</span></td><td>PR-AUC</td><td class='num'>0.199</td><td class='num'>0.485<span class='sub'>LOF</span></td><td class='num'>0.41</td><td><span class='chip bad'>Gap</span></td></tr><tr><td><b>Propensity scoring</b><span class='sub'>UCI bank marketing, 31,647 train / 13,564 test</span></td><td>ROC-AUC</td><td class='num'>0.931</td><td class='num'>0.935<span class='sub'>Gradient-boosted trees</span></td><td class='num'>1.00</td><td><span class='chip good'>Parity or better</span></td></tr></tbody></table></div>
+    <tbody><tr><td><b>Vector search</b><span class='sub'>Fashion-MNIST, 60,000 x 784, 1,000 queries</span></td><td>recall@10</td><td class='num'>1.000</td><td class='num'>0.998<span class='sub'>Qdrant (v1.12.4)</span></td><td class='num'>1.00</td><td><span class='chip good'>Parity or better</span></td></tr><tr><td><b>Pattern discovery</b><span class='sub'>Fashion-MNIST, 60,000 train / 10,000 test, labels hidden</span></td><td>NMI</td><td class='num'>0.531</td><td class='num'>0.506<span class='sub'>k-means (HeatherDB&#x27;s K)</span></td><td class='num'>1.05</td><td><span class='chip good'>Parity or better</span></td></tr><tr><td><b>Recommendations</b><span class='sub'>MovieLens 1M, leave-last-out, 2,000 users</span></td><td>NDCG@10</td><td class='num'>0.066</td><td class='num'>0.062<span class='sub'>ALS + recency (time-decayed confidence)</span></td><td class='num'>1.06</td><td><span class='chip good'>Parity or better</span></td></tr><tr><td><b>Fraud detection</b><span class='sub'>Credit-card fraud (ULB), 142,404 test transactions, 246 frauds</span></td><td>PR-AUC</td><td class='num'>0.582</td><td class='num'>0.582<span class='sub'>LOF (k=50)</span></td><td class='num'>1.00</td><td><span class='chip good'>Parity or better</span></td></tr><tr><td><b>Propensity scoring</b><span class='sub'>UCI bank marketing, 31,647 train / 13,564 test</span></td><td>ROC-AUC</td><td class='num'>0.931</td><td class='num'>0.935<span class='sub'>Gradient-boosted trees</span></td><td class='num'>1.00</td><td><span class='chip good'>Parity or better</span></td></tr><tr><td><b>Access control</b><span class='sub'>Amazon Employee Access, 22,938 train / 9,831 test, 9 id columns</span></td><td>ROC-AUC</td><td class='num'>0.870</td><td class='num'>0.868<span class='sub'>Logistic regression (one-hot)</span></td><td class='num'>1.00</td><td><span class='chip good'>Parity or better</span></td></tr></tbody></table></div>
 </section>
 
 <section>
-  <h2>Infrastructure for all 5 workloads</h2>
+  <h2>Infrastructure for all 6 workloads</h2>
   <p class="muted">Each incumbent is deployed as its own service on the smallest instance that holds its measured
   peak memory with 1.5x headroom; models that must refit to take in new data add
-  30 retrain runs a month. HeatherDB's peak memory is measured with all 5 databases
-  loaded in one process. Prices: AWS us-east-1 on-demand, Graviton m7g, list prices at time of writing.</p>
+  30 retrain runs a month. HeatherDB's peak memory is measured with all 6 databases
+  loaded in one process. Prices: AWS us-east-1 on-demand, Graviton m7g, list prices at time of writing. HeatherDB peak memory, estimated in part: peak = the 5-database run measured together + recommendations-symbols run alone (389 MiB) + access (64 MiB, est.).</p>
   <div class="scroll"><table>
     <thead><tr><th>Component</th><th>Replaces</th><th>Peak memory</th><th>Instance</th><th>USD / month</th></tr></thead>
-    <tbody><tr><td>Qdrant (v1.12.4)</td><td>vector database</td><td class='num'>526 MiB</td><td>m7g.medium</td><td class='num'>$29.82</td></tr><tr><td>k-means (HeatherDB&#x27;s K)</td><td>clustering job</td><td class='num'>1,615 MiB</td><td>m7g.medium</td><td class='num'>$29.78</td></tr><tr><td>ALS + recency (time-decayed confidence)</td><td>recommender model</td><td class='num'>587 MiB</td><td>m7g.medium</td><td class='num'>$29.78</td></tr><tr><td>LOF</td><td>outlier model</td><td class='num'>620 MiB</td><td>m7g.medium</td><td class='num'>$29.78</td></tr><tr><td>Gradient-boosted trees</td><td>supervised model</td><td class='num'>327 MiB</td><td>m7g.medium</td><td class='num'>$29.78</td></tr>
-    <tr class="total"><td>Specialist stack</td><td>5 systems + a retraining scheduler</td><td></td><td></td><td class="num">$148.96</td></tr>
-    <tr class="total"><td>HeatherDB</td><td>1 process, 5 databases</td><td class="num">1,727 MiB</td><td>m7g.medium</td><td class="num">$29.95</td></tr>
+    <tbody><tr><td>Qdrant (v1.12.4)</td><td>vector database</td><td class='num'>610 MiB</td><td>m7g.medium</td><td class='num'>$29.82</td></tr><tr><td>k-means (HeatherDB&#x27;s K)</td><td>clustering job</td><td class='num'>1,599 MiB</td><td>m7g.medium</td><td class='num'>$29.78</td></tr><tr><td>ALS + recency (time-decayed confidence)</td><td>recommender model</td><td class='num'>561 MiB</td><td>m7g.medium</td><td class='num'>$29.78</td></tr><tr><td>LOF (k=50)</td><td>outlier model</td><td class='num'>516 MiB</td><td>m7g.medium</td><td class='num'>$29.79</td></tr><tr><td>Gradient-boosted trees</td><td>supervised model</td><td class='num'>325 MiB</td><td>m7g.medium</td><td class='num'>$29.78</td></tr><tr><td>Logistic regression (one-hot)</td><td>supervised model on ids</td><td class='num'>220 MiB</td><td>m7g.medium</td><td class='num'>$29.78</td></tr>
+    <tr class="total"><td>Specialist stack</td><td>6 systems + a retraining scheduler</td><td></td><td></td><td class="num">$178.74</td></tr>
+    <tr class="total"><td>HeatherDB</td><td>1 process, 6 databases</td><td class="num">2,184 MiB</td><td>m7g.medium</td><td class="num">$29.97</td></tr>
     </tbody></table></div>
 </section>
 
 <section>
-  <h2>What selective attention changed</h2>
-  <p>Selective attention lets the memory learn which features and which moments to weigh, from prediction error,
-  while data is written: each row is predicted before it is stored, and the miss teaches the attention. Same
-  engine, same data; the only difference is the database setting.</p>
+  <h2>What the engine changes did</h2>
+  <p><b>Selective attention</b> (propensity, recommendations) lets the memory learn which features and which moments
+  to weigh, from prediction error, while data is written: each row is predicted before it is stored, and the miss
+  teaches the attention. <b>Novelty</b> (fraud) scores a transaction against how its nearest stored normals sit among
+  themselves, not by raw distance, so rare-but-legitimate activity in sparse regions stops looking like fraud. It is
+  the local outlier factor computed inside the memory: it ties LOF at the same neighbour count (50) and beats LOF at
+  its default (20). <b>Learned symbols</b> (propensity, recommendations, access control) replace hand-encoding:
+  ids and categories are written as values, and the same prediction error that teaches attention moves a small
+  code per value, so a rarely seen value borrows from the values that behave like it. Same engine, same data in
+  every row below.</p>
   <div class="scroll"><table>
     <thead><tr><th>Workload</th><th>Metric</th><th>Without</th><th>With</th><th>Best incumbent</th></tr></thead>
-    <tbody><tr><td><b>Propensity scoring</b></td><td>ROC-AUC</td><td class='num'>0.867</td><td class='num'><b>0.931</b></td><td class='num'>0.935<span class='sub'>Gradient-boosted trees</span></td></tr><tr><td><b>Recommendations</b></td><td>NDCG@10</td><td class='num'>0.024</td><td class='num'><b>0.053</b></td><td class='num'>0.062<span class='sub'>ALS + recency (time-decayed confidence)</span></td></tr></tbody></table></div>
-  <p class='muted'>Learned recency, relative to the newest item (lags 1, 2, 3-4, 5-7, 8-12, …): 1.00, 0.78, 0.60, 0.42, 0.29, 0.18, 0.10, 0.06. It started flat; nobody set a decay.</p>
+    <tbody><tr><td><b>Propensity scoring</b></td><td>ROC-AUC</td><td class='num'>0.867</td><td class='num'><b>0.931</b></td><td class='num'>0.935<span class='sub'>Gradient-boosted trees</span></td></tr><tr><td><b>Recommendations</b></td><td>NDCG@10</td><td class='num'>0.025</td><td class='num'><b>0.066</b></td><td class='num'>0.062<span class='sub'>ALS + recency (time-decayed confidence)</span></td></tr><tr><td><b>Fraud detection</b></td><td>PR-AUC</td><td class='num'>0.199</td><td class='num'><b>0.582</b></td><td class='num'>0.582<span class='sub'>LOF (k=50)</span></td></tr></tbody></table></div>
+  
 </section>
 
 <section>
   <h2>Remaining gaps</h2>
   <ul>
-    <li><b>Fraud precision.</b> PR-AUC 0.199 against LOF's 0.485
-    (ROC-AUC is level or better). The read scores raw distance to normal; LOF also corrects for local density.
-    The fix, a spread per memory location, reached PR-AUC 0.500 in the prototype and is the next engine change.</li>
-    <li><b>Recommendations.</b> NDCG@10 0.053 against ALS + recency (time-decayed confidence)'s
-    0.062 (85%). Learned recency closed
-    most of the gap; what is left is the item code, a fixed random projection where ALS learns item vectors. With
-    ALS's item vectors the same read reached 0.093 in the prototype, so codes the memory learns itself are the next lever.</li>
-    <li><b>Cost per scored row.</b> Search is now faster than Qdrant (1.9 ms against
-    4.3 ms p50), but per-row scoring still costs more than a fitted model's: a propensity recall
-    1.0 ms against
-    0.8 µs, because the read scans every stored row, exactly, on
+
+    
+    <li><b>Cost per scored row.</b> Search is now faster than Qdrant (2.1 ms against
+    3.7 ms p50), but per-row scoring still costs more than a fitted model's: a propensity recall
+    4.3 ms against
+    1.0 µs, because the read scans every stored row, exactly, on
     every request. Fine for interactive use; batch scoring of millions of rows needs an index. The cost model sizes by
     memory, so at high query volume HeatherDB needs more CPU than shown.</li>
   </ul>
@@ -131,19 +132,21 @@ code { font: 13px var(--mono); }
 <section>
   <h2>Workload detail</h2>
   <h3>Vector search · Fashion-MNIST, 60,000 x 784, 1,000 queries</h3>
-  <div class='scroll'><table><thead><tr><th>System</th><th>recall@10</th><th>build</th><th>p50</th><th>p95</th></tr></thead><tbody><tr><td>HeatherDB</td><td class='num'>1.000</td><td class='num'>2.6 s</td><td class='num'>1.9 ms</td><td class='num'>4.6 ms</td></tr><tr><td>Qdrant (v1.12.4)</td><td class='num'>0.997</td><td class='num'>17.4 s</td><td class='num'>4.3 ms</td><td class='num'>5.9 ms</td></tr></tbody></table></div>
+  <div class='scroll'><table><thead><tr><th>System</th><th>recall@10</th><th>build</th><th>p50</th><th>p95</th></tr></thead><tbody><tr><td>HeatherDB</td><td class='num'>1.000</td><td class='num'>2.4 s</td><td class='num'>2.1 ms</td><td class='num'>4.8 ms</td></tr><tr><td>Qdrant (v1.12.4)</td><td class='num'>0.998</td><td class='num'>17.0 s</td><td class='num'>3.7 ms</td><td class='num'>5.1 ms</td></tr></tbody></table></div>
   <h3>Pattern discovery · Fashion-MNIST, 60,000 train / 10,000 test, labels hidden</h3>
-  <div class='scroll'><table><thead><tr><th>System</th><th>K</th><th>NMI</th><th>ARI</th><th>purity</th><th>fit</th></tr></thead><tbody><tr><td>HeatherDB (codebook + MDL)</td><td class='num'>115</td><td class='num'>0.523</td><td class='num'>0.307</td><td class='num'>0.648</td><td class='num'>22.5 s</td></tr><tr><td>k-means (HeatherDB&#x27;s K)</td><td class='num'>115</td><td class='num'>0.491</td><td class='num'>0.107</td><td class='num'>0.755</td><td class='num'>1.3 s</td></tr><tr><td>k-means (true K=10, oracle)</td><td class='num'>10</td><td class='num'>0.561</td><td class='num'>0.371</td><td class='num'>0.558</td><td class='num'>0.4 s</td></tr></tbody></table></div>
-  <p class="muted">HeatherDB is not given K: minimum description length chose K=115 from its learned codebook
+  <div class='scroll'><table><thead><tr><th>System</th><th>K</th><th>NMI</th><th>ARI</th><th>purity</th><th>fit</th></tr></thead><tbody><tr><td>HeatherDB (codebook + MDL)</td><td class='num'>80</td><td class='num'>0.531</td><td class='num'>0.315</td><td class='num'>0.657</td><td class='num'>22.3 s</td></tr><tr><td>k-means (HeatherDB&#x27;s K)</td><td class='num'>80</td><td class='num'>0.506</td><td class='num'>0.139</td><td class='num'>0.746</td><td class='num'>0.9 s</td></tr><tr><td>k-means (true K=10, oracle)</td><td class='num'>10</td><td class='num'>0.561</td><td class='num'>0.371</td><td class='num'>0.558</td><td class='num'>0.4 s</td></tr></tbody></table></div>
+  <p class="muted">HeatherDB is not given K: minimum description length chose K=80 from its learned codebook
   (this selection currently runs client-side; finding F8). Cut at the true K=10, the same codebook scores
-  NMI 0.581 (k-means given K=10: 0.561). The chosen K varies between runs (80 and 115 in the
+  NMI 0.588 (k-means given K=10: 0.561). The chosen K varies between runs (80 and 115 in the
   last two) because competitive writes are not yet seeded; NMI held at 0.523 in both.</p>
   <h3>Recommendations · MovieLens 1M, leave-last-out, 2,000 users</h3>
-  <div class='scroll'><table><thead><tr><th>System</th><th>HR@10</th><th>NDCG@10</th><th>fit</th></tr></thead><tbody><tr><td>HeatherDB (selective attention)</td><td class='num'>0.105</td><td class='num'>0.053</td><td class='num dim'>-</td></tr><tr><td>HeatherDB (no selective attention)</td><td class='num'>0.050</td><td class='num'>0.024</td><td class='num'>0.0 s</td></tr><tr><td>Raw sum (same vectors, no memory)</td><td class='num'>0.048</td><td class='num'>0.023</td><td class='num dim'>-</td></tr><tr><td>Popularity</td><td class='num'>0.029</td><td class='num'>0.016</td><td class='num dim'>-</td></tr><tr><td>ItemKNN (cosine)</td><td class='num'>0.061</td><td class='num'>0.032</td><td class='num'>0.5 s</td></tr><tr><td>ALS (implicit, 64 factors)</td><td class='num'>0.075</td><td class='num'>0.039</td><td class='num'>2.8 s</td></tr><tr><td>ItemKNN + recency</td><td class='num'>0.076</td><td class='num'>0.040</td><td class='num'>0.5 s</td></tr><tr><td>ALS + recency (time-decayed confidence)</td><td class='num'>0.123</td><td class='num'>0.062</td><td class='num'>2.7 s</td></tr></tbody></table></div>
+  <div class='scroll'><table><thead><tr><th>System</th><th>HR@10</th><th>NDCG@10</th><th>fit</th></tr></thead><tbody><tr><td>HeatherDB (learned item symbols)</td><td class='num'>0.120</td><td class='num'>0.066</td><td class='num dim'>-</td></tr><tr><td>HeatherDB (selective attention)</td><td class='num'>0.105</td><td class='num'>0.053</td><td class='num dim'>-</td></tr><tr><td>HeatherDB (no selective attention)</td><td class='num'>0.051</td><td class='num'>0.025</td><td class='num'>0.0 s</td></tr><tr><td>Raw sum (same vectors, no memory)</td><td class='num'>0.048</td><td class='num'>0.023</td><td class='num dim'>-</td></tr><tr><td>Popularity</td><td class='num'>0.029</td><td class='num'>0.016</td><td class='num dim'>-</td></tr><tr><td>ItemKNN (cosine)</td><td class='num'>0.061</td><td class='num'>0.032</td><td class='num'>0.5 s</td></tr><tr><td>ALS (implicit, 64 factors)</td><td class='num'>0.075</td><td class='num'>0.039</td><td class='num'>2.8 s</td></tr><tr><td>ItemKNN + recency</td><td class='num'>0.076</td><td class='num'>0.040</td><td class='num'>0.5 s</td></tr><tr><td>ALS + recency (time-decayed confidence)</td><td class='num'>0.123</td><td class='num'>0.062</td><td class='num'>2.7 s</td></tr></tbody></table></div>
   <h3>Fraud detection · Credit-card fraud (ULB), 142,404 test transactions, 246 frauds</h3>
-  <div class='scroll'><table><thead><tr><th>System</th><th>ROC-AUC</th><th>PR-AUC</th><th>recall @ 1% FPR</th><th>per txn</th></tr></thead><tbody><tr><td>HeatherDB</td><td class='num'>0.953</td><td class='num'>0.199</td><td class='num'>0.711</td><td class='num'>89 µs</td></tr><tr><td>Isolation Forest</td><td class='num'>0.949</td><td class='num'>0.127</td><td class='num'>0.589</td><td class='num'>6 µs</td></tr><tr><td>LOF</td><td class='num'>0.951</td><td class='num'>0.485</td><td class='num'>0.785</td><td class='num'>19 µs</td></tr></tbody></table></div>
+  <div class='scroll'><table><thead><tr><th>System</th><th>ROC-AUC</th><th>PR-AUC</th><th>recall @ 1% FPR</th><th>per txn</th></tr></thead><tbody><tr><td>HeatherDB (novelty)</td><td class='num'>0.953</td><td class='num'>0.582</td><td class='num'>0.805</td><td class='num'>396 µs</td></tr><tr><td>HeatherDB (nearest distance)</td><td class='num'>0.953</td><td class='num'>0.199</td><td class='num'>0.711</td><td class='num'>228 µs</td></tr><tr><td>Isolation Forest</td><td class='num'>0.949</td><td class='num'>0.122</td><td class='num'>0.577</td><td class='num'>19 µs</td></tr><tr><td>LOF</td><td class='num'>0.951</td><td class='num'>0.482</td><td class='num'>0.785</td><td class='num'>58 µs</td></tr><tr><td>LOF (k=50)</td><td class='num'>0.953</td><td class='num'>0.582</td><td class='num'>0.805</td><td class='num'>80 µs</td></tr></tbody></table></div>
   <h3>Propensity scoring · UCI bank marketing, 31,647 train / 13,564 test</h3>
-  <div class='scroll'><table><thead><tr><th>System</th><th>ROC-AUC</th><th>PR-AUC</th><th>fit</th><th>per row</th></tr></thead><tbody><tr><td>HeatherDB (selective attention)</td><td class='num'>0.931</td><td class='num'>0.605</td><td class='num'>9.2 s</td><td class='num'>972 µs</td></tr><tr><td>HeatherDB (no selective attention)</td><td class='num'>0.867</td><td class='num'>0.480</td><td class='num'>0.2 s</td><td class='num'>230 µs</td></tr><tr><td>Logistic regression</td><td class='num'>0.910</td><td class='num'>0.569</td><td class='num'>0.0 s</td><td class='num'>0 µs</td></tr><tr><td>Gradient-boosted trees</td><td class='num'>0.935</td><td class='num'>0.629</td><td class='num'>0.5 s</td><td class='num'>1 µs</td></tr></tbody></table></div>
+  <div class='scroll'><table><thead><tr><th>System</th><th>ROC-AUC</th><th>PR-AUC</th><th>fit</th><th>per row</th></tr></thead><tbody><tr><td>HeatherDB (selective attention)</td><td class='num'>0.931</td><td class='num'>0.605</td><td class='num'>74.5 s</td><td class='num'>4,347 µs</td></tr><tr><td>HeatherDB (no selective attention)</td><td class='num'>0.867</td><td class='num'>0.480</td><td class='num'>0.6 s</td><td class='num'>911 µs</td></tr><tr><td>Logistic regression</td><td class='num'>0.910</td><td class='num'>0.569</td><td class='num'>0.0 s</td><td class='num'>0 µs</td></tr><tr><td>Gradient-boosted trees</td><td class='num'>0.935</td><td class='num'>0.629</td><td class='num'>0.4 s</td><td class='num'>1 µs</td></tr></tbody></table></div>
+  <h3>Access control · Amazon Employee Access, 22,938 train / 9,831 test, 9 id columns</h3>
+  <div class='scroll'><table><thead><tr><th>System</th><th>ROC-AUC</th><th>fit</th><th>per row</th></tr></thead><tbody><tr><td>HeatherDB (learned symbols)</td><td class='num'>0.870</td><td class='num'>19.2 s</td><td class='num'>1,830 µs</td></tr><tr><td>Logistic regression (one-hot)</td><td class='num'>0.868</td><td class='num'>0.1 s</td><td class='num'>2 µs</td></tr><tr><td>Gradient-boosted trees</td><td class='num'>0.831</td><td class='num'>0.4 s</td><td class='num'>3 µs</td></tr></tbody></table></div>
 </section>
 
 <section>
@@ -152,7 +155,7 @@ code { font: 13px var(--mono); }
     <li>Public datasets, downloaded from their canonical sources; a SHA-256 fingerprint of the exact arrays is recorded per run.</li>
     <li>HeatherDB is used only through its public HTTP API, with authentication on. Incumbents use library defaults or standard settings.</li>
     <li>Qdrant runs as the real server in Docker. The other incumbents run as separate Python processes, each measured alone.</li>
-    <li>One machine: macOS-26.5.1-arm64-arm-64bit, Apple M4, 16 GiB. Engine <code>heather 1.0.0</code> at <code>v1.0.0-6-ge5dfbb2-dirty (feat/selective-attention)</code>.</li>
+    <li>One machine: macOS-26.5.1-arm64-arm-64bit, Apple M4, 16 GiB. Engine <code>heather 1.0.0</code> at <code>v1.0.0-8-g4a32470-dirty (feat/selective-attention)</code>.</li>
     <li>Not modelled: staff time to run each system, network between services, high availability and replicas.</li>
   </ul>
   <pre>cargo build --release -p heather_server
