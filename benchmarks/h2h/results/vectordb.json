@@ -1,0 +1,126 @@
+{
+  "fashion": {
+    "n": 60000,
+    "d": 784,
+    "queries": 1000,
+    "systems": [
+      {
+        "system": "HeatherDB (memory residency)",
+        "recall@10": 1.0,
+        "p50_ms": 1.5805624998392886,
+        "p95_ms": 1.837206250638701,
+        "qps_1_client": 622.7010472876682,
+        "qps_8_clients": 1214.4130789804722,
+        "load_s": 2.410008167000342,
+        "peak_mem_mib": 980.0,
+        "steady_mem_mib": 980.046875,
+        "disk_mib": 256.85546875
+      },
+      {
+        "system": "HeatherDB (shadow residency)",
+        "recall@10": 1.0,
+        "p50_ms": 1.939437999681104,
+        "p95_ms": 2.5167476002934563,
+        "qps_1_client": 497.5998054355319,
+        "qps_8_clients": 1106.030947523663,
+        "load_s": 2.249892750000072,
+        "peak_mem_mib": 464.625,
+        "steady_mem_mib": 464.671875,
+        "disk_mib": 248.85546875
+      },
+      {
+        "system": "Qdrant v1.12.4 (default HNSW)",
+        "recall@10": 0.9977,
+        "p50_ms": 4.192104500361893,
+        "p95_ms": 5.796629149517684,
+        "qps_1_client": 243.4622739006521,
+        "qps_8_clients": 1168.6026273405794,
+        "load_s": 16.80440975000056,
+        "peak_mem_mib": 583.8999996185303,
+        "steady_mem_mib": 471.3999996185303,
+        "disk_mib": 397.68271350860596
+      },
+      {
+        "system": "Qdrant v1.12.4 (hnsw_ef=256)",
+        "recall@10": 0.9987999999999999,
+        "p50_ms": 4.11581250045856,
+        "p95_ms": 5.946618749385379,
+        "qps_1_client": 243.30188487600495,
+        "qps_8_clients": 958.442760540128,
+        "load_s": 16.80440975000056,
+        "peak_mem_mib": 583.8999996185303,
+        "steady_mem_mib": 471.3999996185303,
+        "disk_mib": 397.68271350860596
+      }
+    ],
+    "machine": {
+      "cpu": "Apple M4",
+      "cores": 10,
+      "ram_gib": 16
+    },
+    "heather_commit": "73ba51a",
+    "finished": "2026-11-11T04:02:29"
+  },
+  "glove": {
+    "n": 1183514,
+    "d": 100,
+    "queries": 1000,
+    "systems": [
+      {
+        "system": "HeatherDB (memory residency)",
+        "recall@10": 1.0,
+        "p50_ms": 5.25906250004482,
+        "p95_ms": 5.931010749554842,
+        "qps_1_client": 186.87010757335293,
+        "qps_8_clients": 305.9795986573203,
+        "load_s": 9.834255333000328,
+        "peak_mem_mib": 2075.265625,
+        "steady_mem_mib": 2067.8125,
+        "disk_mib": 681.66015625
+      },
+      {
+        "system": "HeatherDB (shadow residency)",
+        "recall@10": 1.0,
+        "p50_ms": 5.450125499010028,
+        "p95_ms": 5.699105899930146,
+        "qps_1_client": 183.25070203355997,
+        "qps_8_clients": 336.9929172416959,
+        "load_s": 10.630236500001047,
+        "peak_mem_mib": 1604.65625,
+        "steady_mem_mib": 1604.65625,
+        "disk_mib": 688.25390625
+      },
+      {
+        "system": "Qdrant v1.12.4 (default HNSW)",
+        "recall@10": 0.9002,
+        "p50_ms": 3.591874999074207,
+        "p95_ms": 5.56091874896083,
+        "qps_1_client": 272.4275998449967,
+        "qps_8_clients": 1439.0218975068299,
+        "load_s": 95.36386141599905,
+        "peak_mem_mib": 991.3999996185303,
+        "steady_mem_mib": 859.7999992370605,
+        "disk_mib": 814.0651082992554
+      },
+      {
+        "system": "Qdrant v1.12.4 (hnsw_ef=256)",
+        "recall@10": 0.9528000000000001,
+        "p50_ms": 4.042583499540342,
+        "p95_ms": 5.830017299103929,
+        "qps_1_client": 250.89845475916317,
+        "qps_8_clients": 997.2045862441219,
+        "load_s": 95.36386141599905,
+        "peak_mem_mib": 991.3999996185303,
+        "steady_mem_mib": 859.7999992370605,
+        "disk_mib": 814.0651082992554
+      }
+    ],
+    "machine": {
+      "cpu": "Apple M4",
+      "cores": 10,
+      "ram_gib": 16
+    },
+    "heather_commit": "73ba51a",
+    "finished": "2026-11-11T04:05:08"
+  }
+}
