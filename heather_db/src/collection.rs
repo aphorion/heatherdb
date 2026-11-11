@@ -4,7 +4,9 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use rayon::prelude::*;
 use realfft::num_complex::Complex;
 
-use crate::config::{EAMConfig, Residency};
+use crate::config::EAMConfig;
+#[cfg(test)]
+use crate::config::Residency;
 use crate::error::{HeatherError, Result};
 use crate::location::{HardLocation, LocationId};
 use crate::merge;
@@ -432,7 +434,7 @@ impl AtomicMutation<'_> {
     /// stored them has committed, so a hollow row is never what gets written.
     fn commit(&mut self) {
         self.committed = true;
-        if self.inner.config.residency == Residency::Shadow {
+        if self.inner.config.shadowed() {
             self.inner.locations.iter_mut().for_each(hollow);
         }
     }
@@ -488,7 +490,7 @@ impl Rows<'_> {
 impl Collection {
     /// The rows at `indices` (collection order), with their vectors.
     pub(crate) fn hydrate<'a>(&self, inner: &'a EAMInner, indices: &[usize]) -> Result<Rows<'a>> {
-        if inner.config.residency != Residency::Shadow {
+        if !inner.config.shadowed() {
             return Ok(Rows {
                 locations: std::borrow::Cow::Borrowed(&inner.locations),
                 idx: indices.to_vec(),
@@ -530,7 +532,7 @@ impl Collection {
         chunk: usize,
         mut f: impl FnMut(usize, &[HardLocation]) -> Result<()>,
     ) -> Result<()> {
-        if inner.config.residency != Residency::Shadow {
+        if !inner.config.shadowed() {
             for (c, rows) in inner.locations.chunks(chunk.max(1)).enumerate() {
                 f(c * chunk.max(1), rows)?;
             }
@@ -564,7 +566,7 @@ impl Collection {
         inner: &EAMInner,
         f: impl FnOnce(&[HardLocation]) -> Result<R>,
     ) -> Result<R> {
-        if inner.config.residency != Residency::Shadow {
+        if !inner.config.shadowed() {
             return f(&inner.locations);
         }
         let mut all = Vec::with_capacity(inner.locations.len());
@@ -580,7 +582,7 @@ impl Collection {
     /// in place. The mutation's commit hollows them again; a failed one is
     /// rolled back by reloading, which hollows them too. No-op when resident.
     fn rehydrate(&self, inner: &mut EAMInner) -> Result<()> {
-        if inner.config.residency != Residency::Shadow {
+        if !inner.config.shadowed() {
             return Ok(());
         }
         let mut full = Vec::with_capacity(inner.locations.len());
@@ -621,7 +623,7 @@ impl Collection {
         k: usize,
         metric: scan::Metric,
     ) -> Result<(Vec<usize>, Vec<f64>)> {
-        let shadow = inner.config.residency == Residency::Shadow;
+        let shadow = inner.config.shadowed();
         let Some(cands) = self.coalescer.candidates(inner, query, k, metric)? else {
             if shadow || metric != scan::Metric::Dot {
                 return Err(HeatherError::Corrupt(
@@ -735,16 +737,16 @@ impl Coalescer {
     }
 }
 
-/// Test builds only: `HEATHER_TEST_RESIDENCY=shadow` opens every plain
-/// collection in shadow residency, so the whole suite exercises it.
+/// Test builds only: `HEATHER_TEST_RESIDENCY=memory` opens every plain
+/// collection left on `auto` in memory residency, so the whole suite
+/// exercises both modes (`auto` already resolves to shadow for them).
 #[cfg(test)]
 fn test_residency(config: &EAMConfig) -> std::borrow::Cow<'_, EAMConfig> {
-    if !config.competitive
-        && config.selective_attention.is_none()
-        && std::env::var("HEATHER_TEST_RESIDENCY").as_deref() == Ok("shadow")
+    if config.residency == Residency::Auto
+        && std::env::var("HEATHER_TEST_RESIDENCY").as_deref() == Ok("memory")
     {
         let mut c = config.clone();
-        c.residency = Residency::Shadow;
+        c.residency = Residency::Memory;
         std::borrow::Cow::Owned(c)
     } else {
         std::borrow::Cow::Borrowed(config)
@@ -772,7 +774,7 @@ fn load_rows(
                 });
             }
             scan.push(&loc.address);
-            if config.residency == Residency::Shadow {
+            if config.shadowed() {
                 hollow(&mut loc);
             }
             locations.push(loc);
@@ -922,7 +924,7 @@ impl Collection {
         let landmarks = read::select_landmarks(&locations, config.num_landmarks);
         let landmarks_at = locations.len();
         let scan = scan::Scan::from_locations(&locations);
-        if config.residency == Residency::Shadow {
+        if config.shadowed() {
             locations.iter_mut().for_each(hollow);
         }
         Ok(Collection {
@@ -1532,7 +1534,7 @@ impl Collection {
         let k = want.min(inner.locations.len());
 
         let (mut indices, _sims) = match allowed {
-            Some(allowed) if inner.config.residency == Residency::Shadow => {
+            Some(allowed) if inner.config.shadowed() => {
                 let allowed: Vec<usize> = allowed
                     .iter()
                     .copied()

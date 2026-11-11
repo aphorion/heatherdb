@@ -96,7 +96,7 @@ pub async fn list_databases(Extension(server): Extension<Arc<Server>>) -> Respon
             collections,
             competitive: cfg.eam.competitive,
             precision: cfg.eam.precision,
-            residency: cfg.eam.residency,
+            residency: cfg.eam.effective_residency(),
             format_version: cfg.format_version,
             selective_attention: cfg.eam.selective_attention.clone(),
             skipped_records: server
@@ -167,7 +167,7 @@ pub async fn create_database(
                     collections: 0,
                     competitive: c.eam.competitive,
                     precision: c.eam.precision,
-                    residency: c.eam.residency,
+                    residency: c.eam.effective_residency(),
                     format_version: c.format_version,
                     selective_attention: c.eam.selective_attention.clone(),
                     skipped_records: 0,
@@ -219,7 +219,7 @@ pub async fn get_database(
         collections,
         competitive: cfg.eam.competitive,
         precision: cfg.eam.precision,
-        residency: cfg.eam.residency,
+        residency: cfg.eam.effective_residency(),
         format_version: cfg.format_version,
         selective_attention: cfg.eam.selective_attention.clone(),
         skipped_records,
@@ -810,7 +810,7 @@ mod plain_compact_tests {
 
     /// `residency: "shadow"` is accepted on a plain database, reported,
     /// kept across a restart, and answers queries from storage; on a
-    /// competitive database it is refused.
+    /// competitive database it is refused. Unset, it resolves per database.
     #[tokio::test]
     async fn shadow_residency_databases_are_created_and_reopened() {
         let dir = tempfile::tempdir().unwrap();
@@ -846,6 +846,23 @@ mod plain_compact_tests {
             )
             .await;
             assert_eq!(status, StatusCode::BAD_REQUEST);
+
+            // Left unset, residency resolves per database: shadow for a
+            // plain database, memory for a competitive one or one with
+            // selective attention, and an explicit "memory" is kept.
+            for (name, eam, want) in [
+                ("plain", serde_json::json!({"competitive": false}), "shadow"),
+                ("competitive", serde_json::json!({}), "memory"),
+                (
+                    "pinned",
+                    serde_json::json!({"competitive": false, "residency": "memory"}),
+                    "memory",
+                ),
+            ] {
+                let (status, body) = create(server.clone(), name, eam).await;
+                assert_eq!(status, StatusCode::OK, "{name}");
+                assert_eq!(body["residency"], want, "{name}");
+            }
 
             let col = resolve_db(&server, "lean")
                 .unwrap()
