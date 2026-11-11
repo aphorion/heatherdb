@@ -33,7 +33,7 @@ BASELINES = {
                   ("run_kmeans_10", "k-means (true K=10, oracle)")],
     "recs": [("run_popularity", None), ("run_itemknn", None), ("run_als", None),
              ("run_itemknn_recency", None), ("run_als_recency", None)],
-    "fraud": [("run_iforest", None), ("run_lof", None)],
+    "fraud": [("run_iforest", None), ("run_lof", None), ("run_lof50", None)],
     "classify": [("run_logreg", None), ("run_gbdt", None)],
 }
 
@@ -103,11 +103,12 @@ def main():
             hres["server_cpu_s"] = h.cpu_seconds() - cpu0
             # With selective attention (format 2) the engine's own result leads;
             # the same engine without it is kept as a comparison row.
-            if hasattr(mod, "run_heather_sa"):
+            improved = getattr(mod, "run_heather_sa", None) or getattr(mod, "run_heather_v2", None)
+            if improved:
                 cpu0 = h.cpu_seconds()
-                sa = mod.run_heather_sa(h, *args)
+                sa = improved(h, *args)
                 sa["server_cpu_s"] = h.cpu_seconds() - cpu0
-                hres["system"] = "HeatherDB (no selective attention)"
+                hres["system"] = getattr(mod, "BEFORE_LABEL", "HeatherDB (no selective attention)")
                 rec["systems"].insert(0, hres)
                 rec["systems"].insert(0, sa)
                 hres = sa

@@ -81,6 +81,29 @@ orphans the document index, so keep this collection document-free and resolve
 against a sidecar cache instead: [Resolve a reconstruction to a
 thing](resolve-reconstructions.md).
 
+## Score by surprise when density varies
+
+Reconstruction fidelity measures distance to normal. When normal activity
+is dense in some places and sparse in others, a rare-but-legitimate
+observation in a sparse region looks as far from normal as a real anomaly.
+`surprise` asks a relative question instead: how far is this observation
+from its nearest normals, compared with how far those normals usually sit
+from their own? One request scores a batch:
+
+```python
+# Store standardised features: surprise compares Euclidean distances.
+r = call("POST", col(entity) + "/surprise",
+         {"queries": [encode(o) for o in batch], "k": 50})
+scores = [x["surprise"] for x in r["results"]]   # ~1 normal, higher = unusual
+```
+
+On the credit-card fraud benchmark in `benchmarks/h2h/` (50,000 normal
+transactions, 142,404 test transactions), surprise reaches PR-AUC 0.582,
+against 0.199 for distance to the nearest normal and 0.482 for a local
+outlier factor model at its default 20 neighbours. It is the local outlier
+factor computed inside the memory, so at equal `k` it matches that model.
+Derive the threshold from held-out normals exactly as below.
+
 ## Score by reconstruction fidelity
 
 One read per observation. The score is the cosine between what you sent and

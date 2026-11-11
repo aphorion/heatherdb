@@ -1087,6 +1087,90 @@ pub async fn analyze(
     }
 }
 
+/// Surprise relative to the neighbourhood, for a batch of queries: the local
+/// outlier factor over the collection's stored rows (see
+/// `heather_db::surprise`). Audited when it returns stored rows.
+pub async fn surprise(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    ctx: AuditCtx,
+    Json(req): Json<SurpriseRequest>,
+) -> Response {
+    if req.queries.is_empty() {
+        return error_response(StatusCode::BAD_REQUEST, "queries array must not be empty");
+    }
+    let max_queries = limits::get().max_batch_queries;
+    if max_queries > 0 && req.queries.len() > max_queries {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "batch of {} queries exceeds the server cap of {max_queries}; \
+                 split into smaller batches or raise --max-batch-queries",
+                req.queries.len()
+            ),
+        );
+    }
+    let col = match hive.get_collection(&name) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("collection '{name}' not found"),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let k = req.k.unwrap_or(50);
+    let keep = req.nearest.unwrap_or(0);
+    let queries = req.queries;
+    let result = tokio::task::spawn_blocking(move || col.surprise(&queries, k)).await;
+    if keep > 0 {
+        let (status, ids) = match &result {
+            Ok(Ok(rs)) => (
+                StatusCode::OK,
+                AuditIds::locations(
+                    rs.iter()
+                        .flat_map(|r| r.nearest.iter().take(keep).map(|&(id, _)| id))
+                        .collect(),
+                ),
+            ),
+            Ok(Err(e)) => (engine_error_status(e), AuditIds::default()),
+            Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::default()),
+        };
+        audit_read(
+            &hive,
+            &ctx,
+            &name,
+            "surprise",
+            status,
+            ids,
+            AuditQueryInfo {
+                hash: None,
+                raw: None,
+            },
+        );
+    }
+    match result {
+        Ok(Ok(rs)) => Json(SurpriseResponse {
+            results: rs
+                .into_iter()
+                .map(|r| SurpriseItem {
+                    surprise: r.surprise,
+                    nearest: r
+                        .nearest
+                        .into_iter()
+                        .take(keep)
+                        .map(|(id, distance)| SurpriseNeighbour { id, distance })
+                        .collect(),
+                })
+                .collect(),
+        })
+        .into_response(),
+        Ok(Err(e)) => error_response(engine_error_status(&e), e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
 pub async fn batch_analyze(
     State(hive): State<AppState>,
     Path(name): Path<String>,

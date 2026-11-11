@@ -575,4 +575,40 @@ mod tests {
         config.competitive = true;
         assert!(config.validate().is_err());
     }
+
+    #[test]
+    fn surprise_ranks_an_outlier_and_rebuilds_after_a_write() {
+        use rand::{Rng, SeedableRng};
+        let dir = TempDir::new().unwrap();
+        let mut config = EAMConfig::new(3).unwrap();
+        config.competitive = false;
+        let hive = Hive::open(dir.path(), config, 256).unwrap();
+        let col = hive.get_or_create_collection("normal").unwrap();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(9);
+        let rows: Vec<Vec<f64>> = (0..400)
+            .map(|_| (0..3).map(|_| rng.gen_range(-1.0..1.0)).collect())
+            .collect();
+        col.write_batch(&rows).unwrap();
+        let inside = vec![0.1, 0.0, -0.1];
+        let outside = vec![6.0, 6.0, 6.0];
+        let before = col
+            .surprise(&[inside.clone(), outside.clone()], 20)
+            .unwrap();
+        assert!(before[0].surprise < 1.5, "inside: {}", before[0].surprise);
+        assert!(before[1].surprise > 3.0, "outside: {}", before[1].surprise);
+        assert_eq!(before[1].nearest.len(), 20);
+
+        // Normal activity now includes that region: the cache must rebuild.
+        let near: Vec<Vec<f64>> = (0..60)
+            .map(|_| (0..3).map(|_| 6.0 + rng.gen_range(-0.5..0.5)).collect())
+            .collect();
+        col.write_batch(&near).unwrap();
+        let after = col.surprise(std::slice::from_ref(&outside), 20).unwrap();
+        assert!(
+            after[0].surprise < 1.5,
+            "after normal writes there: {}",
+            after[0].surprise
+        );
+        assert!(col.surprise(std::slice::from_ref(&outside), 0).is_err());
+    }
 }

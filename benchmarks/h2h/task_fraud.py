@@ -29,6 +29,8 @@ N_NORMALS = 50_000
 
 
 def load():
+    """Standardised features (by the training normals' mean and spread),
+    unchanged otherwise: every detector sees the same numbers."""
     X, y = data.creditcard()
     X = X.copy()
     X[:, -1] = np.log1p(X[:, -1])  # Amount is heavy-tailed
@@ -38,12 +40,14 @@ def load():
     rng = np.random.default_rng(4)
     normals = normals[rng.choice(len(normals), N_NORMALS, replace=False)]
     mu, sd = normals.mean(0), normals.std(0) + 1e-9
-    def enc(A):
-        E = np.hstack([(A - mu) / sd, np.full((len(A), 1), 100.0)])
-        # bulk_load keeps addresses at the norm given and activation ranks by
-        # dot product, so rows must be unit-normalised before loading.
-        return E / np.linalg.norm(E, axis=1, keepdims=True)
-    return enc(normals), enc(Xte), yte, data.fingerprint(X, y)
+    return (normals - mu) / sd, (Xte - mu) / sd, yte, data.fingerprint(X, y)
+
+
+def unit_with_bias(A):
+    """The nearest-distance encoding: standardised features plus a bias
+    coordinate c=100, unit-normalised, so 1 - cosine ~ |a-b|^2 / 2c^2."""
+    E = np.hstack([A, np.full((len(A), 1), 100.0)])
+    return E / np.linalg.norm(E, axis=1, keepdims=True)
 
 
 def metrics(score, y):
@@ -54,7 +58,12 @@ def metrics(score, y):
             "recall@1%fpr": float(np.mean(score[y == 1] > thr))}
 
 
+BEFORE_LABEL = "HeatherDB (nearest distance)"
+
+
 def run_heather(h, normals, Xte, yte):
+    """Before: raw distance to the nearest stored normal (a k=1 read)."""
+    normals, Xte = unit_with_bias(normals), unit_with_bias(Xte)
     h.create_db("fraud", normals.shape[1], competitive=False, k=1)
     col = "/db/fraud/collections/normal_card_activity"
     with Meter() as fit:
@@ -73,6 +82,25 @@ def run_heather(h, normals, Xte, yte):
             "score_us_per_txn": sc.wall / len(Xte) * 1e6}
 
 
+def run_heather_v2(h, normals, Xte, yte, k=50):
+    """Surprise relative to the neighbourhood: the stored normals are the
+    memory; each transaction is scored by `surprise` (its distance to its k
+    nearest normals relative to how spread out those normals usually are)."""
+    h.create_db("fraud_surprise", normals.shape[1], competitive=False)
+    col = "/db/fraud_surprise/collections/normal_card_activity"
+    with Meter() as fit:
+        h.call("POST", col + "/bulk_load",
+               {"addresses_b64": b64rows(normals), "counters_b64": b64rows(normals)})
+    score = np.empty(len(Xte))
+    with Meter() as sc:
+        for i in range(0, len(Xte), 1000):
+            r = h.call("POST", col + "/surprise",
+                       {"queries": Xte[i:i + 1000].tolist(), "k": k})
+            score[i:i + 1000] = [x["surprise"] for x in r["results"]]
+    return {"system": "HeatherDB (surprise)", **metrics(score, yte), "fit_s": fit.wall,
+            "score_us_per_txn": sc.wall / len(Xte) * 1e6}
+
+
 def run_iforest(normals, Xte, yte):
     from sklearn.ensemble import IsolationForest
 
@@ -84,12 +112,17 @@ def run_iforest(normals, Xte, yte):
             "score_us_per_txn": sc.wall / len(Xte) * 1e6}
 
 
-def run_lof(normals, Xte, yte):
+def run_lof50(normals, Xte, yte):
+    """LOF at the same neighbour count HeatherDB's surprise uses."""
+    return run_lof(normals, Xte, yte, k=50)
+
+
+def run_lof(normals, Xte, yte, k=20):
     from sklearn.neighbors import LocalOutlierFactor
 
     with Meter() as fit:
-        m = LocalOutlierFactor(n_neighbors=20, novelty=True, n_jobs=-1).fit(normals)
+        m = LocalOutlierFactor(n_neighbors=k, novelty=True, n_jobs=-1).fit(normals)
     with Meter() as sc:
         s = -m.score_samples(Xte)
-    return {"system": "LOF", **metrics(s, yte), "fit_s": fit.wall,
+    return {"system": "LOF" if k == 20 else f"LOF (k={k})", **metrics(s, yte), "fit_s": fit.wall,
             "score_us_per_txn": sc.wall / len(Xte) * 1e6}

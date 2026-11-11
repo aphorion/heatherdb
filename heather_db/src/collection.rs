@@ -343,6 +343,27 @@ impl EAMInner {
     }
 }
 
+/// A collection's neighbourhood for `surprise`, as of one collection
+/// version. Plain appends update it in place ([`crate::surprise::Incremental`]);
+/// any other change leaves it stale, and the next call rebuilds it.
+#[derive(Debug)]
+struct NeighbourhoodCache {
+    version: u64,
+    n: usize,
+    state: crate::surprise::Incremental,
+}
+
+/// One query's surprise relative to its neighbourhood.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SurpriseResult {
+    /// About 1 for a query that sits the way its neighbours do; higher is
+    /// more unusual. `NaN` for an empty collection.
+    pub surprise: f64,
+    /// The query's nearest stored rows, (location id, Euclidean distance),
+    /// nearest first.
+    pub nearest: Vec<(u64, f64)>,
+}
+
 /// An attention-head recall: the blended row and the stored rows behind it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttendedRecall {
@@ -416,6 +437,9 @@ pub struct Collection {
     attention: Option<Arc<crate::attention::SharedAttention>>,
     /// Shares the exact k-nearest scan among concurrent reads.
     coalescer: Coalescer,
+    /// Spreads and familiarities for `surprise`, built on first use and
+    /// rebuilt when the collection changes (see [`crate::surprise`]).
+    neighbourhood: std::sync::RwLock<Option<NeighbourhoodCache>>,
 }
 
 /// Hold the collection lock through persistence and recovery. Successful writes
@@ -946,6 +970,7 @@ impl Collection {
             store,
             attention: None,
             coalescer: Coalescer::default(),
+            neighbourhood: std::sync::RwLock::new(None),
         })
     }
 
@@ -1000,6 +1025,7 @@ impl Collection {
             store,
             attention: None,
             coalescer: Coalescer::default(),
+            neighbourhood: std::sync::RwLock::new(None),
         })
     }
 
@@ -1251,6 +1277,173 @@ impl Collection {
         })
     }
 
+    /// Exact `k` nearest rows by Euclidean distance for each query, as
+    /// (row index, distance) nearest first, through the int8 scan: its
+    /// candidates are read (from storage in shadow residency) and ranked
+    /// exactly. `exclude[j]` drops one row from query `j`'s answer.
+    fn euclidean_knn(
+        &self,
+        inner: &EAMInner,
+        queries: &[&[f64]],
+        k: usize,
+        exclude: &[Option<usize>],
+    ) -> Result<Vec<Vec<(usize, f64)>>> {
+        use rayon::prelude::*;
+        let n = inner.locations.len();
+        let kk = (k + 1).min(n);
+        let specs = vec![(kk, scan::Metric::Euclidean); queries.len()];
+        let cands = match scan::candidates_batch(queries, &specs, n, &inner.scan) {
+            Some(c) => c,
+            None if inner.config.shadowed() => {
+                return Err(HeatherError::Corrupt(
+                    "the int8 shadow is out of step with the collection".into(),
+                ));
+            }
+            None => vec![(0..n).collect(); queries.len()],
+        };
+        let mut union: Vec<usize> = cands.iter().flatten().copied().collect();
+        union.sort_unstable();
+        union.dedup();
+        let rows = self.hydrate(inner, &union)?;
+        let address = |orig: usize| -> &[f64] {
+            let j = union.binary_search(&orig).expect("candidate was hydrated");
+            &rows.locations[rows.idx[j]].address
+        };
+        Ok(queries
+            .par_iter()
+            .zip(cands.par_iter())
+            .zip(exclude.par_iter())
+            .map(|((q, c), ex)| {
+                let mut scored: Vec<(usize, f64)> = c
+                    .iter()
+                    .filter(|&&i| Some(i) != *ex)
+                    .map(|&i| (i, scan::squared_distance(q, address(i))))
+                    .collect();
+                scored.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+                scored.truncate(k);
+                scored.into_iter().map(|(i, s)| (i, s.sqrt())).collect()
+            })
+            .collect())
+    }
+
+    /// Surprise of each query relative to its `k` nearest stored rows (see
+    /// [`crate::surprise`]): the local outlier factor over the collection's
+    /// stored addresses, by Euclidean distance. Neighbours come from the
+    /// exact int8 scan. The rows' spreads are computed on the first call for
+    /// a given `k` and collection version by a blocked all-pairs search
+    /// ([`crate::surprise::knn_all`]), then reused until the collection
+    /// changes.
+    pub fn surprise(
+        &self,
+        queries: &[impl AsRef<[f64]> + Sync],
+        k: usize,
+    ) -> Result<Vec<SurpriseResult>> {
+        if k == 0 {
+            return Err(HeatherError::InvalidInput("k must be > 0".into()));
+        }
+        let inner = self.read_inner()?;
+        let d = inner.config.d;
+        for q in queries {
+            vec_ops::validate_vector(q.as_ref())?;
+            if q.as_ref().len() != d {
+                return Err(HeatherError::DimensionMismatch {
+                    expected: d,
+                    got: q.as_ref().len(),
+                });
+            }
+        }
+        let n = inner.locations.len();
+        if n < 2 {
+            return Err(HeatherError::InvalidInput(
+                "surprise needs at least 2 stored rows".into(),
+            ));
+        }
+        let k_eff = k.min(n - 1);
+        // Queries go through the scan in groups: each group's candidate lists
+        // are held for the whole pass, so memory grows with the group size.
+        const QUERY_GROUP: usize = 64;
+        let qs: Vec<&[f64]> = queries.iter().map(|q| q.as_ref()).collect();
+        let mut knn: Vec<Vec<(usize, f64)>> = Vec::with_capacity(qs.len());
+        for group in qs.chunks(QUERY_GROUP) {
+            let none = vec![None; group.len()];
+            knn.extend(self.euclidean_knn(&inner, group, k_eff, &none)?);
+        }
+        let fresh =
+            |c: &NeighbourhoodCache| c.version == inner.version && c.n == n && c.state.k == k;
+        let score = |c: &NeighbourhoodCache| -> Vec<SurpriseResult> {
+            knn.iter()
+                .map(|nb| SurpriseResult {
+                    surprise: c.state.score(nb),
+                    nearest: nb
+                        .iter()
+                        .map(|&(i, dist)| (inner.locations[i].id.0, dist))
+                        .collect(),
+                })
+                .collect()
+        };
+        {
+            let slot = self
+                .neighbourhood
+                .read()
+                .map_err(|_| HeatherError::LockPoisoned)?;
+            if let Some(c) = slot.as_ref().filter(|c| fresh(c)) {
+                return Ok(score(c));
+            }
+        }
+        let mut slot = self
+            .neighbourhood
+            .write()
+            .map_err(|_| HeatherError::LockPoisoned)?;
+        if !slot.as_ref().is_some_and(fresh) {
+            // Every row once, in collection order: from memory, or streamed
+            // from storage in shadow residency.
+            let mut flat: Vec<f64> = Vec::with_capacity(n * d);
+            self.for_each_chunk(&inner, crate::store::LOCATION_CHUNK, |_, rows| {
+                for r in rows {
+                    flat.extend_from_slice(&r.address);
+                }
+                Ok(())
+            })?;
+            *slot = Some(NeighbourhoodCache {
+                version: inner.version,
+                n,
+                state: crate::surprise::Incremental::build(flat, d, k),
+            });
+        }
+        Ok(score(slot.as_ref().expect("just filled")))
+    }
+
+    /// After a committed write: when the collection only appended rows (a
+    /// plain collection) and the `surprise` cache was current before it,
+    /// insert the new rows into the cache instead of letting it go stale.
+    fn neighbourhood_after_append<'a>(
+        &self,
+        before: (u64, usize),
+        inner: &EAMInner,
+        appended: impl ExactSizeIterator<Item = &'a [f64]>,
+    ) {
+        if inner.config.competitive {
+            return;
+        }
+        let Ok(mut slot) = self.neighbourhood.write() else {
+            return;
+        };
+        let Some(c) = slot.as_mut() else {
+            return;
+        };
+        if c.version != before.0
+            || c.n != before.1
+            || inner.locations.len() != before.1 + appended.len()
+        {
+            return;
+        }
+        for x in appended {
+            c.state.insert(x);
+        }
+        c.version = inner.version;
+        c.n = inner.locations.len();
+    }
+
     /// The time-attended read of this collection's history: what the
     /// database's learned recency expects next, unit-normalised. `None` when
     /// the collection is empty.
@@ -1285,6 +1478,7 @@ impl Collection {
 
         let mut att = self.attention_begin()?;
         let mut inner = self.atomic_mutation()?;
+        let before = (inner.version, inner.locations.len());
 
         // No EmptyMemory guard: data-seeded index is seeded by the first write.
 
@@ -1373,6 +1567,7 @@ impl Collection {
 
         inner.commit();
         publish_attention_state(att);
+        self.neighbourhood_after_append(before, &inner, inputs.iter().map(|x| x.as_ref()));
         Ok(())
     }
 
@@ -2251,6 +2446,7 @@ impl Collection {
 
         let mut att = self.attention_begin()?;
         let mut inner = self.atomic_mutation()?;
+        let before = (inner.version, inner.locations.len());
 
         let d = inner.config.d;
         for (input, _) in items {
@@ -2376,6 +2572,7 @@ impl Collection {
 
         inner.commit();
         publish_attention_state(att);
+        self.neighbourhood_after_append(before, &inner, items.iter().map(|(x, _)| x.as_ref()));
         Ok(documents.into_iter().map(|(id, _)| id).collect())
     }
 
@@ -5280,6 +5477,64 @@ mod shadow_residency_tests {
                 (v, format!("{{\"i\":{i}}}").into_bytes())
             })
             .collect()
+    }
+
+    /// `surprise` through the int8 scan gives exactly the brute-force
+    /// reference's scores and neighbours, in memory and in shadow residency
+    /// (where the rows are read back from storage), and again after a write.
+    #[test]
+    fn surprise_matches_the_brute_force_reference_in_both_residencies() {
+        let items = corpus(1200, 32);
+        let rows: Vec<Vec<f64>> = items.iter().map(|(v, _)| v.clone()).collect();
+        let mut rng = StdRng::seed_from_u64(4);
+        let queries: Vec<Vec<f64>> = (0..40)
+            .map(|t| {
+                let base = &rows[rng.gen_range(0..rows.len())];
+                base.iter()
+                    .map(|x| x + if t % 2 == 0 { 0.05 } else { 2.0 })
+                    .collect()
+            })
+            .collect();
+        let check = |col: &Collection, rows: &[Vec<f64>]| {
+            let refs: Vec<&[f64]> = rows.iter().map(|r| r.as_slice()).collect();
+            let reference = crate::surprise::Neighbourhood::build(&refs, 20);
+            let got = col.surprise(&queries, 20).unwrap();
+            for (q, g) in queries.iter().zip(&got) {
+                let (want, nb) = reference.surprise(q, &refs);
+                assert!(
+                    (g.surprise - want).abs() <= 1e-9 * want.abs().max(1.0),
+                    "{} vs {}",
+                    g.surprise,
+                    want
+                );
+                let want_ids: Vec<u64> = nb.iter().map(|&(i, _)| i as u64).collect();
+                let got_ids: Vec<u64> = g.nearest.iter().map(|&(id, _)| id).collect();
+                assert_eq!(got_ids, want_ids);
+            }
+        };
+        for residency in [Residency::Memory, Residency::Shadow] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let hive = Hive::open(dir.path(), config(residency), 256).unwrap();
+            let col = hive.get_or_create_collection("normal").unwrap();
+            col.write_batch(&rows).unwrap();
+            check(&col, &rows);
+            let more: Vec<Vec<f64>> = corpus(1300, 32)[1200..]
+                .iter()
+                .map(|(v, _)| v.clone())
+                .collect();
+            col.write_batch(&more).unwrap();
+            // The append updated the cache in place: it is current without a
+            // rebuild.
+            {
+                let inner = col.read_inner().unwrap();
+                let slot = col.neighbourhood.read().unwrap();
+                let c = slot.as_ref().expect("the cache survives an append");
+                assert_eq!((c.version, c.n), (inner.version, inner.locations.len()));
+            }
+            let mut all = rows.clone();
+            all.extend(more);
+            check(&col, &all);
+        }
     }
 
     /// Everything a shadow-resident collection answers is what the same data

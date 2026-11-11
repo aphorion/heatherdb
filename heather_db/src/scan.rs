@@ -68,12 +68,15 @@ pub struct Scan {
 /// What a scan ranks by. `Dot` is the normalised query's dot product with
 /// each stored address ([`crate::read::activate`]'s order); `Cosine` divides
 /// by the address's length too ([`vec_ops::cosine_similarity`]), which is the
-/// order documents are ranked in.
+/// order documents are ranked in. `Euclidean` ranks by smallest
+/// `|q − x|` with the query as given (not normalised): the score is
+/// `−|q − x|²`, nearest first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Metric {
     #[default]
     Dot,
     Cosine,
+    Euclidean,
 }
 
 /// An f64 rounded up to the nearest f32 that is not smaller.
@@ -353,6 +356,8 @@ struct Prepared {
     tq: f64,
     qn: f64,
     eq: f64,
+    /// `|q|` of the query as given (`Euclidean` only).
+    qlen: f64,
 }
 
 impl Prepared {
@@ -367,6 +372,7 @@ impl Prepared {
         match self.metric {
             Metric::Dot => (low, high),
             Metric::Cosine => cosine_interval(low, high, r),
+            Metric::Euclidean => euclidean_interval(low, high, self.qlen, r),
         }
     }
 
@@ -381,6 +387,7 @@ impl Prepared {
             tq,
             qn: vec_ops::l2_norm(&q),
             eq,
+            qlen: vec_ops::l2_norm(query),
         }
     }
 }
@@ -503,6 +510,20 @@ fn cosine_interval(low: f64, high: f64, r: &RowTerms) -> (f64, f64) {
     (lo - widen(lo), hi + widen(hi))
 }
 
+/// A certified interval for `−|q − x|²` from one for `q̂·x` (`q̂` the unit
+/// query). `−|q − x|² = 2|q| (q̂·x) − |x|² − |q|²`, so with `|x|` between its
+/// rounded bounds the interval follows directly, widened by the rounding of
+/// the products and squares. `|q|²` is the same for every row; it is kept so
+/// the score is the true negative squared distance.
+fn euclidean_interval(low: f64, high: f64, qlen: f64, r: &RowTerms) -> (f64, f64) {
+    let q2 = qlen * qlen;
+    let hi = 2.0 * qlen * high - r.len_lo * r.len_lo - q2;
+    let lo = 2.0 * qlen * low - r.len_hi * r.len_hi - q2;
+    let slack = r.fp * (2.0 * qlen * low.abs().max(high.abs()) + r.len_hi * r.len_hi + q2)
+        + f64::MIN_POSITIVE;
+    (lo - slack, hi + slack)
+}
+
 /// The rows the int8 shadow cannot rule out of the exact top `k` for
 /// `query`: a superset of the true top k, usually a few dozen rows. `None`
 /// when the shadow is not in step with the `n` rows, so the caller falls back
@@ -593,7 +614,12 @@ pub fn rank<'a>(
     rank_by(query, rows, k, Metric::Dot, address)
 }
 
-/// [`rank`] by either metric: `Cosine` scores are
+/// Exact squared Euclidean distance.
+pub fn squared_distance(a: &[f64], b: &[f64]) -> f64 {
+    a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum()
+}
+
+/// [`rank`] by any metric: `Cosine` scores are
 /// [`vec_ops::cosine_similarity`], exactly as documents are scored.
 pub fn rank_by<'a>(
     query: &[f64],
@@ -610,6 +636,7 @@ pub fn rank_by<'a>(
             let s = match metric {
                 Metric::Dot => vec_ops::dot(&q, a),
                 Metric::Cosine => vec_ops::cosine_similarity(query, a),
+                Metric::Euclidean => -squared_distance(query, a),
             };
             (i, s)
         })
@@ -643,6 +670,48 @@ mod tests {
                 HardLocation::new(LocationId(i as u64), vec_ops::normalize(&v))
             })
             .collect()
+    }
+
+    /// Euclidean candidates always contain the exact nearest rows by
+    /// distance, on rows of very different lengths (plain collections store
+    /// vectors as given), with exact duplicates and unnormalised queries.
+    #[test]
+    fn the_int8_scan_finds_the_exact_euclidean_nearest() {
+        let mut rng = StdRng::seed_from_u64(17);
+        for (n, d) in [(60, 3), (3000, 29), (1500, 130)] {
+            let mut locations = clustered(n, d, &mut rng);
+            for (i, loc) in locations.iter_mut().enumerate() {
+                let s = 0.2 + (i % 9) as f64;
+                loc.address.iter_mut().for_each(|x| *x *= s);
+            }
+            locations[1].address = locations[0].address.clone();
+            let scan = Scan::from_locations(&locations);
+            for t in 0..100 {
+                let base = locations[rng.gen_range(0..n)].address.clone();
+                let q: Vec<f64> = base
+                    .iter()
+                    .map(|x| {
+                        x + if t % 2 == 0 {
+                            0.0
+                        } else {
+                            rng.gen_range(-0.3..0.3)
+                        }
+                    })
+                    .collect();
+                for k in [1, 10, 51] {
+                    let k = k.min(n);
+                    let cands = candidates_batch(&[&q], &[(k, Metric::Euclidean)], n, &scan)
+                        .unwrap()
+                        .remove(0);
+                    let (_, got) =
+                        rank_by(&q, &cands, k, Metric::Euclidean, |i| &locations[i].address);
+                    let all: Vec<usize> = (0..n).collect();
+                    let (_, want) =
+                        rank_by(&q, &all, k, Metric::Euclidean, |i| &locations[i].address);
+                    assert_eq!(got, want, "n={n} d={d} k={k}");
+                }
+            }
+        }
     }
 
     #[test]
