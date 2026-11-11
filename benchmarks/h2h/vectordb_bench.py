@@ -22,7 +22,7 @@ Systems (each in a fresh process or container, measured alone)
 
 Measures (all over HTTP, JSON bodies on both sides)
   recall@10, single-client latency p50/p95 and queries/s, throughput with
-  8 concurrent clients, load time (writes + index build, until the first
+  8 concurrent clients (each pass repeated 3 times: median and range), load time (writes + index build, until the first
   query can run at full speed), peak memory (sampled every 0.25 s from
   start to end, so load-time peaks count), steady memory after queries,
   and disk use.
@@ -77,6 +77,14 @@ def pct(xs, q):
     return float(np.percentile(np.asarray(xs) * 1000.0, q))
 
 
+def qps(single, conc):
+    """Median and range of the repeated throughput passes."""
+    return {"qps_1_client": float(np.median(single)),
+            "qps_1_client_range": [float(min(single)), float(max(single))],
+            f"qps_{CLIENTS}_clients": float(np.median(conc)),
+            f"qps_{CLIENTS}_clients_range": [float(min(conc)), float(max(conc))]}
+
+
 class Sampler:
     """Samples a memory reading every 0.25 s on a background thread."""
 
@@ -99,19 +107,31 @@ class Sampler:
         return self.peak
 
 
+REPEATS = 3
+
+
 def run_queries(one, Q):
-    """Single client latency, then CLIENTS concurrent clients' throughput."""
-    one(Q[0])  # warm-up (and builds any lazy index)
-    lat, found = [], []
-    for q in Q:
-        t = time.perf_counter()
-        found.append(one(q))
-        lat.append(time.perf_counter() - t)
-    t0 = time.perf_counter()
-    with ThreadPoolExecutor(CLIENTS) as ex:
-        list(ex.map(one, Q))
-    conc = len(Q) / (time.perf_counter() - t0)
-    return found, lat, conc
+    """Single-client latency (every query, REPEATS passes), then CLIENTS
+    concurrent clients' throughput, REPEATS times. A laptop's background load
+    swings one run by tens of percent, so throughput is reported as the
+    median with its range, and latency percentiles pool every pass."""
+    one(Q[0])  # warm-up
+    lat, found, single = [], None, []
+    for _ in range(REPEATS):
+        res, t_pass = [], time.perf_counter()
+        for q in Q:
+            t = time.perf_counter()
+            res.append(one(q))
+            lat.append(time.perf_counter() - t)
+        single.append(len(Q) / (time.perf_counter() - t_pass))
+        found = found or res
+    conc = []
+    for _ in range(REPEATS):
+        t0 = time.perf_counter()
+        with ThreadPoolExecutor(CLIENTS) as ex:
+            list(ex.map(one, Q))
+        conc.append(len(Q) / (time.perf_counter() - t0))
+    return found, lat, single, conc
 
 
 # -------------------------------------------------------------- HeatherDB
@@ -142,15 +162,14 @@ def bench_heather(X, Q, truth, residency):
             r.raise_for_status()
             return [id2row[x["id"]] for x in r.json()["results"]]
 
-        found, lat, conc = run_queries(one, Q)
+        found, lat, single, conc = run_queries(one, Q)
         steady = h.ps.memory_info().rss
         disk = h.disk_bytes()
     finally:
         peak = sampler.stop()
         h.close()
     return {"system": f"HeatherDB ({residency} residency)", "recall@10": recall(found, truth),
-            "p50_ms": pct(lat, 50), "p95_ms": pct(lat, 95), "qps_1_client": len(lat) / sum(lat),
-            f"qps_{CLIENTS}_clients": conc, "load_s": load_s,
+            "p50_ms": pct(lat, 50), "p95_ms": pct(lat, 95), **qps(single, conc), "load_s": load_s,
             "peak_mem_mib": peak / 2**20, "steady_mem_mib": steady / 2**20, "disk_mib": disk / 2**20}
 
 
@@ -205,10 +224,9 @@ def bench_qdrant(X, Q, truth):
                 r.raise_for_status()
                 return [p["id"] for p in r.json()["result"]]
 
-            found, lat, conc = run_queries(one, Q)
+            found, lat, single, conc = run_queries(one, Q)
             out.append({"system": label, "recall@10": recall(found, truth),
-                        "p50_ms": pct(lat, 50), "p95_ms": pct(lat, 95),
-                        "qps_1_client": len(lat) / sum(lat), f"qps_{CLIENTS}_clients": conc,
+                        "p50_ms": pct(lat, 50), "p95_ms": pct(lat, 95), **qps(single, conc),
                         "load_s": load_s})
         steady = docker_mem(name)
         peak = sampler.stop()
