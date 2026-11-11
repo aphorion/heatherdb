@@ -164,7 +164,7 @@ pub struct FieldTable {
 
 /// Every symbol field's vocabulary and codes.
 ///
-/// A write changes it in place and keeps an undo [`Journal`] of what it
+/// A write changes it in place and keeps an undo `Journal` of what it
 /// touched: [`Self::rollback`] restores a failed write exactly, and only the
 /// touched values are saved ([`Self::changed_records`]), one record per
 /// value, so a write costs what it touches, not the table's size.
@@ -186,7 +186,7 @@ struct Journal {
 }
 
 /// One value as a write found it: its text, codes, optimiser moments and
-/// count. Kept in memory for rollback; [`StoredValue`] is what is saved.
+/// count. Kept in memory for rollback; `StoredValue` is what is saved.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ValueRecord {
     pub value: String,
