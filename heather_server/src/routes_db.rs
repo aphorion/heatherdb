@@ -518,17 +518,17 @@ pub async fn selective_attention(
     routes::selective_attention(State(hive)).await
 }
 
-pub async fn surprise(
+pub async fn novelty(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
     ctx: AuditCtx,
-    Json(req): Json<SurpriseRequest>,
+    Json(req): Json<NoveltyRequest>,
 ) -> Response {
     let hive = match resolve_db(&server, &db_name) {
         Ok(h) => h,
         Err(r) => return r,
     };
-    routes::surprise(State(hive), Path(col), ctx.for_db(&db_name), Json(req)).await
+    routes::novelty(State(hive), Path(col), ctx.for_db(&db_name), Json(req)).await
 }
 
 pub async fn analyze(
@@ -1221,12 +1221,12 @@ mod selective_attention_tests {
 }
 
 #[cfg(test)]
-mod surprise_tests {
+mod novelty_tests {
     use super::*;
     use axum::body::to_bytes;
 
     #[tokio::test]
-    async fn surprise_scores_a_batch_and_audits_returned_rows() {
+    async fn novelty_scores_a_batch_and_audits_returned_rows() {
         let dir = tempfile::tempdir().unwrap();
         let server = Arc::new(Server::open(dir.path(), 8).unwrap());
         let req: CreateDatabaseRequest = serde_json::from_value(serde_json::json!({
@@ -1259,11 +1259,11 @@ mod surprise_tests {
             scope: "root".into(),
             db: "default".into(),
         };
-        let req: SurpriseRequest = serde_json::from_value(serde_json::json!({
+        let req: NoveltyRequest = serde_json::from_value(serde_json::json!({
             "queries": [[0.45, 0.45], [5.0, 5.0]], "k": 10, "nearest": 2
         }))
         .unwrap();
-        let resp = surprise(
+        let resp = novelty(
             Extension(server.clone()),
             Path(("risk".into(), "normal".into())),
             ctx,
@@ -1273,8 +1273,8 @@ mod surprise_tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let v: serde_json::Value =
             serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap();
-        let a = v["results"][0]["surprise"].as_f64().unwrap();
-        let b = v["results"][1]["surprise"].as_f64().unwrap();
+        let a = v["results"][0]["novelty"].as_f64().unwrap();
+        let b = v["results"][1]["novelty"].as_f64().unwrap();
         assert!(a < 1.5 && b > 5.0, "{v}");
         assert_eq!(v["results"][1]["nearest"].as_array().unwrap().len(), 2);
 
@@ -1283,7 +1283,7 @@ mod surprise_tests {
         assert!(
             entries
                 .iter()
-                .any(|e| e.route == "surprise" && e.result_count == 4)
+                .any(|e| e.route == "novelty" && e.result_count == 4)
         );
     }
 }

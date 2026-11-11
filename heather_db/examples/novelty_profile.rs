@@ -1,8 +1,8 @@
-//! Time `surprise` on real rows: the first call (building every row's
+//! Time `novelty` on real rows: the first call (building every row's
 //! spread through the int8 scan) and later calls, in memory and in shadow
 //! residency. Run under `/usr/bin/time -l` (macOS) or `-v` (Linux) for peak
 //! memory.
-//! `cargo run --release -p heather_db --example surprise_profile -- ROWS QUERIES D RESIDENCY`
+//! `cargo run --release -p heather_db --example novelty_profile -- ROWS QUERIES D RESIDENCY`
 //! (rows and queries: little-endian f64; RESIDENCY: memory | shadow)
 use std::time::Instant;
 
@@ -47,7 +47,7 @@ fn main() {
     let nocache = a.get(5).is_some_and(|x| x == "nocache");
     let t = Instant::now();
     if !nocache {
-        col.surprise(&queries, 50).unwrap();
+        col.novelty(&queries, 50).unwrap();
     }
     println!(
         "  first call (build spreads + {} queries): {:.1}s",
@@ -56,7 +56,7 @@ fn main() {
     );
     let t = Instant::now();
     if !nocache {
-        col.surprise(&queries, 50).unwrap();
+        col.novelty(&queries, 50).unwrap();
     }
     println!(
         "  later call: {:.3} ms/query",
@@ -74,7 +74,7 @@ fn main() {
         t.elapsed().as_secs_f64() * 1e3 / new.len() as f64
     );
     let t = Instant::now();
-    col.surprise(&queries, 50).unwrap();
+    col.novelty(&queries, 50).unwrap();
     println!(
         "  call after appends (no rebuild): {:.3} ms/query",
         t.elapsed().as_secs_f64() * 1e3 / queries.len() as f64

@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn surprise_ranks_an_outlier_and_rebuilds_after_a_write() {
+    fn novelty_ranks_an_outlier_and_rebuilds_after_a_write() {
         use rand::{Rng, SeedableRng};
         let dir = TempDir::new().unwrap();
         let mut config = EAMConfig::new(3).unwrap();
@@ -591,11 +591,9 @@ mod tests {
         col.write_batch(&rows).unwrap();
         let inside = vec![0.1, 0.0, -0.1];
         let outside = vec![6.0, 6.0, 6.0];
-        let before = col
-            .surprise(&[inside.clone(), outside.clone()], 20)
-            .unwrap();
-        assert!(before[0].surprise < 1.5, "inside: {}", before[0].surprise);
-        assert!(before[1].surprise > 3.0, "outside: {}", before[1].surprise);
+        let before = col.novelty(&[inside.clone(), outside.clone()], 20).unwrap();
+        assert!(before[0].novelty < 1.5, "inside: {}", before[0].novelty);
+        assert!(before[1].novelty > 3.0, "outside: {}", before[1].novelty);
         assert_eq!(before[1].nearest.len(), 20);
 
         // Normal activity now includes that region: the cache must rebuild.
@@ -603,12 +601,12 @@ mod tests {
             .map(|_| (0..3).map(|_| 6.0 + rng.gen_range(-0.5..0.5)).collect())
             .collect();
         col.write_batch(&near).unwrap();
-        let after = col.surprise(std::slice::from_ref(&outside), 20).unwrap();
+        let after = col.novelty(std::slice::from_ref(&outside), 20).unwrap();
         assert!(
-            after[0].surprise < 1.5,
+            after[0].novelty < 1.5,
             "after normal writes there: {}",
-            after[0].surprise
+            after[0].novelty
         );
-        assert!(col.surprise(std::slice::from_ref(&outside), 0).is_err());
+        assert!(col.novelty(std::slice::from_ref(&outside), 0).is_err());
     }
 }

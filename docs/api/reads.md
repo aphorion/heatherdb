@@ -275,11 +275,15 @@ curl -u admin:pw http://localhost:6380/db/movies/collections/user_42/next
 | `400 Bad Request` | the database has no selective attention, or was created without `time` |
 | `404 Not Found` | no such collection |
 
-### POST /db/{db}/collections/{name}/surprise
+### POST /db/{db}/collections/{name}/novelty
 
-How unusual each query is, relative to how its nearest stored rows sit
-among themselves. Legacy: `POST /collections/{name}/surprise`. Audited
-when `nearest` asks for stored rows back.
+How new each query is, relative to what is normal around it in memory.
+About `1` means it fits its surroundings; higher means it stands out from
+them. Novelty is relative, not absolute: the same distance can be ordinary
+in a sparse region and alarming in a dense one. It is the default way to
+ask "is this an anomaly?", "is this new?", "should I abstain?" or "has
+normal moved?". Legacy: `POST /collections/{name}/novelty`. Audited when
+`nearest` asks for stored rows back.
 
 | Field | Type | Default |
 |---|---|---|
@@ -287,14 +291,13 @@ when `nearest` asks for stored rows back.
 | `k` | integer | `50`. Neighbours compared |
 | `nearest` | integer | `0`. How many nearest stored rows to return per query |
 
-Every stored row gets a *spread*, the distance to its `k`-th nearest other
-row. A query's surprise is the mean familiarity of its `k` nearest rows
-divided by its own, where familiarity is the inverse mean distance to those
-neighbours, each distance floored at the neighbour's spread. This is the
-local outlier factor over the collection's rows, so it reads the same way in
-dense and sparse regions: about `1` for a query that sits the way its
-neighbours do, higher for one that does not. Distances are Euclidean over
-the stored patterns, so store standardised features.
+How it is computed today: the local outlier factor over the collection's
+rows. Every stored row gets a *spread*, the distance to its `k`-th nearest
+other row. A query's novelty is the mean familiarity of its `k` nearest
+rows divided by its own, where familiarity is the inverse mean distance to
+those neighbours, each distance floored at the neighbour's spread.
+Distances are Euclidean over the stored rows, so store standardised
+features.
 
 Neighbours are found by the exact int8 scan (`Euclidean` metric), which
 reads only a few dozen candidate rows back from storage in shadow
@@ -317,14 +320,14 @@ appended row costs one distance per stored row.
 
 ```bash
 curl -u admin:pw -X POST \
-  http://localhost:6380/db/risk/collections/normal_card_activity/surprise \
+  http://localhost:6380/db/risk/collections/normal_card_activity/novelty \
   -H 'Content-Type: application/json' \
   -d '{"queries":[[0.1,-0.3,0.2],[4.1,3.8,-5.0]],"k":50,"nearest":1}'
 ```
 
 ```json
-{ "results": [ { "surprise": 1.02, "nearest": [ { "id": 812, "distance": 0.31 } ] },
-               { "surprise": 7.9,  "nearest": [ { "id": 40,  "distance": 6.2 } ] } ] }
+{ "results": [ { "novelty": 1.02, "nearest": [ { "id": 812, "distance": 0.31 } ] },
+               { "novelty": 7.9,  "nearest": [ { "id": 40,  "distance": 6.2 } ] } ] }
 ```
 
 | Status | Cause |

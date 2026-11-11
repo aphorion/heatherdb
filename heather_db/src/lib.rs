@@ -44,11 +44,11 @@ pub mod hive;
 pub mod location;
 pub mod merge;
 pub mod nearest;
+pub mod novelty;
 pub mod read;
 pub mod scan;
 pub mod server;
 pub mod store;
-pub mod surprise;
 pub mod vec_ops;
 pub mod verify;
 pub mod write;
@@ -56,7 +56,7 @@ pub mod write;
 pub use audit::{AuditConfig, AuditLog, AuditQuery, AuditRecord, AuditVisibility, query_hash};
 pub use collection::{
     Collection, CompressResult, EAMStats, LocationSummary, MIN_CLEANUP_BETA, MultiRoleHit,
-    MultiRoleResults, ReadStrategy, RoleCleanup, SurpriseResult,
+    MultiRoleResults, NoveltyResult, ReadStrategy, RoleCleanup,
 };
 pub use config::{EAMConfig, Precision, Residency};
 pub use db_config::{

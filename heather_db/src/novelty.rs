@@ -1,26 +1,31 @@
-//! Surprise relative to the neighbourhood: how unusual a query is compared
-//! with how unusual its nearest stored rows are among themselves.
+//! Novelty: how new something is, relative to what is normal around it in
+//! memory.
 //!
-//! Raw distance to the nearest stored row cannot tell a rare-but-normal
-//! region from a genuinely unusual point: both are far from everything. This
-//! read asks a relative question instead. Every stored row gets a *spread*,
-//! the distance to its `k`-th nearest other row; a row's *familiarity* is the
-//! inverse of its mean reachability distance to its `k` nearest rows, where
-//! reaching a row costs at least that row's spread. A query's surprise is
-//! the mean familiarity of its `k` nearest rows divided by its own:
+//! Novelty is relative, not absolute. The same distance can be ordinary in
+//! a sparse region of memory and alarming in a dense one, so novelty
+//! compares a query's place among its nearest stored rows with how those
+//! rows sit among themselves. About 1 means the query fits its
+//! surroundings; higher means it stands out from them. One number answers
+//! "is this an anomaly?", "is this new?", "should I abstain?" and "has
+//! normal moved?".
+//!
+//! **How it is computed today.** The local outlier factor (Breunig et al.,
+//! 2000) over a collection's stored rows. Every stored row gets a *spread*,
+//! the distance to its `k`-th nearest other row; a row's *familiarity* is
+//! the inverse of its mean reachability distance to its `k` nearest rows,
+//! where reaching a row costs at least that row's spread:
 //!
 //! ```text
 //! reach(q, o)   = max(|q − o|, spread(o))
 //! fam(q)        = 1 / mean_{o ∈ kNN(q)} reach(q, o)
-//! surprise(q)   = mean_{o ∈ kNN(q)} fam(o) / fam(q)
+//! novelty(q)   = mean_{o ∈ kNN(q)} fam(o) / fam(q)
 //! ```
 //!
-//! About 1 for a query that sits the way its neighbours sit; well above 1
-//! for a query far from a region its neighbours find dense. This is the
-//! local outlier factor (Breunig et al., 2000) computed over a collection's
-//! stored rows, so it is scale-free: a threshold means the same thing in a
-//! dense and a sparse part of the data. The floor `spread(o)` keeps exact
-//! duplicates, whose distance is 0, from making familiarity infinite.
+//! It is scale-free: a threshold means the same thing in a dense and a
+//! sparse part of the data. The floor `spread(o)` keeps exact duplicates,
+//! whose distance is 0, from making familiarity infinite. The definition
+//! above is what novelty means; the computation may change (for example to
+//! a learned distance) without changing it.
 //!
 //! Distances are Euclidean over the stored addresses as written, so encode
 //! with the scales you want compared. A collection finds neighbours with
@@ -264,7 +269,7 @@ impl Neighbourhood {
         Self::from_knn(&knn, k)
     }
 
-    /// The surprise of a query given its `k` nearest rows (row index,
+    /// The novelty of a query given its `k` nearest rows (row index,
     /// distance), nearest first. `NaN` when it has none.
     pub fn score(&self, nb: &[(usize, f64)]) -> f64 {
         if nb.is_empty() {
@@ -275,9 +280,9 @@ impl Neighbourhood {
         theirs / own
     }
 
-    /// The surprise of `query` against the rows this was built from, by
+    /// The novelty of `query` against the rows this was built from, by
     /// brute force, and its `k` nearest rows, nearest first.
-    pub fn surprise(&self, query: &[f64], rows: &[&[f64]]) -> (f64, Vec<(usize, f64)>) {
+    pub fn novelty(&self, query: &[f64], rows: &[&[f64]]) -> (f64, Vec<(usize, f64)>) {
         let nb = nearest(query, rows, self.k, None);
         (self.score(&nb), nb)
     }
@@ -455,7 +460,7 @@ impl Incremental {
         }
     }
 
-    /// The surprise of a query given its nearest rows (row index, distance),
+    /// The novelty of a query given its nearest rows (row index, distance),
     /// nearest first. `NaN` when it has none.
     pub fn score(&self, nb: &[(usize, f64)]) -> f64 {
         if nb.is_empty() {
@@ -490,7 +495,7 @@ mod tests {
     /// cluster is. Raw distance cannot tell these apart: both are equally
     /// far from their nearest row.
     #[test]
-    fn surprise_is_relative_to_the_neighbourhood() {
+    fn novelty_is_relative_to_the_neighbourhood() {
         let mut rng = StdRng::seed_from_u64(3);
         let mut rows: Vec<Vec<f64>> = Vec::new();
         for _ in 0..300 {
@@ -504,8 +509,8 @@ mod tests {
         }
         let r = refs(&rows);
         let nh = Neighbourhood::build(&r, 20);
-        let (in_sparse, _) = nh.surprise(&[10.5, 0.5], &r);
-        let (off_dense, _) = nh.surprise(&[0.0, 1.0], &r);
+        let (in_sparse, _) = nh.novelty(&[10.5, 0.5], &r);
+        let (off_dense, _) = nh.novelty(&[0.0, 1.0], &r);
         assert!(in_sparse < 1.5, "inside the sparse cluster: {in_sparse}");
         assert!(off_dense > 3.0, "far off the dense cluster: {off_dense}");
     }
@@ -518,7 +523,7 @@ mod tests {
             .collect();
         let r = refs(&rows);
         let nh = Neighbourhood::build(&r, 20);
-        let (s, nb) = nh.surprise(&[0.0, 0.0, 0.0, 0.0], &r);
+        let (s, nb) = nh.novelty(&[0.0, 0.0, 0.0, 0.0], &r);
         assert!((0.7..1.4).contains(&s), "{s}");
         assert_eq!(nb.len(), 20);
         assert!(nb.windows(2).all(|w| w[0].1 <= w[1].1), "nearest first");
@@ -530,7 +535,7 @@ mod tests {
         let r = refs(&rows);
         let nh = Neighbourhood::build(&r, 10);
         assert!(nh.familiarity.iter().all(|f| f.is_finite()));
-        let (s, _) = nh.surprise(&[1.0, 2.0], &r);
+        let (s, _) = nh.novelty(&[1.0, 2.0], &r);
         assert!(s.is_finite());
     }
 

@@ -107,7 +107,7 @@ Source of truth: `heather_server/src/main.rs`.
 | [POST /db/{db}/collections/{name}/batch_analyze](../api/reads.md#post-dbdbcollectionsnamebatchanalyze) | [POST /collections/{name}/batch_analyze](../api/reads.md#post-dbdbcollectionsnamebatchanalyze) |
 | [POST /db/{db}/collections/{name}/recall](../api/reads.md#post-dbdbcollectionsnamerecall) | [POST /collections/{name}/recall](../api/reads.md#post-dbdbcollectionsnamerecall) |
 | [GET /db/{db}/collections/{name}/next](../api/reads.md#get-dbdbcollectionsnamenext) | [GET /collections/{name}/next](../api/reads.md#get-dbdbcollectionsnamenext) |
-| [POST /db/{db}/collections/{name}/surprise](../api/reads.md#post-dbdbcollectionsnamesurprise) | [POST /collections/{name}/surprise](../api/reads.md#post-dbdbcollectionsnamesurprise) |
+| [POST /db/{db}/collections/{name}/novelty](../api/reads.md#post-dbdbcollectionsnamenovelty) | [POST /collections/{name}/novelty](../api/reads.md#post-dbdbcollectionsnamenovelty) |
 
 ### Documents
 

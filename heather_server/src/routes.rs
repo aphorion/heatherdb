@@ -1087,14 +1087,14 @@ pub async fn analyze(
     }
 }
 
-/// Surprise relative to the neighbourhood, for a batch of queries: the local
+/// Novelty relative to the neighbourhood, for a batch of queries: the local
 /// outlier factor over the collection's stored rows (see
-/// `heather_db::surprise`). Audited when it returns stored rows.
-pub async fn surprise(
+/// `heather_db::novelty`). Audited when it returns stored rows.
+pub async fn novelty(
     State(hive): State<AppState>,
     Path(name): Path<String>,
     ctx: AuditCtx,
-    Json(req): Json<SurpriseRequest>,
+    Json(req): Json<NoveltyRequest>,
 ) -> Response {
     if req.queries.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "queries array must not be empty");
@@ -1123,7 +1123,7 @@ pub async fn surprise(
     let k = req.k.unwrap_or(50);
     let keep = req.nearest.unwrap_or(0);
     let queries = req.queries;
-    let result = tokio::task::spawn_blocking(move || col.surprise(&queries, k)).await;
+    let result = tokio::task::spawn_blocking(move || col.novelty(&queries, k)).await;
     if keep > 0 {
         let (status, ids) = match &result {
             Ok(Ok(rs)) => (
@@ -1141,7 +1141,7 @@ pub async fn surprise(
             &hive,
             &ctx,
             &name,
-            "surprise",
+            "novelty",
             status,
             ids,
             AuditQueryInfo {
@@ -1151,16 +1151,16 @@ pub async fn surprise(
         );
     }
     match result {
-        Ok(Ok(rs)) => Json(SurpriseResponse {
+        Ok(Ok(rs)) => Json(NoveltyResponse {
             results: rs
                 .into_iter()
-                .map(|r| SurpriseItem {
-                    surprise: r.surprise,
+                .map(|r| NoveltyItem {
+                    novelty: r.novelty,
                     nearest: r
                         .nearest
                         .into_iter()
                         .take(keep)
-                        .map(|(id, distance)| SurpriseNeighbour { id, distance })
+                        .map(|(id, distance)| NoveltyNeighbour { id, distance })
                         .collect(),
                 })
                 .collect(),

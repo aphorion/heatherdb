@@ -343,22 +343,22 @@ impl EAMInner {
     }
 }
 
-/// A collection's neighbourhood for `surprise`, as of one collection
-/// version. Plain appends update it in place ([`crate::surprise::Incremental`]);
+/// A collection's neighbourhood for `novelty`, as of one collection
+/// version. Plain appends update it in place ([`crate::novelty::Incremental`]);
 /// any other change leaves it stale, and the next call rebuilds it.
 #[derive(Debug)]
 struct NeighbourhoodCache {
     version: u64,
     n: usize,
-    state: crate::surprise::Incremental,
+    state: crate::novelty::Incremental,
 }
 
-/// One query's surprise relative to its neighbourhood.
+/// One query's novelty relative to its neighbourhood.
 #[derive(Debug, Clone, PartialEq)]
-pub struct SurpriseResult {
+pub struct NoveltyResult {
     /// About 1 for a query that sits the way its neighbours do; higher is
     /// more unusual. `NaN` for an empty collection.
-    pub surprise: f64,
+    pub novelty: f64,
     /// The query's nearest stored rows, (location id, Euclidean distance),
     /// nearest first.
     pub nearest: Vec<(u64, f64)>,
@@ -437,8 +437,8 @@ pub struct Collection {
     attention: Option<Arc<crate::attention::SharedAttention>>,
     /// Shares the exact k-nearest scan among concurrent reads.
     coalescer: Coalescer,
-    /// Spreads and familiarities for `surprise`, built on first use and
-    /// rebuilt when the collection changes (see [`crate::surprise`]).
+    /// Spreads and familiarities for `novelty`, built on first use and
+    /// rebuilt when the collection changes (see [`crate::novelty`]).
     neighbourhood: std::sync::RwLock<Option<NeighbourhoodCache>>,
 }
 
@@ -1326,18 +1326,18 @@ impl Collection {
             .collect())
     }
 
-    /// Surprise of each query relative to its `k` nearest stored rows (see
-    /// [`crate::surprise`]): the local outlier factor over the collection's
+    /// Novelty of each query relative to its `k` nearest stored rows (see
+    /// [`crate::novelty`]): the local outlier factor over the collection's
     /// stored addresses, by Euclidean distance. Neighbours come from the
     /// exact int8 scan. The rows' spreads are computed on the first call for
     /// a given `k` and collection version by a blocked all-pairs search
-    /// ([`crate::surprise::knn_all`]), then reused until the collection
+    /// ([`crate::novelty::knn_all`]), then reused until the collection
     /// changes.
-    pub fn surprise(
+    pub fn novelty(
         &self,
         queries: &[impl AsRef<[f64]> + Sync],
         k: usize,
-    ) -> Result<Vec<SurpriseResult>> {
+    ) -> Result<Vec<NoveltyResult>> {
         if k == 0 {
             return Err(HeatherError::InvalidInput("k must be > 0".into()));
         }
@@ -1355,7 +1355,7 @@ impl Collection {
         let n = inner.locations.len();
         if n < 2 {
             return Err(HeatherError::InvalidInput(
-                "surprise needs at least 2 stored rows".into(),
+                "novelty needs at least 2 stored rows".into(),
             ));
         }
         let k_eff = k.min(n - 1);
@@ -1370,10 +1370,10 @@ impl Collection {
         }
         let fresh =
             |c: &NeighbourhoodCache| c.version == inner.version && c.n == n && c.state.k == k;
-        let score = |c: &NeighbourhoodCache| -> Vec<SurpriseResult> {
+        let score = |c: &NeighbourhoodCache| -> Vec<NoveltyResult> {
             knn.iter()
-                .map(|nb| SurpriseResult {
-                    surprise: c.state.score(nb),
+                .map(|nb| NoveltyResult {
+                    novelty: c.state.score(nb),
                     nearest: nb
                         .iter()
                         .map(|&(i, dist)| (inner.locations[i].id.0, dist))
@@ -1407,14 +1407,14 @@ impl Collection {
             *slot = Some(NeighbourhoodCache {
                 version: inner.version,
                 n,
-                state: crate::surprise::Incremental::build(flat, d, k),
+                state: crate::novelty::Incremental::build(flat, d, k),
             });
         }
         Ok(score(slot.as_ref().expect("just filled")))
     }
 
     /// After a committed write: when the collection only appended rows (a
-    /// plain collection) and the `surprise` cache was current before it,
+    /// plain collection) and the `novelty` cache was current before it,
     /// insert the new rows into the cache instead of letting it go stale.
     fn neighbourhood_after_append<'a>(
         &self,
@@ -5479,11 +5479,11 @@ mod shadow_residency_tests {
             .collect()
     }
 
-    /// `surprise` through the int8 scan gives exactly the brute-force
+    /// `novelty` through the int8 scan gives exactly the brute-force
     /// reference's scores and neighbours, in memory and in shadow residency
     /// (where the rows are read back from storage), and again after a write.
     #[test]
-    fn surprise_matches_the_brute_force_reference_in_both_residencies() {
+    fn novelty_matches_the_brute_force_reference_in_both_residencies() {
         let items = corpus(1200, 32);
         let rows: Vec<Vec<f64>> = items.iter().map(|(v, _)| v.clone()).collect();
         let mut rng = StdRng::seed_from_u64(4);
@@ -5497,14 +5497,14 @@ mod shadow_residency_tests {
             .collect();
         let check = |col: &Collection, rows: &[Vec<f64>]| {
             let refs: Vec<&[f64]> = rows.iter().map(|r| r.as_slice()).collect();
-            let reference = crate::surprise::Neighbourhood::build(&refs, 20);
-            let got = col.surprise(&queries, 20).unwrap();
+            let reference = crate::novelty::Neighbourhood::build(&refs, 20);
+            let got = col.novelty(&queries, 20).unwrap();
             for (q, g) in queries.iter().zip(&got) {
-                let (want, nb) = reference.surprise(q, &refs);
+                let (want, nb) = reference.novelty(q, &refs);
                 assert!(
-                    (g.surprise - want).abs() <= 1e-9 * want.abs().max(1.0),
+                    (g.novelty - want).abs() <= 1e-9 * want.abs().max(1.0),
                     "{} vs {}",
-                    g.surprise,
+                    g.novelty,
                     want
                 );
                 let want_ids: Vec<u64> = nb.iter().map(|&(i, _)| i as u64).collect();

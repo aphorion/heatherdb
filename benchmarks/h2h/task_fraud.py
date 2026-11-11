@@ -83,21 +83,21 @@ def run_heather(h, normals, Xte, yte):
 
 
 def run_heather_v2(h, normals, Xte, yte, k=50):
-    """Surprise relative to the neighbourhood: the stored normals are the
-    memory; each transaction is scored by `surprise` (its distance to its k
+    """Novelty relative to the neighbourhood: the stored normals are the
+    memory; each transaction is scored by `novelty` (its distance to its k
     nearest normals relative to how spread out those normals usually are)."""
-    h.create_db("fraud_surprise", normals.shape[1], competitive=False)
-    col = "/db/fraud_surprise/collections/normal_card_activity"
+    h.create_db("fraud_novelty", normals.shape[1], competitive=False)
+    col = "/db/fraud_novelty/collections/normal_card_activity"
     with Meter() as fit:
         h.call("POST", col + "/bulk_load",
                {"addresses_b64": b64rows(normals), "counters_b64": b64rows(normals)})
     score = np.empty(len(Xte))
     with Meter() as sc:
         for i in range(0, len(Xte), 1000):
-            r = h.call("POST", col + "/surprise",
+            r = h.call("POST", col + "/novelty",
                        {"queries": Xte[i:i + 1000].tolist(), "k": k})
-            score[i:i + 1000] = [x["surprise"] for x in r["results"]]
-    return {"system": "HeatherDB (surprise)", **metrics(score, yte), "fit_s": fit.wall,
+            score[i:i + 1000] = [x["novelty"] for x in r["results"]]
+    return {"system": "HeatherDB (novelty)", **metrics(score, yte), "fit_s": fit.wall,
             "score_us_per_txn": sc.wall / len(Xte) * 1e6}
 
 
@@ -113,7 +113,7 @@ def run_iforest(normals, Xte, yte):
 
 
 def run_lof50(normals, Xte, yte):
-    """LOF at the same neighbour count HeatherDB's surprise uses."""
+    """LOF at the same neighbour count HeatherDB's novelty uses."""
     return run_lof(normals, Xte, yte, k=50)
 
 

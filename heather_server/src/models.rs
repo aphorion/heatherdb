@@ -432,9 +432,9 @@ pub struct BatchAnalyzeRequest {
     pub strategy: Option<String>,
 }
 
-/// `POST .../surprise`: each query's surprise relative to its neighbourhood.
+/// `POST .../novelty`: each query's novelty relative to its neighbourhood.
 #[derive(Debug, Deserialize)]
-pub struct SurpriseRequest {
+pub struct NoveltyRequest {
     pub queries: Vec<Vec<f64>>,
     /// Neighbours compared. Default 50.
     pub k: Option<usize>,
@@ -443,23 +443,23 @@ pub struct SurpriseRequest {
 }
 
 #[derive(Debug, Serialize)]
-pub struct SurpriseNeighbour {
+pub struct NoveltyNeighbour {
     pub id: u64,
     pub distance: f64,
 }
 
 #[derive(Debug, Serialize)]
-pub struct SurpriseItem {
+pub struct NoveltyItem {
     /// About 1 for a query that sits the way its neighbours do; higher is
     /// more unusual.
-    pub surprise: f64,
+    pub novelty: f64,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub nearest: Vec<SurpriseNeighbour>,
+    pub nearest: Vec<NoveltyNeighbour>,
 }
 
 #[derive(Debug, Serialize)]
-pub struct SurpriseResponse {
-    pub results: Vec<SurpriseItem>,
+pub struct NoveltyResponse {
+    pub results: Vec<NoveltyItem>,
 }
 
 #[derive(Debug, Serialize)]
