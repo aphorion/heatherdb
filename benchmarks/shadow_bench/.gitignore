@@ -1,0 +1,4 @@
+target/
+data
+data_glove
+Cargo.lock

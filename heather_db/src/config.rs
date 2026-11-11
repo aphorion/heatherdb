@@ -71,6 +71,33 @@ pub struct EAMConfig {
     /// (`competitive = false`) databases only.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selective_attention: Option<crate::attention::AttentionConfig>,
+    /// Where vectors live while the database is open: `memory` keeps every
+    /// address in RAM; `shadow` keeps only the int8 shadow the scans read
+    /// (see [`crate::scan`]) and reads exact vectors from storage when an
+    /// answer needs them; `auto` (the default) is `shadow` for a plain
+    /// database without selective attention and `memory` otherwise. See
+    /// [`Residency`] and [`EAMConfig::shadowed`].
+    #[serde(default)]
+    pub residency: Residency,
+}
+
+/// Where a database's vectors live while it is open.
+///
+/// `Shadow` keeps a few bytes per dimension in memory instead of eight: the
+/// scans need only the shadow, and the exact rows an answer needs are read
+/// from storage. Whole-collection operations (fingerprint, snapshots,
+/// compress, dreaming, `locations?full`) stream the rows from storage in
+/// chunks rather than holding them. Answers are identical in both.
+///
+/// `Auto`, the default, resolves per database: `Shadow` where it is allowed
+/// (a plain database without selective attention), `Memory` otherwise.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Residency {
+    #[default]
+    Auto,
+    Memory,
+    Shadow,
 }
 
 fn default_competitive() -> bool {
@@ -128,6 +155,7 @@ impl EAMConfig {
             competitive: true,
             precision: Precision::F64,
             selective_attention: None,
+            residency: Residency::Auto,
         };
         config.validate()?;
         Ok(config)
@@ -147,9 +175,43 @@ impl EAMConfig {
         long_range.max(floor)
     }
 
+    /// Whether this database keeps only the int8 shadow in memory: an
+    /// explicit `shadow`, or `auto` on a plain database without selective
+    /// attention.
+    pub fn shadowed(&self) -> bool {
+        match self.residency {
+            Residency::Shadow => true,
+            Residency::Memory => false,
+            Residency::Auto => !self.competitive && self.selective_attention.is_none(),
+        }
+    }
+
+    /// The residency this database runs with, with `auto` resolved.
+    pub fn effective_residency(&self) -> Residency {
+        if self.shadowed() {
+            Residency::Shadow
+        } else {
+            Residency::Memory
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         if self.d == 0 {
             return Err(HeatherError::InvalidConfig("d must be > 0".into()));
+        }
+        if self.residency == Residency::Shadow && self.competitive {
+            return Err(HeatherError::InvalidConfig(
+                "residency \"shadow\" needs a plain database (competitive: false): \
+                 competitive writes move addresses, so they need them in memory"
+                    .into(),
+            ));
+        }
+        if self.residency == Residency::Shadow && self.selective_attention.is_some() {
+            return Err(HeatherError::InvalidConfig(
+                "selective_attention reads every stored row on each write and recall, so it \
+                 needs residency \"memory\""
+                    .into(),
+            ));
         }
         if let Some(att) = &self.selective_attention {
             if self.competitive {
@@ -240,6 +302,24 @@ impl EAMConfig {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn auto_residency_is_shadow_only_where_shadow_is_allowed() {
+        let mut c = EAMConfig::new(8).unwrap();
+        assert_eq!(c.residency, Residency::Auto);
+        assert_eq!(c.effective_residency(), Residency::Memory); // competitive
+        c.competitive = false;
+        assert_eq!(c.effective_residency(), Residency::Shadow);
+        c.residency = Residency::Memory;
+        assert_eq!(c.effective_residency(), Residency::Memory);
+        c.residency = Residency::Auto;
+        c.selective_attention = Some(toml::from_str("time = true").unwrap());
+        assert_eq!(c.effective_residency(), Residency::Memory);
+        // A db.toml written before residency existed reads as auto.
+        let toml = toml::to_string(&EAMConfig::new(8).unwrap()).unwrap();
+        let old: EAMConfig = toml::from_str(&toml.replace("residency = \"auto\"\n", "")).unwrap();
+        assert_eq!(old.residency, Residency::Auto);
+    }
     use super::*;
 
     #[test]

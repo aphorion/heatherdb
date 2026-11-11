@@ -96,6 +96,7 @@ pub async fn list_databases(Extension(server): Extension<Arc<Server>>) -> Respon
             collections,
             competitive: cfg.eam.competitive,
             precision: cfg.eam.precision,
+            residency: cfg.eam.effective_residency(),
             format_version: cfg.format_version,
             selective_attention: cfg.eam.selective_attention.clone(),
             skipped_records: server
@@ -146,6 +147,9 @@ pub async fn create_database(
         if let Some(v) = o.selective_attention {
             cfg.eam.selective_attention = Some(v);
         }
+        if let Some(v) = o.residency {
+            cfg.eam.residency = v;
+        }
         if let Err(e) = cfg.eam.validate() {
             return err(StatusCode::BAD_REQUEST, e);
         }
@@ -163,6 +167,7 @@ pub async fn create_database(
                     collections: 0,
                     competitive: c.eam.competitive,
                     precision: c.eam.precision,
+                    residency: c.eam.effective_residency(),
                     format_version: c.format_version,
                     selective_attention: c.eam.selective_attention.clone(),
                     skipped_records: 0,
@@ -214,6 +219,7 @@ pub async fn get_database(
         collections,
         competitive: cfg.eam.competitive,
         precision: cfg.eam.precision,
+        residency: cfg.eam.effective_residency(),
         format_version: cfg.format_version,
         selective_attention: cfg.eam.selective_attention.clone(),
         skipped_records,
@@ -801,6 +807,88 @@ mod audit_tests {
 #[cfg(test)]
 mod plain_compact_tests {
     use super::*;
+
+    /// `residency: "shadow"` is accepted on a plain database, reported,
+    /// kept across a restart, and answers queries from storage; on a
+    /// competitive database it is refused. Unset, it resolves per database.
+    #[tokio::test]
+    async fn shadow_residency_databases_are_created_and_reopened() {
+        let dir = tempfile::tempdir().unwrap();
+        let create = |server: Arc<Server>, name: &'static str, eam: serde_json::Value| async move {
+            let req: CreateDatabaseRequest = serde_json::from_value(serde_json::json!({
+                "name": name, "dimension": 8, "eam": eam
+            }))
+            .unwrap();
+            let resp = create_database(Extension(server), Json(req)).await;
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (
+                status,
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+            )
+        };
+        {
+            let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+            let (status, body) = create(
+                server.clone(),
+                "lean",
+                serde_json::json!({"competitive": false, "residency": "shadow"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(body["residency"], "shadow");
+            let (status, _) = create(
+                server.clone(),
+                "refused",
+                serde_json::json!({"residency": "shadow"}),
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+
+            // Left unset, residency resolves per database: shadow for a
+            // plain database, memory for a competitive one or one with
+            // selective attention, and an explicit "memory" is kept.
+            for (name, eam, want) in [
+                ("plain", serde_json::json!({"competitive": false}), "shadow"),
+                ("competitive", serde_json::json!({}), "memory"),
+                (
+                    "pinned",
+                    serde_json::json!({"competitive": false, "residency": "memory"}),
+                    "memory",
+                ),
+            ] {
+                let (status, body) = create(server.clone(), name, eam).await;
+                assert_eq!(status, StatusCode::OK, "{name}");
+                assert_eq!(body["residency"], want, "{name}");
+            }
+
+            let col = resolve_db(&server, "lean")
+                .unwrap()
+                .get_or_create_collection("docs")
+                .unwrap();
+            for i in 0..50 {
+                let mut v = vec![0.1; 8];
+                v[i % 8] = 1.0 + i as f64;
+                col.write_with_metadata(&v, format!("{{\"i\":{i}}}").as_bytes())
+                    .unwrap();
+            }
+        }
+        let server = Arc::new(Server::open(dir.path(), 4).unwrap());
+        assert_eq!(
+            server.database_config("lean").unwrap().eam.residency,
+            heather_db::Residency::Shadow
+        );
+        let col = resolve_db(&server, "lean")
+            .unwrap()
+            .get_or_create_collection("docs")
+            .unwrap();
+        let (v, _) = col.get_document(7).unwrap().unwrap();
+        let hits = col.query_documents(&v, 1).unwrap();
+        assert_eq!(hits[0].0, 7);
+        assert!((hits[0].1 - 1.0).abs() < 1e-9);
+    }
 
     /// A database created with `competitive: false` and `precision: "f32"`
     /// reports both, keeps them across a restart, and stores one location

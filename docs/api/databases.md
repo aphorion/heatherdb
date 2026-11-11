@@ -46,7 +46,7 @@ Auth: Basic or Bearer, **root scope**.
 | `dimension` | integer | *required* | Immutable for the life of the database |
 | `map_size_mb` | integer | `4096` | LMDB ceiling for this database's env |
 | `mdl_gate` | boolean | `false` | Allocate by description length instead of `tau_split`/`tau_overload` |
-| `eam` | object | — | Partial `EAMConfig` override: `k`, `t_max`, `beta`, `neighbor_cap`, `num_landmarks`, `l_0`, `competitive`, `precision`. Unset fields keep the engine default; the merged config is validated. `"competitive": false` makes every collection a plain store: writes append each vector as its own location with no activation, merge or migration, use it to retain individual observations, including similarity-based associative recall through attention. Competitive mode learns shared patterns and can adapt through graceful forgetting. See [Choose a memory mode](../how-to/choose-memory-mode.md). `"precision": "f32"` stores vectors in half the space (rounded to f32 when written; all math stays f64). Both are fixed for the database's lifetime, and `GET /db` / `GET /db/{db}` report them. `"selective_attention"` turns on attention learned from prediction error (plain databases only); see [GET /db/{db}/selective-attention](#get-dbdbselective-attention) and [Selective attention](../explanation/selective-attention.md) |
+| `eam` | object | — | Partial `EAMConfig` override: `k`, `t_max`, `beta`, `neighbor_cap`, `num_landmarks`, `l_0`, `competitive`, `precision`, `residency`. Unset fields keep the engine default; the merged config is validated. `"competitive": false` makes every collection a plain store: writes append each vector as its own location with no activation, merge or migration, use it to retain individual observations, including similarity-based associative recall through attention. Competitive mode learns shared patterns and can adapt through graceful forgetting. See [Choose a memory mode](../how-to/choose-memory-mode.md). `"precision": "f32"` stores vectors in half the space (rounded to f32 when written; all math stays f64). Both are fixed for the database's lifetime, and `GET /db` / `GET /db/{db}` report them. `"residency"` is `"auto"` by default: plain databases without selective attention run in `"shadow"` residency, keeping an int8 shadow of each vector in memory and reading exact vectors from storage when an answer needs them (answers are identical, memory is several times smaller); other databases run in `"memory"`. Set `"memory"` to keep a plain database's vectors in RAM. Responses report the resolved residency. See [Configuration](../reference/configuration.md#eam-knobs). `"selective_attention"` turns on attention learned from prediction error (plain databases only); see [GET /db/{db}/selective-attention](#get-dbdbselective-attention) and [Selective attention](../explanation/selective-attention.md) |
 
 ```bash
 curl -u admin:pw -X POST http://localhost:6380/db \
@@ -59,7 +59,7 @@ Responds with the same shape as [`GET /db/{db}`](#get-dbdb):
 
 ```json
 { "name": "movies", "created_at": 1767225600, "dimension": 384,
-  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64",
+  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64", "residency": "memory",
   "format_version": 2, "skipped_records": 0 }
 ```
 
@@ -84,7 +84,7 @@ curl -u admin:pw http://localhost:6380/db/movies
 
 ```json
 { "name": "movies", "created_at": 1767225600, "dimension": 384,
-  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64",
+  "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64", "residency": "memory",
   "format_version": 2, "skipped_records": 0 }
 ```
 

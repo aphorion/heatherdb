@@ -9,6 +9,9 @@ use crate::error::{HeatherError, Result};
 use crate::location::{HardLocation, LocationId};
 
 const NEXT_COLLECTION_ID_KEY: &str = "_next_collection_id";
+/// Locations decoded per chunk when streaming a collection's rows (see
+/// [`Store::for_each_location_chunk`]).
+pub const LOCATION_CHUNK: usize = 4096;
 
 /// Composite key: [collection_id: 4 bytes BE | location_id: 8 bytes BE]
 fn location_key(collection_id: u32, location_id: u64) -> [u8; 12] {
@@ -263,6 +266,14 @@ impl Store {
         collection_id: u32,
         loc: &HardLocation,
     ) -> Result<()> {
+        // A location whose vectors were dropped from memory (shadow
+        // residency) must never overwrite its stored row.
+        if loc.address.is_empty() || loc.address[0].is_nan() {
+            return Err(HeatherError::InvalidInput(format!(
+                "refusing to store location {} without its vectors",
+                loc.id.0
+            )));
+        }
         let key = location_key(collection_id, loc.id.0);
         let data = self.encode_location(loc)?;
         self.locations_db.put(txn, &key, &data)?;
@@ -295,19 +306,66 @@ impl Store {
     }
 
     pub fn load_all_locations(&self, collection_id: u32) -> Result<Vec<HardLocation>> {
+        let mut locations = Vec::new();
+        self.for_each_location_chunk(collection_id, LOCATION_CHUNK, |chunk| {
+            locations.append(chunk);
+            Ok(())
+        })?;
+        Ok(locations)
+    }
+
+    /// Every stored location of a collection, in id order, handed to `f` in
+    /// chunks of up to `chunk` decoded locations. A chunk is dropped (or
+    /// moved out by `f`) before the next is decoded, so a caller that does
+    /// not keep them holds at most one chunk of vectors at a time. A
+    /// location that does not decode is skipped (and counted), so one bad
+    /// record cannot keep the collection from opening.
+    pub fn for_each_location_chunk(
+        &self,
+        collection_id: u32,
+        chunk: usize,
+        mut f: impl FnMut(&mut Vec<HardLocation>) -> Result<()>,
+    ) -> Result<()> {
+        let chunk = chunk.max(1);
         let rtxn = self.env.read_txn()?;
         let prefix = collection_prefix(collection_id);
-        let mut locations = Vec::new();
-        let iter = self.locations_db.prefix_iter(&rtxn, &prefix)?;
-        for result in iter {
+        let mut buf = Vec::with_capacity(chunk);
+        for result in self.locations_db.prefix_iter(&rtxn, &prefix)? {
             let (_key, value) = result?;
-            // A location that does not decode is skipped (and counted), so
-            // one bad record cannot keep the collection from opening.
             if let Some(loc) = self.tolerate(self.decode_location(value))? {
-                locations.push(loc);
+                buf.push(loc);
+            }
+            if buf.len() == chunk {
+                f(&mut buf)?;
+                buf.clear();
             }
         }
-        Ok(locations)
+        if !buf.is_empty() {
+            f(&mut buf)?;
+        }
+        Ok(())
+    }
+
+    /// One stored location by id, or `None` if there is none (or it does
+    /// not decode).
+    pub fn get_location(&self, collection_id: u32, id: u64) -> Result<Option<HardLocation>> {
+        let rtxn = self.env.read_txn()?;
+        self.get_location_txn(&rtxn, collection_id, id)
+    }
+
+    /// [`Self::get_location`] within an open read transaction, for callers
+    /// fetching several rows from one consistent snapshot.
+    pub fn get_location_txn(
+        &self,
+        txn: &RoTxn,
+        collection_id: u32,
+        id: u64,
+    ) -> Result<Option<HardLocation>> {
+        let key = location_key(collection_id, id);
+        match self.locations_db.get(txn, key.as_slice())? {
+            Some(bytes) => self.tolerate(self.decode_location(bytes)),
+            None => Ok(None),
+        }
     }
 
     /// Decodes every stored location and document of a collection and
