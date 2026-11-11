@@ -412,6 +412,8 @@ pub struct Collection {
     /// The database's selective attention, shared by its collections; `None`
     /// unless the database opted in. See [`crate::attention`].
     attention: Option<Arc<crate::attention::SharedAttention>>,
+    /// Shares the exact k-nearest scan among concurrent reads.
+    coalescer: Coalescer,
 }
 
 /// Hold the collection lock through persistence and recovery. Successful writes
@@ -599,24 +601,137 @@ impl Collection {
     /// The exact `k` nearest rows to `query`, sorted descending, as
     /// [`EAMInner::activate`]: in shadow residency the int8 shadow names the
     /// candidates and only those rows are read from storage and ranked.
+    ///
+    /// Concurrent calls share the scan: see [`Coalescer`].
     pub(crate) fn activate(
         &self,
         inner: &EAMInner,
         query: &[f64],
         k: usize,
     ) -> Result<(Vec<usize>, Vec<f64>)> {
-        if inner.config.residency != Residency::Shadow {
+        self.activate_by(inner, query, k, scan::Metric::Dot)
+    }
+
+    /// [`Self::activate`] by either metric: `Cosine` ranks rows exactly as
+    /// documents are scored ([`vec_ops::cosine_similarity`]).
+    pub(crate) fn activate_by(
+        &self,
+        inner: &EAMInner,
+        query: &[f64],
+        k: usize,
+        metric: scan::Metric,
+    ) -> Result<(Vec<usize>, Vec<f64>)> {
+        let shadow = inner.config.residency == Residency::Shadow;
+        let Some(cands) = self.coalescer.candidates(inner, query, k, metric)? else {
+            if shadow || metric != scan::Metric::Dot {
+                return Err(HeatherError::Corrupt(
+                    "the int8 shadow is out of step with the collection".into(),
+                ));
+            }
             return Ok(inner.activate(query, k));
-        }
-        let n = inner.locations.len();
-        let Some(cands) = scan::candidates(query, n, k, &inner.scan) else {
-            return Err(HeatherError::Corrupt(
-                "the int8 shadow is out of step with the collection".into(),
-            ));
         };
+        if !shadow {
+            return Ok(scan::rank_by(query, &cands, k, metric, |i| {
+                &inner.locations[i].address
+            }));
+        }
         let rows = self.hydrate(inner, &cands)?;
-        let (local, sims) = scan::rank(query, &rows.idx, k, |j| &rows.locations[j].address);
+        let (local, sims) =
+            scan::rank_by(query, &rows.idx, k, metric, |j| &rows.locations[j].address);
         Ok((local.into_iter().map(|j| rows.original(j)).collect(), sims))
+    }
+}
+
+/// Documents as a query returns them: (id, cosine similarity, metadata).
+type ScoredDocuments = Vec<(u64, f64, Vec<u8>)>;
+
+/// Group commit for the exact k-nearest scan.
+///
+/// The int8 scan is limited by memory bandwidth: every query reads every
+/// shadow. Queries that arrive while a scan is running queue here, and the
+/// next scan answers all of them in one pass over the shadow
+/// ([`scan::candidates_batch`]). A query that finds no scan running starts
+/// one at once, so an idle collection adds no latency; under load, batches
+/// form by themselves.
+///
+/// Every queued caller holds its own read lock on the collection while it
+/// waits, so no write can land between their views: whichever caller runs
+/// the batch scans the state all of them see.
+#[derive(Default)]
+pub(crate) struct Coalescer {
+    state: std::sync::Mutex<Queue>,
+    done: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct Queue {
+    running: bool,
+    pending: Vec<Arc<Ticket>>,
+}
+
+/// One queued query and, once a scan has run, its candidates (`None` when
+/// the shadow could not answer it).
+struct Ticket {
+    query: Vec<f64>,
+    k: usize,
+    metric: scan::Metric,
+    answer: std::sync::Mutex<Option<Option<Vec<usize>>>>,
+}
+
+impl Coalescer {
+    /// The rows the shadow cannot rule out of `query`'s top `k`, from a scan
+    /// shared with every query queued alongside it.
+    fn candidates(
+        &self,
+        inner: &EAMInner,
+        query: &[f64],
+        k: usize,
+        metric: scan::Metric,
+    ) -> Result<Option<Vec<usize>>> {
+        fn poisoned<T>(_: T) -> HeatherError {
+            HeatherError::LockPoisoned
+        }
+        let ticket = Arc::new(Ticket {
+            query: query.to_vec(),
+            k,
+            metric,
+            answer: std::sync::Mutex::new(None),
+        });
+        let mut queue = self.state.lock().map_err(poisoned)?;
+        queue.pending.push(ticket.clone());
+        loop {
+            if let Some(answer) = ticket.answer.lock().map_err(poisoned)?.take() {
+                return Ok(answer);
+            }
+            if queue.running {
+                queue = self.done.wait(queue).map_err(poisoned)?;
+                continue;
+            }
+            queue.running = true;
+            let batch = std::mem::take(&mut queue.pending);
+            drop(queue);
+            let n = inner.locations.len();
+            let refs: Vec<&[f64]> = batch.iter().map(|t| t.query.as_slice()).collect();
+            let specs: Vec<(usize, scan::Metric)> = batch.iter().map(|t| (t.k, t.metric)).collect();
+            let answers = match scan::candidates_batch(&refs, &specs, n, &inner.scan) {
+                Some(all) => all.into_iter().map(Some).collect(),
+                // One query the shadow cannot take (a k out of range) must
+                // not fail the others: answer each on its own.
+                None => batch
+                    .iter()
+                    .map(|t| {
+                        scan::candidates_batch(&[&t.query], &[(t.k, t.metric)], n, &inner.scan)
+                            .map(|mut v| v.remove(0))
+                    })
+                    .collect::<Vec<_>>(),
+            };
+            for (t, a) in batch.iter().zip(answers) {
+                *t.answer.lock().map_err(poisoned)? = Some(a);
+            }
+            queue = self.state.lock().map_err(poisoned)?;
+            queue.running = false;
+            self.done.notify_all();
+        }
     }
 }
 
@@ -828,6 +943,7 @@ impl Collection {
             }),
             store,
             attention: None,
+            coalescer: Coalescer::default(),
         })
     }
 
@@ -881,6 +997,7 @@ impl Collection {
             }),
             store,
             attention: None,
+            coalescer: Coalescer::default(),
         })
     }
 
@@ -2477,6 +2594,27 @@ impl Collection {
             return Ok(Vec::new());
         }
 
+        // A plain collection's documents are its locations' own vectors
+        // (stored by reference), so the top n documents by cosine are among
+        // the top n locations by cosine: ask the scan for exactly those.
+        // Fewer than n documents among them (vector-only writes mixed in)
+        // widens the search; a document that is not its location's own vector
+        // (rewritten by merge or compress) falls back to the general path.
+        if !inner.config.competitive && unbind_role.is_none() {
+            let len = inner.locations.len();
+            let mut k = n.min(len);
+            loop {
+                match self.plain_documents_by_cosine(&inner, query, k)? {
+                    Some(mut scored) if scored.len() >= n || k == len => {
+                        scored.truncate(n);
+                        return Ok(scored);
+                    }
+                    Some(_) => k = (k * 2).min(len),
+                    None => break,
+                }
+            }
+        }
+
         // Step 1: Activate query against hard locations (graph-accelerated when ready)
         // Candidates come from a wider set of locations than a read uses: a
         // document is posted under the locations its write activated, which
@@ -2527,6 +2665,49 @@ impl Collection {
         scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         scored.truncate(n);
         Ok(scored)
+    }
+
+    /// The documents posted under the `k` locations nearest `query` by cosine,
+    /// scored by cosine and sorted, or `None` if any of them is not stored by
+    /// reference to its own location (its vector could then differ from the
+    /// location's, and ranking locations would not rank documents).
+    fn plain_documents_by_cosine(
+        &self,
+        inner: &EAMInner,
+        query: &[f64],
+        k: usize,
+    ) -> Result<Option<ScoredDocuments>> {
+        let (indices, sims) = self.activate_by(inner, query, k, scan::Metric::Cosine)?;
+        let rtxn = self.store.read_txn()?;
+        let mut scored = Vec::with_capacity(indices.len());
+        for (&idx, &sim) in indices.iter().zip(&sims) {
+            let loc_id = inner.locations[idx].id.0;
+            for doc_id in
+                self.store
+                    .get_doc_ids_for_location_txn(&rtxn, self.collection_id, loc_id)?
+            {
+                let Some(data) = self
+                    .store
+                    .get_document_txn(&rtxn, self.collection_id, doc_id)?
+                else {
+                    continue;
+                };
+                let Some((vector, metadata)) = self
+                    .store
+                    .tolerate(self.store.decode_document_parts(&data))?
+                else {
+                    continue;
+                };
+                if vector != DocVector::Location(loc_id) {
+                    return Ok(None);
+                }
+                // The document's vector is this location's address, so its
+                // cosine is the one the scan ranked by.
+                scored.push((doc_id, sim, metadata));
+            }
+        }
+        scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+        Ok(Some(scored))
     }
 
     /// Score every recalled document against **several** `(role, filler)`
@@ -5183,6 +5364,93 @@ mod shadow_residency_tests {
         // A flush must not overwrite stored rows with hollow ones.
         reopened.flush().unwrap();
         compare(&mem, &reopened);
+    }
+
+    /// Concurrent queries share scans (see [`Coalescer`]) and each still gets
+    /// exactly the answer it gets alone, in both residency modes.
+    #[test]
+    fn concurrent_queries_share_scans_and_stay_exact() {
+        for residency in [Residency::Memory, Residency::Shadow] {
+            let items = corpus(4000, 32);
+            let dir = tempfile::tempdir().unwrap();
+            let hive = Hive::open(dir.path(), config(residency), 64).unwrap();
+            let col = hive.get_or_create_collection("c").unwrap();
+            for chunk in items.chunks(1000) {
+                col.write_batch_with_metadata(chunk).unwrap();
+            }
+            let mut rng = StdRng::seed_from_u64(77);
+            let queries: Vec<Vec<f64>> = (0..160)
+                .map(|_| (0..32).map(|_| rng.gen_range(-1.0..1.0)).collect())
+                .collect();
+            let alone: Vec<_> = queries
+                .iter()
+                .map(|q| {
+                    let hits = col.query_documents(q, 10).unwrap();
+                    let read = col.read(q, ReadStrategy::HopfieldSS).unwrap();
+                    (
+                        hits.into_iter().map(|h| (h.0, h.1)).collect::<Vec<_>>(),
+                        read,
+                    )
+                })
+                .collect();
+            std::thread::scope(|s| {
+                for t in 0..16 {
+                    let (col, queries, alone) = (&col, &queries, &alone);
+                    s.spawn(move || {
+                        for i in (t..queries.len()).step_by(16) {
+                            let hits = col.query_documents(&queries[i], 10).unwrap();
+                            let got: Vec<_> = hits.into_iter().map(|h| (h.0, h.1)).collect();
+                            assert_eq!(got, alone[i].0, "{residency:?} query {i}");
+                            let read = col.read(&queries[i], ReadStrategy::HopfieldSS).unwrap();
+                            assert_eq!(read, alone[i].1, "{residency:?} read {i}");
+                        }
+                    });
+                }
+            });
+        }
+    }
+
+    /// A plain document query is the exact top n by cosine, checked against
+    /// brute force, on vectors whose lengths differ so dot and cosine orders
+    /// disagree, with vector-only writes mixed in, in both residency modes.
+    #[test]
+    fn plain_document_query_is_exact_by_cosine() {
+        for residency in [Residency::Memory, Residency::Shadow] {
+            let items = corpus(3000, 32);
+            let dir = tempfile::tempdir().unwrap();
+            let hive = Hive::open(dir.path(), config(residency), 64).unwrap();
+            let col = hive.get_or_create_collection("c").unwrap();
+            let mut rng = StdRng::seed_from_u64(31);
+            for chunk in items.chunks(500) {
+                col.write_batch_with_metadata(chunk).unwrap();
+                // vector-only rows: locations with no document
+                let extra: Vec<Vec<f64>> = (0..100)
+                    .map(|_| (0..32).map(|_| 6.0 * rng.gen_range(-1.0..1.0)).collect())
+                    .collect();
+                col.write_batch(&extra).unwrap();
+            }
+            for _ in 0..40 {
+                let q: Vec<f64> = (0..32).map(|_| rng.gen_range(-1.0..1.0)).collect();
+                let mut truth: Vec<(u64, f64)> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (v, _))| (i as u64, vec_ops::cosine_similarity(&q, v)))
+                    .collect();
+                truth.sort_by(|a, b| b.1.total_cmp(&a.1));
+                for n in [1, 10, 50] {
+                    let got = col.query_documents(&q, n).unwrap();
+                    assert_eq!(got.len(), n, "{residency:?}");
+                    for (g, t) in got.iter().zip(&truth) {
+                        assert!(
+                            (g.1 - t.1).abs() < 1e-12,
+                            "{residency:?} n={n}: {} vs {}",
+                            g.1,
+                            t.1
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
