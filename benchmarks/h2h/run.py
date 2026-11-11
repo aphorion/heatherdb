@@ -25,7 +25,7 @@ import common
 
 HERE = Path(__file__).parent
 RESULTS = HERE / "results"
-TASKS = ["search", "discovery", "recs", "fraud", "classify"]
+TASKS = ["search", "discovery", "recs", "fraud", "classify", "access"]
 
 # Incumbent runners: (task, label, module, function, loader-args)
 BASELINES = {
@@ -35,6 +35,7 @@ BASELINES = {
              ("run_itemknn_recency", None), ("run_als_recency", None)],
     "fraud": [("run_iforest", None), ("run_lof", None), ("run_lof50", None)],
     "classify": [("run_logreg", None), ("run_gbdt", None)],
+    "access": [("run_logreg", None), ("run_gbdt", None)],
 }
 
 
@@ -63,6 +64,23 @@ def run_child(task, fn, extra=None):
         if line.startswith("@@RESULT@@"):
             return json.loads(line[len("@@RESULT@@"):])
     raise RuntimeError(f"{task}.{fn} failed:\n{out.stderr[-2000:]}")
+
+
+def qdrant_or_last(mod, args):
+    """Qdrant is the incumbent: engine changes don't move its numbers. With
+    Docker unavailable, reuse its last measured row, marked as carried over."""
+    try:
+        subprocess.run(["docker", "info"], capture_output=True, timeout=20, check=True)
+    except (subprocess.SubprocessError, OSError):
+        prev = json.loads((RESULTS / "results.json").read_text())
+        q = next(r for r in prev["tasks"]["search"]["systems"]
+                 if r["system"].startswith("Qdrant"))
+        q["carried_from"] = prev["started"]
+        print(f"  Docker unavailable: Qdrant row carried from {prev['started']}", flush=True)
+        return q
+    q = mod.run_qdrant(*args)
+    q["process"] = "docker container"
+    return q
 
 
 def main():
@@ -103,21 +121,25 @@ def main():
             hres["server_cpu_s"] = h.cpu_seconds() - cpu0
             # With selective attention (format 2) the engine's own result leads;
             # the same engine without it is kept as a comparison row.
-            improved = getattr(mod, "run_heather_sa", None) or getattr(mod, "run_heather_v2", None)
-            if improved:
-                cpu0 = h.cpu_seconds()
-                sa = improved(h, *args)
-                sa["server_cpu_s"] = h.cpu_seconds() - cpu0
+            # Engine improvements, oldest first; the newest leads the task and
+            # every earlier HeatherDB result stays as a comparison row.
+            variants = [getattr(mod, f) for f in ("run_heather_sa", "run_heather_v2", "run_heather_sym")
+                        if hasattr(mod, f)]
+            if variants:
                 hres["system"] = getattr(mod, "BEFORE_LABEL", "HeatherDB (no selective attention)")
-                rec["systems"].insert(0, hres)
-                rec["systems"].insert(0, sa)
-                hres = sa
+                rows = [hres]
+                for fn in variants:
+                    cpu0 = h.cpu_seconds()
+                    v = fn(h, *args)
+                    v["server_cpu_s"] = h.cpu_seconds() - cpu0
+                    rows.append(v)
+                rec["systems"][0:0] = list(reversed(rows))
+                hres = rows[-1]
             else:
                 rec["systems"].insert(0, hres)
             print("  HeatherDB", {k: v for k, v in hres.items() if not isinstance(v, dict)}, flush=True)
             if task == "search":
-                q = mod.run_qdrant(*args)
-                q["process"] = "docker container"
+                q = qdrant_or_last(mod, args)
                 rec["systems"].append(q)
                 print("  ", q, flush=True)
             for fn, _ in BASELINES.get(task, []):

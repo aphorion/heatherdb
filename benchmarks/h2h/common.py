@@ -90,7 +90,20 @@ class Heather:
                 "mdl_gate": mdl_gate}
         if eam:
             body["eam"] = eam
-        return self.call("POST", "/db", body)
+        out = self.call("POST", "/db", body)
+        # Bulk import, as Postgres COPY with synchronous_commit=off: commits
+        # reach the OS, not the disk, one at a time. The incumbents load into
+        # memory with no per-write sync either. Reads are unaffected.
+        self.call("PUT", f"/db/{name}/durability", {"sync": False})
+        return out
+
+    def create_columns_db(self, name: str, columns: dict, predict=(), sequence=False):
+        """A database declared by its columns; rows are then written and read
+        by name (`rows`, `predict`, `next?column=`). Bulk import, as above."""
+        out = self.call("POST", "/db", {"name": name, "map_size_mb": 65536, "columns": columns,
+                                        "predict": list(predict), "sequence": sequence})
+        self.call("PUT", f"/db/{name}/durability", {"sync": False})
+        return out
 
     # -- measurement -------------------------------------------------------
     def sample(self) -> int:

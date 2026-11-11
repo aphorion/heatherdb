@@ -18,6 +18,7 @@ SPEC = [  # task, primary metric, label, capability, incumbent role, what it rep
     ("recs", "ndcg@10", "NDCG@10", "Recommendations", "recommender model"),
     ("fraud", "pr_auc", "PR-AUC", "Fraud detection", "outlier model"),
     ("classify", "roc_auc", "ROC-AUC", "Propensity scoring", "supervised model"),
+    ("access", "roc_auc", "ROC-AUC", "Access control", "supervised model on ids"),
 ]
 DATASET = {
     "search": "Fashion-MNIST, 60,000 x 784, 1,000 queries",
@@ -25,6 +26,7 @@ DATASET = {
     "recs": "MovieLens 1M, leave-last-out, 2,000 users",
     "fraud": "Credit-card fraud (ULB), 142,404 test transactions, 246 frauds",
     "classify": "UCI bank marketing, 31,647 train / 13,564 test",
+    "access": "Amazon Employee Access, 22,938 train / 9,831 test, 9 id columns",
 }
 e = html.escape
 
@@ -115,17 +117,24 @@ def best_inc(task, m):
 
 # Before/after selective attention, where the suite measured both.
 sa_rows = []
-for task, m, lab, cap in [("classify", "roc_auc", "ROC-AUC", "Propensity scoring"),
-                          ("recs", "ndcg@10", "NDCG@10", "Recommendations")]:
-    before, after = sysrow(task, "HeatherDB (no selective"), sysrow(task, "HeatherDB (selective")
+for task, m, lab, cap, bp in [
+        ("classify", "roc_auc", "ROC-AUC", "Propensity scoring", "HeatherDB (no selective"),
+        ("recs", "ndcg@10", "NDCG@10", "Recommendations", "HeatherDB (no selective"),
+        ("fraud", "pr_auc", "PR-AUC", "Fraud detection", "HeatherDB (nearest")]:
+    # "With" is the task's leading HeatherDB result: its newest method.
+    before, after = sysrow(task, bp), R["tasks"][task]["systems"][0]
     if before and after:
         b = best_inc(task, m)
         sa_rows.append(f"<tr><td><b>{cap}</b></td><td>{lab}</td><td class='num'>{f3(before[m])}</td>"
                        f"<td class='num'><b>{f3(after[m])}</b></td>"
                        f"<td class='num'>{f3(b[m])}<span class='sub'>{e(b['system'])}</span></td></tr>")
-recs_sa = sysrow("recs", "HeatherDB (selective")
+recs_sa = R["tasks"]["recs"]["systems"][0]
 curve = recs_sa.get("learned_time_weights") if recs_sa else None
 fraud_h = R["tasks"]["fraud"]["systems"][0]
+_rb = best_inc("recs", "ndcg@10")
+recs_gap = "" if recs_sa["ndcg@10"] >= 0.98 * _rb["ndcg@10"] else (
+    f"<li><b>Recommendations.</b> NDCG@10 {recs_sa['ndcg@10']:.3f} against {e(_rb['system'])}'s "
+    f"{_rb['ndcg@10']:.3f} ({recs_sa['ndcg@10'] / _rb['ndcg@10']:.0%}).</li>")
 fraud_b = best_inc("fraud", "pr_auc")
 good = sum(1 for _, r, _ in bars if r >= 0.98)
 close = sum(1 for _, r, _ in bars if 0.90 <= r < 0.98)
@@ -246,7 +255,7 @@ code {{ font: 13px var(--mono); }}
   <p class="muted">Each incumbent is deployed as its own service on the smallest instance that holds its measured
   peak memory with {P['memory_headroom']}x headroom; models that must refit to take in new data add
   {P['retrain_runs_per_month']} retrain runs a month. HeatherDB's peak memory is measured with all {n} databases
-  loaded in one process. Prices: AWS us-east-1 on-demand, Graviton m7g, list prices at time of writing.</p>
+  loaded in one process. Prices: AWS us-east-1 on-demand, Graviton m7g, list prices at time of writing.{(' HeatherDB peak memory, estimated in part: ' + fp['estimate_note'] + '.') if fp.get('estimate_note') else ''}</p>
   <div class="scroll"><table>
     <thead><tr><th>Component</th><th>Replaces</th><th>Peak memory</th><th>Instance</th><th>USD / month</th></tr></thead>
     <tbody>{''.join(inf_rows)}
@@ -256,10 +265,16 @@ code {{ font: 13px var(--mono); }}
 </section>
 
 <section>
-  <h2>What selective attention changed</h2>
-  <p>Selective attention lets the memory learn which features and which moments to weigh, from prediction error,
-  while data is written: each row is predicted before it is stored, and the miss teaches the attention. Same
-  engine, same data; the only difference is the database setting.</p>
+  <h2>What the engine changes did</h2>
+  <p><b>Selective attention</b> (propensity, recommendations) lets the memory learn which features and which moments
+  to weigh, from prediction error, while data is written: each row is predicted before it is stored, and the miss
+  teaches the attention. <b>Novelty</b> (fraud) scores a transaction against how its nearest stored normals sit among
+  themselves, not by raw distance, so rare-but-legitimate activity in sparse regions stops looking like fraud. It is
+  the local outlier factor computed inside the memory: it ties LOF at the same neighbour count (50) and beats LOF at
+  its default (20). <b>Learned symbols</b> (propensity, recommendations, access control) replace hand-encoding:
+  ids and categories are written as values, and the same prediction error that teaches attention moves a small
+  code per value, so a rarely seen value borrows from the values that behave like it. Same engine, same data in
+  every row below.</p>
   <div class="scroll"><table>
     <thead><tr><th>Workload</th><th>Metric</th><th>Without</th><th>With</th><th>Best incumbent</th></tr></thead>
     <tbody>{''.join(sa_rows)}</tbody></table></div>
@@ -269,16 +284,11 @@ code {{ font: 13px var(--mono); }}
 <section>
   <h2>Remaining gaps</h2>
   <ul>
-    <li><b>Fraud precision.</b> PR-AUC {fraud_h['pr_auc']:.3f} against {fraud_b['system']}'s {fraud_b['pr_auc']:.3f}
-    (ROC-AUC is level or better). The read scores raw distance to normal; LOF also corrects for local density.
-    The fix, a spread per memory location, reached PR-AUC 0.500 in the prototype and is the next engine change.</li>
-    <li><b>Recommendations.</b> NDCG@10 {recs_sa['ndcg@10']:.3f} against {best_inc('recs', 'ndcg@10')['system']}'s
-    {best_inc('recs', 'ndcg@10')['ndcg@10']:.3f} ({recs_sa['ndcg@10'] / best_inc('recs', 'ndcg@10')['ndcg@10']:.0%}). Learned recency closed
-    most of the gap; what is left is the item code, a fixed random projection where ALS learns item vectors. With
-    ALS's item vectors the same read reached 0.093 in the prototype, so codes the memory learns itself are the next lever.</li>
+
+    {recs_gap}
     <li><b>Cost per scored row.</b> Search is now faster than Qdrant ({search[0]['p50_ms']:.1f} ms against
     {search[1]['p50_ms']:.1f} ms p50), but per-row scoring still costs more than a fitted model's: a propensity recall
-    {sysrow('classify', 'HeatherDB (selective')['score_us_per_row'] / 1000:.1f} ms against
+    {R['tasks']['classify']['systems'][0]['score_us_per_row'] / 1000:.1f} ms against
     {best_inc('classify', 'roc_auc')['score_us_per_row']:.1f} µs, because the read scans every stored row, exactly, on
     every request. Fine for interactive use; batch scoring of millions of rows needs an index. The cost model sizes by
     memory, so at high query volume HeatherDB needs more CPU than shown.</li>
@@ -302,6 +312,8 @@ code {{ font: 13px var(--mono); }}
   {detail('fraud', [('roc_auc', 'ROC-AUC', f3), ('pr_auc', 'PR-AUC', f3), ('recall@1%fpr', 'recall @ 1% FPR', f3), ('score_us_per_txn', 'per txn', us)])}
   <h3>Propensity scoring · {e(DATASET['classify'])}</h3>
   {detail('classify', [('roc_auc', 'ROC-AUC', f3), ('pr_auc', 'PR-AUC', f3), ('fit_s', 'fit', sec), ('score_us_per_row', 'per row', us)])}
+  <h3>Access control · {e(DATASET['access'])}</h3>
+  {detail('access', [('roc_auc', 'ROC-AUC', f3), ('fit_s', 'fit', sec), ('score_us_per_row', 'per row', us)])}
 </section>
 
 <section>
