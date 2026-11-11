@@ -417,6 +417,80 @@ pub fn activate_auto(
     }
 }
 
+/// Where the iterative read settled in key space.
+pub(crate) struct KeySettle {
+    /// Settled state, a unit vector in address (key) space.
+    pub xi: Vec<f64>,
+    /// Softmax weights of the settled state over the activated addresses —
+    /// the weights the single value read uses.
+    pub weights: Vec<f64>,
+    pub iterations: usize,
+    pub converged: bool,
+}
+
+/// Iterate the Hopfield update over the activated **addresses only**: the loop
+/// decides *which* stored item the query belongs to without feeding a value
+/// back in as the next query. Values (counters) accumulate other writes'
+/// shares and need not equal their keys, so iterating on them drifts the state
+/// toward a different item; iterating on keys is the auto-associative update
+/// the convergence argument assumes (Ramsauer et al., 2021).
+pub(crate) fn settle_on_keys(
+    query: &[f64],
+    locations: &[HardLocation],
+    config: &EAMConfig,
+    indices: &[usize],
+) -> KeySettle {
+    let addresses: Vec<&[f64]> = indices
+        .iter()
+        .map(|&i| locations[i].address.as_slice())
+        .collect();
+    let weights_at = |xi: &[f64]| -> Vec<f64> {
+        let sims: Vec<f64> = addresses
+            .iter()
+            .map(|addr| vec_ops::cosine_similarity(xi, addr))
+            .collect();
+        vec_ops::softmax(&sims, config.beta)
+    };
+
+    let mut xi = vec_ops::normalize(query);
+    let mut converged = false;
+    let mut iterations = 0;
+
+    for t in 0..config.t_max {
+        iterations = t + 1;
+        let alpha = weights_at(&xi);
+        let xi_new = vec_ops::normalize(&vec_ops::weighted_sum(&addresses, &alpha));
+        let sim = vec_ops::cosine_similarity(&xi, &xi_new);
+        xi = xi_new;
+        if sim > 1.0 - config.epsilon {
+            converged = true;
+            break;
+        }
+    }
+
+    let weights = weights_at(&xi);
+    KeySettle {
+        xi,
+        weights,
+        iterations,
+        converged,
+    }
+}
+
+/// One value read: the unit-normalised, weight-blended stored patterns.
+pub(crate) fn read_values(
+    locations: &[HardLocation],
+    indices: &[usize],
+    weights: &[f64],
+) -> Vec<f64> {
+    let patterns: Vec<Vec<f64>> = indices
+        .iter()
+        .map(|&i| locations[i].unit_pattern())
+        .collect();
+    let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
+    vec_ops::normalize(&vec_ops::weighted_sum(&pattern_refs, weights))
+}
+
 /// Hopfield iterative read from pre-computed activation set.
 /// Same as `hopfield_iter` but skips the activate step.
 pub fn hopfield_iter_from(
@@ -428,42 +502,12 @@ pub fn hopfield_iter_from(
     if indices.is_empty() {
         return Err(HeatherError::EmptyMemory);
     }
-
-    let patterns: Vec<Vec<f64>> = indices
-        .iter()
-        .map(|&i| locations[i].unit_pattern())
-        .collect();
-
-    let addresses: Vec<&[f64]> = indices
-        .iter()
-        .map(|&i| locations[i].address.as_slice())
-        .collect();
-
-    let mut xi = vec_ops::normalize(query);
-
-    for _t in 0..config.t_max {
-        let sims: Vec<f64> = addresses
-            .iter()
-            .map(|addr| vec_ops::cosine_similarity(&xi, addr))
-            .collect();
-
-        let alpha = vec_ops::softmax(&sims, config.beta);
-        let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
-        let xi_new = vec_ops::normalize(&vec_ops::weighted_sum(&pattern_refs, &alpha));
-
-        let sim = vec_ops::cosine_similarity(&xi, &xi_new);
-        xi = xi_new;
-
-        if sim > 1.0 - config.epsilon {
-            break;
-        }
-    }
-
-    Ok(xi)
+    let settled = settle_on_keys(query, locations, config, indices);
+    Ok(read_values(locations, indices, &settled.weights))
 }
 
-/// Hopfield iterative read (Eq. 13-14).
-/// Fixed activation set, iterate softmax reweighting until convergence.
+/// Hopfield iterative read (Eq. 13-14): settle on the keys, then read the
+/// values once. See `settle_on_keys`.
 pub fn hopfield_iter(
     query: &[f64],
     locations: &[HardLocation],
@@ -472,48 +516,9 @@ pub fn hopfield_iter(
     if locations.is_empty() {
         return Err(HeatherError::EmptyMemory);
     }
-
     let k = config.k.min(locations.len());
     let (indices, _sims) = activate(query, locations, k);
-
-    // Collect normalized patterns from activated locations
-    let patterns: Vec<Vec<f64>> = indices
-        .iter()
-        .map(|&i| locations[i].unit_pattern())
-        .collect();
-
-    let addresses: Vec<&[f64]> = indices
-        .iter()
-        .map(|&i| locations[i].address.as_slice())
-        .collect();
-
-    // ξ₀ = normalize(query)
-    let mut xi = vec_ops::normalize(query);
-
-    for _t in 0..config.t_max {
-        // Compute similarities between current estimate and activated addresses
-        let sims: Vec<f64> = addresses
-            .iter()
-            .map(|addr| vec_ops::cosine_similarity(&xi, addr))
-            .collect();
-
-        // Softmax weights
-        let alpha = vec_ops::softmax(&sims, config.beta);
-
-        // Weighted sum of normalized patterns
-        let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
-        let xi_new = vec_ops::normalize(&vec_ops::weighted_sum(&pattern_refs, &alpha));
-
-        // Check convergence
-        let sim = vec_ops::cosine_similarity(&xi, &xi_new);
-        xi = xi_new;
-
-        if sim > 1.0 - config.epsilon {
-            break;
-        }
-    }
-
-    Ok(xi)
+    hopfield_iter_from(query, locations, config, &indices)
 }
 
 /// Traced activation info for a single location.
@@ -570,66 +575,35 @@ pub fn hopfield_iter_traced(
     if locations.is_empty() {
         return Err(HeatherError::EmptyMemory);
     }
-
     let k = config.k.min(locations.len());
-    let (indices, initial_sims) = activate(query, locations, k);
+    let (indices, _sims) = activate(query, locations, k);
+    Ok(trace_settled(query, locations, config, &indices))
+}
 
-    let patterns: Vec<Vec<f64>> = indices
-        .iter()
-        .map(|&i| locations[i].unit_pattern())
-        .collect();
-
-    let addresses: Vec<&[f64]> = indices
-        .iter()
-        .map(|&i| locations[i].address.as_slice())
-        .collect();
-
-    let mut xi = vec_ops::normalize(query);
-    let mut converged = false;
-    let mut iterations = 0;
-    let mut final_weights = vec_ops::softmax(&initial_sims, config.beta);
-
-    for t in 0..config.t_max {
-        iterations = t + 1;
-        let sims: Vec<f64> = addresses
-            .iter()
-            .map(|addr| vec_ops::cosine_similarity(&xi, addr))
-            .collect();
-
-        let alpha = vec_ops::softmax(&sims, config.beta);
-        final_weights = alpha.clone();
-
-        let pattern_refs: Vec<&[f64]> = patterns.iter().map(|p| p.as_slice()).collect();
-        let xi_new = vec_ops::normalize(&vec_ops::weighted_sum(&pattern_refs, &alpha));
-
-        let sim = vec_ops::cosine_similarity(&xi, &xi_new);
-        xi = xi_new;
-
-        if sim > 1.0 - config.epsilon {
-            converged = true;
-            break;
-        }
-    }
-
+/// Settle on the keys and package the activation details. `similarity` is the
+/// cosine between the settled key-space state and each address.
+pub(crate) fn trace_settled(
+    query: &[f64],
+    locations: &[HardLocation],
+    config: &EAMConfig,
+    indices: &[usize],
+) -> ReadTrace {
+    let settled = settle_on_keys(query, locations, config, indices);
     let activated_locations = indices
         .iter()
-        .zip(final_weights.iter())
-        .map(|(&idx, &weight)| {
-            let sim = vec_ops::cosine_similarity(&xi, &locations[idx].address);
-            ActivatedLocation {
-                id: idx,
-                similarity: sim,
-                weight,
-            }
+        .zip(settled.weights.iter())
+        .map(|(&idx, &weight)| ActivatedLocation {
+            id: idx,
+            similarity: vec_ops::cosine_similarity(&settled.xi, &locations[idx].address),
+            weight,
         })
         .collect();
-
-    Ok(ReadTrace {
-        iterations,
-        converged,
+    ReadTrace {
+        iterations: settled.iterations,
+        converged: settled.converged,
         activated_locations,
-        result: xi,
-    })
+        result: read_values(locations, indices, &settled.weights),
+    }
 }
 
 /// Hopfield single-step read (Eq. 11).
@@ -669,6 +643,33 @@ mod tests {
         loc.counter = pattern.iter().map(|p| p * wc).collect();
         loc.write_count = wc;
         loc
+    }
+
+    /// Regression for #108: when values differ from their keys, the iterative
+    /// read must settle on the keys and return the matched key's value, not
+    /// feed values back in and drift to another item.
+    #[test]
+    fn test_hopfield_iter_key_value_recall() {
+        use rand::SeedableRng;
+        let mut rng = rand::rngs::StdRng::seed_from_u64(7);
+        let d = 256;
+        let n = 60;
+        let keys: Vec<Vec<f64>> = (0..n)
+            .map(|_| vec_ops::random_unit_vector(d, &mut rng))
+            .collect();
+        let values: Vec<Vec<f64>> = (0..n)
+            .map(|_| vec_ops::random_unit_vector(d, &mut rng))
+            .collect();
+        let locations: Vec<HardLocation> = (0..n)
+            .map(|i| make_loc(i as u64, keys[i].clone(), values[i].clone(), 1.0))
+            .collect();
+        let config = EAMConfig::new(d).unwrap();
+
+        for i in 0..n {
+            let result = hopfield_iter(&keys[i], &locations, &config).unwrap();
+            let sim = vec_ops::cosine_similarity(&result, &values[i]);
+            assert!(sim > 0.95, "key {i}: cosine to its value {sim}");
+        }
     }
 
     #[test]

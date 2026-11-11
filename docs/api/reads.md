@@ -25,8 +25,12 @@ Reconstruct a pattern associated with the query. Legacy:
 | `query` | array | *required* |
 | `strategy` | `"iterative"` \| `"fast"` | `"iterative"` |
 
-`iterative` runs the Hopfield loop to convergence (up to `t_max`); `fast` is a
-single step.
+`iterative` re-weights the query against the activated addresses until it
+settles (up to `t_max` passes), then reads the stored values once at the
+settled point. `fast` is a single step. Use `fast` for lookups and anything
+that feeds a confidence decision, and `iterative` to recover an item from a
+heavily corrupted query. See [choose a read
+strategy](../how-to/choose-a-read-strategy.md).
 
 The result is a reconstructed vector. In competitive mode it can complete an
 individual pattern or express shared structure learned from related writes.
@@ -171,7 +175,9 @@ curl -u admin:pw -X POST \
   "result": [ … ] }
 ```
 
-Here `similarity` **is** a cosine.
+Here `similarity` **is** a cosine. With `iterative`, `similarity` and
+`weight` are taken at the settled point, so they look alike for every query;
+use `"strategy": "fast"` when the weights feed a confidence decision.
 
 | Status | Cause |
 |---|---|
