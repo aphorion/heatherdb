@@ -9,8 +9,10 @@ use heather_db::{EAMConfig, Hive, Precision, Residency};
 
 fn read_f32(path: &str) -> Vec<f32> {
     let b = std::fs::read(path).unwrap();
-    b.chunks_exact(4)
-        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+    b.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect()
 }
 

@@ -17,8 +17,10 @@ fn main() {
     let (n, d, nq) = (s[0], s[1], s[2].min(1000));
     let raw = |f: &str| -> Vec<f32> {
         let b = std::fs::read(format!("{dir}/{f}")).unwrap();
-        b.chunks_exact(4)
-            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        b.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect()
     };
     let base = raw("base.f32");
