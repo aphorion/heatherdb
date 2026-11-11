@@ -51,7 +51,7 @@ $HEATHER_DATA_DIR/
   db/<name>/data/            # LMDB env, one per database
   snapshots/                 # default landing zone for `snapshot create`
   backups/                   # conventional location listed by `backup list`
-  _trash/<name>-<ts>/        # dropped databases; recoverable by moving back
+  _trash/<name>-<ts>[-n]/    # dropped databases; recoverable by moving back
 ```
 
 Each database's LMDB environment holds six named sub-databases: `_registry`,
