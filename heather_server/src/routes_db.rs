@@ -112,10 +112,55 @@ pub async fn create_database(
     Extension(server): Extension<Arc<Server>>,
     Json(req): Json<CreateDatabaseRequest>,
 ) -> Response {
-    let mut cfg = match DbConfig::new(&req.name, req.dimension) {
+    let declared = match (&req.columns, req.dimension) {
+        (Some(_), Some(_)) => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "give `columns` or `dimension`, not both: columns set the dimension",
+            );
+        }
+        (None, None) => {
+            return err(StatusCode::BAD_REQUEST, "give `columns` or `dimension`");
+        }
+        (None, Some(_)) if !req.predict.is_empty() || req.sequence => {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "`predict` and `sequence` go with `columns`",
+            );
+        }
+        (Some(cols), None) => {
+            let cols = cols.iter().map(|(n, t)| t.column(n)).collect();
+            match heather_db::columns::plan(cols, &req.predict, req.sequence) {
+                Ok(p) => Some(p),
+                Err(e) => return err(StatusCode::BAD_REQUEST, e),
+            }
+        }
+        (None, Some(_)) => None,
+    };
+    let dimension = declared
+        .as_ref()
+        .map_or(req.dimension.unwrap_or(0), |p| p.0);
+    let mut cfg = match DbConfig::new(&req.name, dimension) {
         Ok(c) => c,
         Err(e) => return err(StatusCode::BAD_REQUEST, e),
     };
+    if let Some((_, att)) = declared {
+        if req
+            .eam
+            .as_ref()
+            .is_some_and(|o| o.selective_attention.is_some() || o.competitive == Some(true))
+        {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "`columns` sets selective attention and plain storage; leave them out of `eam`",
+            );
+        }
+        cfg.eam.competitive = false;
+        cfg.eam.selective_attention = Some(att);
+        if let Err(e) = cfg.eam.validate() {
+            return err(StatusCode::BAD_REQUEST, e);
+        }
+    }
     cfg.map_size_mb = req.map_size_mb.unwrap_or(DEFAULT_MAP_SIZE_MB);
     cfg.eam.mdl_gate = req.mdl_gate;
 
@@ -496,15 +541,41 @@ pub async fn recall(
     routes::recall(State(hive), Path(col), ctx.for_db(&db_name), Json(req)).await
 }
 
-pub async fn next(
+pub async fn rows(
     Extension(server): Extension<Arc<Server>>,
     Path((db_name, col)): Path<(String, String)>,
+    Json(req): Json<RowsRequest>,
 ) -> Response {
     let hive = match resolve_db(&server, &db_name) {
         Ok(h) => h,
         Err(r) => return r,
     };
-    routes::next(State(hive), Path(col)).await
+    routes::rows(State(hive), Path(col), Json(req)).await
+}
+
+pub async fn predict(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col)): Path<(String, String)>,
+    ctx: AuditCtx,
+    Json(req): Json<PredictRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::predict(State(hive), Path(col), ctx.for_db(&db_name), Json(req)).await
+}
+
+pub async fn next(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col)): Path<(String, String)>,
+    query: Query<NextQuery>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::next(State(hive), Path(col), query).await
 }
 
 pub async fn selective_attention(
@@ -745,6 +816,7 @@ mod audit_tests {
                 ),
                 vectors,
                 vectors_b64: None,
+                symbols: None,
             }),
         )
         .await;
@@ -1141,6 +1213,7 @@ mod selective_attention_tests {
                 metadata: None,
                 vectors,
                 vectors_b64: None,
+                symbols: None,
             }),
         )
         .await;
@@ -1168,6 +1241,7 @@ mod selective_attention_tests {
         let resp = next(
             Extension(server.clone()),
             Path(("crm".into(), "customers".into())),
+            Query(NextQuery::default()),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1249,6 +1323,7 @@ mod novelty_tests {
                 metadata: None,
                 vectors,
                 vectors_b64: None,
+                symbols: None,
             }),
         )
         .await;
@@ -1285,5 +1360,269 @@ mod novelty_tests {
                 .iter()
                 .any(|e| e.route == "novelty" && e.result_count == 4)
         );
+    }
+}
+
+#[cfg(test)]
+mod symbol_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    async fn json(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    #[tokio::test]
+    async fn symbols_through_the_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Server::open(dir.path(), 8).unwrap());
+        // 1 numeric outcome slot + 2 symbol fields.
+        let req: CreateDatabaseRequest = serde_json::from_value(serde_json::json!({
+            "name": "shop", "dimension": 3,
+            "eam": {"competitive": false, "selective_attention": {
+                "time": true, "warmup": 8, "heads": {"bought": [0]},
+                "symbols": {"fields": ["item", "store"], "dims": 4}}}
+        }))
+        .unwrap();
+        let (st, info) = json(create_database(Extension(server.clone()), Json(req)).await).await;
+        assert!(st.is_success(), "{info}");
+        assert_eq!(info["selective_attention"]["symbols"]["fields"][1], "store");
+
+        let rows: Vec<serde_json::Value> = (0..60)
+            .map(|i| serde_json::json!({"item": format!("i{}", i % 6), "store": if i % 2 == 0 {"north"} else {"south"}}))
+            .collect();
+        let vectors: Vec<Vec<f64>> = (0..60)
+            .map(|i| vec![if i % 6 < 3 { 1.0 } else { 0.0 }])
+            .collect();
+        let req: WriteRequest =
+            serde_json::from_value(serde_json::json!({"vectors": vectors, "symbols": rows}))
+                .unwrap();
+        let resp = write(
+            Extension(server.clone()),
+            Path(("shop".into(), "u1".into())),
+            Json(req),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // A raw vector write is refused on a symbol database.
+        let req: WriteRequest =
+            serde_json::from_value(serde_json::json!({"vectors": [[1.0, 0.0, 0.0]]})).unwrap();
+        let resp = write(
+            Extension(server.clone()),
+            Path(("shop".into(), "u1".into())),
+            Json(req),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        let ctx = AuditCtx {
+            user: "a".into(),
+            scope: "root".into(),
+            db: "default".into(),
+        };
+        let req: RecallRequest = serde_json::from_value(serde_json::json!({
+            "query": [0.5], "head": "bought", "symbols": {"item": "i1"}
+        }))
+        .unwrap();
+        let (st, r) = json(
+            recall(
+                Extension(server.clone()),
+                Path(("shop".into(), "u1".into())),
+                ctx,
+                Json(req),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{r}");
+        assert_eq!(r["result"].as_array().unwrap().len(), 1);
+        assert!(r["result"][0].as_f64().unwrap() > 0.5, "{r}");
+
+        let q = Query(NextQuery {
+            field: Some("item".into()),
+            n: Some(3),
+            exclude_seen: Some(false),
+        });
+        let (st, nx) = json(
+            next(
+                Extension(server.clone()),
+                Path(("shop".into(), "u1".into())),
+                q,
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{nx}");
+        assert_eq!(nx["values"].as_array().unwrap().len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    async fn json(resp: Response) -> (StatusCode, serde_json::Value) {
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn ctx() -> AuditCtx {
+        AuditCtx {
+            user: "a".into(),
+            scope: "root".into(),
+            db: "default".into(),
+        }
+    }
+
+    async fn create(
+        server: &Arc<Server>,
+        body: serde_json::Value,
+    ) -> (StatusCode, serde_json::Value) {
+        let req: CreateDatabaseRequest = serde_json::from_value(body).unwrap();
+        json(create_database(Extension(server.clone()), Json(req)).await).await
+    }
+
+    #[tokio::test]
+    async fn columns_through_the_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Server::open(dir.path(), 8).unwrap());
+        let (st, info) = create(
+            &server,
+            serde_json::json!({"name": "access",
+                "columns": {"role": "category", "amount": "number", "granted": "number",
+                            "note": {"vector": 2}},
+                "predict": ["granted"]}),
+        )
+        .await;
+        assert!(st.is_success(), "{info}");
+        assert_eq!(info["dimension"], 1 + 1 + 2 + 1, "{info}");
+
+        // Neither, both, and nothing to learn are refused.
+        for bad in [
+            serde_json::json!({"name": "a1"}),
+            serde_json::json!({"name": "a2", "dimension": 3, "columns": {"x": "number"}, "predict": ["x"]}),
+            serde_json::json!({"name": "a3", "columns": {"x": "number"}}),
+            serde_json::json!({"name": "a4", "dimension": 3, "sequence": true}),
+        ] {
+            assert_eq!(create(&server, bad).await.0, StatusCode::BAD_REQUEST);
+        }
+
+        let rows: Vec<serde_json::Value> = (0..400)
+            .map(|i| {
+                let r = i % 20;
+                serde_json::json!({"role": r, "amount": (i * 37 % 1000) as f64,
+                                   "granted": r < 10, "note": [0.1, 0.2]})
+            })
+            .collect();
+        let req: RowsRequest = serde_json::from_value(serde_json::json!({"rows": rows})).unwrap();
+        let resp = super::rows(
+            Extension(server.clone()),
+            Path(("access".into(), "log".into())),
+            Json(req),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let bad: RowsRequest =
+            serde_json::from_value(serde_json::json!({"rows": [{"role": "r1"}]})).unwrap();
+        let resp = super::rows(
+            Extension(server.clone()),
+            Path(("access".into(), "log".into())),
+            Json(bad),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "a row needs every column"
+        );
+
+        for (role, granted) in [(3, true), (15, false)] {
+            let req: PredictRequest = serde_json::from_value(serde_json::json!({
+                "row": {"role": role.to_string()}, "column": "granted"}))
+            .unwrap();
+            let (st, out) = json(
+                super::predict(
+                    Extension(server.clone()),
+                    Path(("access".into(), "log".into())),
+                    ctx(),
+                    Json(req),
+                )
+                .await,
+            )
+            .await;
+            assert!(st.is_success(), "{out}");
+            let p = out["predicted"]["granted"].as_f64().unwrap();
+            assert_eq!(p > 0.5, granted, "role {role}: {out}");
+        }
+
+        // Novelty by row: a usual request fits, an odd one stands out.
+        let req: NoveltyRequest = serde_json::from_value(serde_json::json!({
+            "rows": [{"role": "3", "amount": 111.0, "note": [0.1, 0.2]},
+                     {"role": "never-seen", "amount": 1e12, "note": [9.0, -9.0]}],
+            "k": 10}))
+        .unwrap();
+        let (st, out) = json(
+            super::novelty(
+                Extension(server.clone()),
+                Path(("access".into(), "log".into())),
+                ctx(),
+                Json(req),
+            )
+            .await,
+        )
+        .await;
+        assert!(st.is_success(), "{out}");
+        let (usual, odd) = (
+            out["results"][0]["novelty"].as_f64().unwrap(),
+            out["results"][1]["novelty"].as_f64().unwrap(),
+        );
+        assert!(odd > 2.0 * usual, "{out}");
+
+        // A sequence database ranks a category's next values by `column`.
+        let (st, info) = create(
+            &server,
+            serde_json::json!({"name": "movies", "columns": {"item": "category"}, "sequence": true}),
+        )
+        .await;
+        assert!(st.is_success(), "{info}");
+        let history: Vec<serde_json::Value> = (0..10)
+            .map(|i| serde_json::json!({"item": format!("m{i}")}))
+            .collect();
+        let req: RowsRequest =
+            serde_json::from_value(serde_json::json!({"rows": history})).unwrap();
+        let resp = super::rows(
+            Extension(server.clone()),
+            Path(("movies".into(), "u1".into())),
+            Json(req),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let q: NextQuery = serde_json::from_value(
+            serde_json::json!({"column": "item", "n": 3, "exclude_seen": false}),
+        )
+        .unwrap();
+        let (st, out) = json(
+            next(
+                Extension(server.clone()),
+                Path(("movies".into(), "u1".into())),
+                Query(q),
+            )
+            .await,
+        )
+        .await;
+        assert!(st.is_success(), "{out}");
+        assert_eq!(out["values"].as_array().unwrap().len(), 3, "{out}");
     }
 }

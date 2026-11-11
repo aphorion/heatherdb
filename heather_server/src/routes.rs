@@ -266,6 +266,24 @@ pub async fn write(
     if let Err(message) = resolve_vectors(&mut req.vectors, req.vectors_b64.take(), "vectors") {
         return error_response(StatusCode::BAD_REQUEST, message);
     }
+    if let Some(symbols) = &req.symbols {
+        // Symbol-only rows have no numeric part to send.
+        if req.vectors.is_empty() {
+            req.vectors = vec![Vec::new(); symbols.len()];
+        }
+        if symbols.len() != req.vectors.len() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "symbols must have one entry per row",
+            );
+        }
+        if req.metadata.is_some() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "rows with symbols cannot carry metadata yet",
+            );
+        }
+    }
     let num_vectors = req.vectors.len();
     if num_vectors == 0 {
         return error_response(StatusCode::BAD_REQUEST, "vectors array must not be empty");
@@ -306,7 +324,10 @@ pub async fn write(
             let ids = col_clone.write_batch_with_metadata(&items)?;
             Ok((ids.len(), Some(ids)))
         } else {
-            col_clone.write_batch(&req.vectors)?;
+            match &req.symbols {
+                Some(symbols) => col_clone.write_batch_symbols(&req.vectors, symbols)?,
+                None => col_clone.write_batch(&req.vectors)?,
+            }
             Ok::<_, heather_db::HeatherError>((req.vectors.len(), None))
         }
     })
@@ -917,8 +938,10 @@ pub async fn recall(
     };
     let n = req.contributors.unwrap_or(10);
     let qinfo = AuditQueryInfo::of(&hive, &req.query);
-    let result =
-        tokio::task::spawn_blocking(move || col.attention_recall(&req.query, &req.head)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        col.attention_recall_symbols(&req.query, &req.head, &req.symbols)
+    })
+    .await;
     // Audited like `analyze`: every stored row the recall blended.
     let (status, ids) = match &result {
         Ok(Ok(r)) => (
@@ -951,7 +974,40 @@ pub async fn recall(
 
 /// The time-attended read of a collection's history: what the database's
 /// learned recency expects next.
-pub async fn next(State(hive): State<AppState>, Path(name): Path<String>) -> Response {
+/// `POST .../rows`: rows by column name (a database declared with columns).
+pub async fn rows(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<RowsRequest>,
+) -> Response {
+    let rows: Vec<heather_db::columns::Row> =
+        match req.rows.into_iter().map(json_row).collect::<Result<_, _>>() {
+            Ok(r) => r,
+            Err(m) => return error_response(StatusCode::BAD_REQUEST, m),
+        };
+    let col = match hive.get_or_create_collection(&name) {
+        Ok(col) => col,
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let count = rows.len();
+    match tokio::task::spawn_blocking(move || col.write_rows(&rows)).await {
+        Ok(Ok(())) => Json(WriteResponse { count, ids: None }).into_response(),
+        Ok(Err(e)) => error_response(engine_error_status(&e), e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// `POST .../predict`: a predicted column filled in for a row given by name.
+pub async fn predict(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    ctx: AuditCtx,
+    Json(req): Json<PredictRequest>,
+) -> Response {
+    let row = match json_row(req.row) {
+        Ok(r) => r,
+        Err(m) => return error_response(StatusCode::BAD_REQUEST, m),
+    };
     let col = match hive.get_collection(&name) {
         Ok(Some(col)) => col,
         Ok(None) => {
@@ -962,8 +1018,84 @@ pub async fn next(State(hive): State<AppState>, Path(name): Path<String>) -> Res
         }
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     };
-    match tokio::task::spawn_blocking(move || col.attention_next()).await {
-        Ok(Ok(result)) => Json(NextResponse { result }).into_response(),
+    let n = req.contributors.unwrap_or(10);
+    let column = req.column;
+    let asked = column.clone();
+    let result = tokio::task::spawn_blocking(move || col.predict(&row, &asked)).await;
+    // Audited like `recall`: every stored row the prediction blended.
+    let (status, ids) = match &result {
+        Ok(Ok((_, c))) => (
+            StatusCode::OK,
+            AuditIds::locations(c.iter().map(|c| c.id).collect()),
+        ),
+        Ok(Err(e)) => (engine_error_status(e), AuditIds::default()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::default()),
+    };
+    audit_read(
+        &hive,
+        &ctx,
+        &name,
+        "predict",
+        status,
+        ids,
+        AuditQueryInfo {
+            hash: None,
+            raw: None,
+        },
+    );
+    match result {
+        Ok(Ok((value, contributors))) => Json(PredictResponse {
+            predicted: [(column, value)].into_iter().collect(),
+            contributors: contributors
+                .into_iter()
+                .take(n)
+                .map(|c| RecallContributor {
+                    id: c.id,
+                    distance: c.distance,
+                    weight: c.weight,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Ok(Err(e)) => error_response(engine_error_status(&e), e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+pub async fn next(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    axum::extract::Query(q): axum::extract::Query<NextQuery>,
+) -> Response {
+    let col = match hive.get_collection(&name) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("collection '{name}' not found"),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let work = move || -> Result<NextResponse, heather_db::HeatherError> {
+        let result = col.attention_next()?;
+        let values = match &q.field {
+            Some(field) => Some(
+                col.attention_next_values(
+                    field,
+                    q.n.unwrap_or(10),
+                    q.exclude_seen.unwrap_or(true),
+                )?
+                .into_iter()
+                .map(|(value, score)| NextValue { value, score })
+                .collect(),
+            ),
+            None => None,
+        };
+        Ok(NextResponse { result, values })
+    };
+    match tokio::task::spawn_blocking(work).await {
+        Ok(Ok(resp)) => Json(resp).into_response(),
         Ok(Err(e)) => error_response(engine_error_status(&e), e),
         Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
     }
@@ -1096,17 +1228,29 @@ pub async fn novelty(
     ctx: AuditCtx,
     Json(req): Json<NoveltyRequest>,
 ) -> Response {
-    if req.queries.is_empty() {
-        return error_response(StatusCode::BAD_REQUEST, "queries array must not be empty");
+    let asked = req.queries.len() + req.rows.len();
+    if asked == 0 {
+        return error_response(StatusCode::BAD_REQUEST, "send `queries` or `rows`");
     }
+    if !req.queries.is_empty() && !req.rows.is_empty() {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "send `queries` or `rows`, not both",
+        );
+    }
+    let rows: Vec<heather_db::columns::Row> =
+        match req.rows.into_iter().map(json_row).collect::<Result<_, _>>() {
+            Ok(r) => r,
+            Err(m) => return error_response(StatusCode::BAD_REQUEST, m),
+        };
     let max_queries = limits::get().max_batch_queries;
-    if max_queries > 0 && req.queries.len() > max_queries {
+    if max_queries > 0 && asked > max_queries {
         return error_response(
             StatusCode::BAD_REQUEST,
             format!(
                 "batch of {} queries exceeds the server cap of {max_queries}; \
                  split into smaller batches or raise --max-batch-queries",
-                req.queries.len()
+                asked
             ),
         );
     }
@@ -1123,7 +1267,14 @@ pub async fn novelty(
     let k = req.k.unwrap_or(50);
     let keep = req.nearest.unwrap_or(0);
     let queries = req.queries;
-    let result = tokio::task::spawn_blocking(move || col.novelty(&queries, k)).await;
+    let result = tokio::task::spawn_blocking(move || {
+        if rows.is_empty() {
+            col.novelty(&queries, k)
+        } else {
+            col.novelty_rows(&rows, k)
+        }
+    })
+    .await;
     if keep > 0 {
         let (status, ids) = match &result {
             Ok(Ok(rs)) => (

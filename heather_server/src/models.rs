@@ -101,11 +101,16 @@ pub struct WriteRequest {
     #[serde(default)]
     pub vectors_b64: Option<Vec<String>>,
     pub metadata: Option<Vec<serde_json::Value>>,
+    /// For a database with symbol fields: one map of field → value per row.
+    /// `vectors` then holds each row's numeric part (omit it when there is
+    /// none).
+    #[serde(default)]
+    pub symbols: Option<Vec<std::collections::BTreeMap<String, String>>>,
 }
 
 /// The features `/health` advertises, so clients can tell what a server
 /// accepts before sending it.
-pub const FEATURES: &[&str] = &["vectors_b64"];
+pub const FEATURES: &[&str] = &["vectors_b64", "symbols", "columns"];
 
 /// Decodes base64 vectors of little-endian f64 bytes. `field` names the
 /// request field in errors.
@@ -281,7 +286,20 @@ pub struct CreateCollectionResponse {
 #[derive(Debug, Deserialize)]
 pub struct CreateDatabaseRequest {
     pub name: String,
-    pub dimension: usize,
+    /// Row width for a database written as vectors. Omit it with `columns`.
+    #[serde(default)]
+    pub dimension: Option<usize>,
+    /// Declare the database by its columns instead of a dimension:
+    /// column name → `"category"`, `"number"` or `{"vector": size}`.
+    #[serde(default)]
+    pub columns: Option<std::collections::BTreeMap<String, ColumnType>>,
+    /// With `columns`: number columns the database learns to fill in.
+    #[serde(default)]
+    pub predict: Vec<String>,
+    /// With `columns`: each collection's rows are a history in order (one
+    /// user's events), and the database learns what comes next.
+    #[serde(default)]
+    pub sequence: bool,
     /// Optional LMDB map size in MB (default: 4096).
     #[serde(default)]
     pub map_size_mb: Option<usize>,
@@ -292,6 +310,87 @@ pub struct CreateDatabaseRequest {
     /// Optional EAM-config overrides. Any unset field keeps the engine default.
     #[serde(default)]
     pub eam: Option<EamConfigOverride>,
+}
+
+/// A column's type in a create request.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ColumnType {
+    Simple(SimpleColumn),
+    Vector { vector: usize },
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SimpleColumn {
+    Category,
+    Number,
+}
+
+impl ColumnType {
+    pub fn column(&self, name: &str) -> heather_db::columns::Column {
+        use heather_db::columns::Column;
+        match self {
+            ColumnType::Simple(SimpleColumn::Category) => Column::category(name),
+            ColumnType::Simple(SimpleColumn::Number) => Column::number(name),
+            ColumnType::Vector { vector } => Column::vector(name, *vector),
+        }
+    }
+}
+
+/// `POST .../rows`: rows by column name, for a database declared with
+/// columns. A value is a string or number (category), a number, or an array
+/// of numbers (vector).
+#[derive(Debug, Deserialize)]
+pub struct RowsRequest {
+    pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// `POST .../predict`: fill in a predicted column for a row given by name.
+/// Columns the row leaves out take no part.
+#[derive(Debug, Deserialize)]
+pub struct PredictRequest {
+    pub row: serde_json::Map<String, serde_json::Value>,
+    pub column: String,
+    /// How many contributing rows to list (nearest first). Default 10.
+    pub contributors: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PredictResponse {
+    /// The predicted column → its value, in the column's own units.
+    pub predicted: std::collections::BTreeMap<String, f64>,
+    pub contributors: Vec<RecallContributor>,
+}
+
+/// A JSON row as the engine's cells. `null` and objects are refused.
+pub fn json_row(
+    obj: serde_json::Map<String, serde_json::Value>,
+) -> Result<heather_db::columns::Row, String> {
+    use heather_db::columns::Cell;
+    use serde_json::Value;
+    obj.into_iter()
+        .map(|(k, v)| {
+            let cell = match v {
+                Value::String(s) => Cell::Text(s),
+                Value::Bool(b) => Cell::Number(if b { 1.0 } else { 0.0 }),
+                Value::Number(n) => {
+                    Cell::Number(n.as_f64().ok_or_else(|| format!("{k:?} is not a number"))?)
+                }
+                Value::Array(xs) => Cell::Vector(
+                    xs.iter()
+                        .map(|x| x.as_f64().ok_or_else(|| format!("{k:?} must be numbers")))
+                        .collect::<Result<_, _>>()?,
+                ),
+                Value::Null | Value::Object(_) => {
+                    return Err(format!(
+                        "{k:?} must be a string, number or array of numbers"
+                    ));
+                }
+            };
+            Ok((k, cell))
+        })
+        .collect()
 }
 
 /// Per-database EAM knobs settable at creation. Unset fields keep the engine
@@ -435,7 +534,13 @@ pub struct BatchAnalyzeRequest {
 /// `POST .../novelty`: each query's novelty relative to its neighbourhood.
 #[derive(Debug, Deserialize)]
 pub struct NoveltyRequest {
+    /// Vectors, for a database written as vectors.
+    #[serde(default)]
     pub queries: Vec<Vec<f64>>,
+    /// Rows by column name, for a database declared with columns: every
+    /// column but the predicted ones. Send `queries` or `rows`, not both.
+    #[serde(default)]
+    pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
     /// Neighbours compared. Default 50.
     pub k: Option<usize>,
     /// How many nearest stored rows to return per query. Default 0.
@@ -481,6 +586,28 @@ pub struct RecallRequest {
     pub head: String,
     /// How many contributing rows to list (nearest first). Default 10.
     pub contributors: Option<usize>,
+    /// Symbol values to compare by (databases with symbol fields). `query`
+    /// is then the numeric part; a field left out takes no part.
+    #[serde(default)]
+    pub symbols: std::collections::BTreeMap<String, String>,
+}
+
+/// `GET .../next` parameters: with `field`, rank that symbol field's values.
+#[derive(Debug, Deserialize, Default)]
+pub struct NextQuery {
+    /// The category column (symbol field) whose next values to rank.
+    #[serde(alias = "column")]
+    pub field: Option<String>,
+    /// Values to return. Default 10.
+    pub n: Option<usize>,
+    /// Leave out values already in the collection's history. Default true.
+    pub exclude_seen: Option<bool>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct NextValue {
+    pub value: String,
+    pub score: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -502,8 +629,12 @@ pub struct RecallResponse {
 /// `GET .../next`: the time-attended read of a collection's history.
 #[derive(Debug, Serialize)]
 pub struct NextResponse {
-    /// Unit-normalised; `null` for an empty collection.
+    /// Unit-normalised; `null` for an empty collection or one with no
+    /// numeric part.
     pub result: Option<Vec<f64>>,
+    /// With `field`: that symbol field's most likely next values, best first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<Vec<NextValue>>,
 }
 
 #[derive(Debug, Serialize)]
