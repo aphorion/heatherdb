@@ -61,6 +61,7 @@ Source of truth: `heather_server/src/main.rs`.
 | [GET /db/{db}/durability](../api/databases.md#get-dbdbdurability) | — |
 | [PUT /db/{db}/durability](../api/databases.md#put-dbdbdurability) | — |
 | [DELETE /db/{db}](../api/databases.md#delete-dbdb) | — |
+| [GET /db/{db}/selective-attention](../api/databases.md#get-dbdbselective-attention) | [GET /selective-attention](../api/databases.md#get-dbdbselective-attention) |
 
 ### Dream
 
@@ -104,6 +105,8 @@ Source of truth: `heather_server/src/main.rs`.
 | [POST /db/{db}/collections/{name}/attention/calibrate](../api/reads.md#post-dbdbcollectionsnameattentioncalibrate) | [POST /collections/{name}/attention/calibrate](../api/reads.md#post-dbdbcollectionsnameattentioncalibrate) |
 | [POST /db/{db}/collections/{name}/analyze](../api/reads.md#post-dbdbcollectionsnameanalyze) | [POST /collections/{name}/analyze](../api/reads.md#post-dbdbcollectionsnameanalyze) |
 | [POST /db/{db}/collections/{name}/batch_analyze](../api/reads.md#post-dbdbcollectionsnamebatchanalyze) | [POST /collections/{name}/batch_analyze](../api/reads.md#post-dbdbcollectionsnamebatchanalyze) |
+| [POST /db/{db}/collections/{name}/recall](../api/reads.md#post-dbdbcollectionsnamerecall) | [POST /collections/{name}/recall](../api/reads.md#post-dbdbcollectionsnamerecall) |
+| [GET /db/{db}/collections/{name}/next](../api/reads.md#get-dbdbcollectionsnamenext) | [GET /collections/{name}/next](../api/reads.md#get-dbdbcollectionsnamenext) |
 
 ### Documents
 

@@ -18,7 +18,10 @@ pub const DEFAULT_MAP_SIZE_MB: usize = 4096;
 
 /// The database format this HeatherDB writes, and the newest it mounts.
 /// `1`: records in the self-describing, checksummed envelope (`codec`).
-pub const FORMAT_VERSION: u32 = 1;
+/// `2`: may hold learned selective-attention state (`attention`). No record
+/// layout changed, so a format-1 database is migrated on mount by raising
+/// this marker alone; nothing is rewritten.
+pub const FORMAT_VERSION: u32 = 2;
 
 /// What a database needs to know about itself across restarts.
 ///

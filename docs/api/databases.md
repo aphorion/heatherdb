@@ -46,7 +46,7 @@ Auth: Basic or Bearer, **root scope**.
 | `dimension` | integer | *required* | Immutable for the life of the database |
 | `map_size_mb` | integer | `4096` | LMDB ceiling for this database's env |
 | `mdl_gate` | boolean | `false` | Allocate by description length instead of `tau_split`/`tau_overload` |
-| `eam` | object | — | Partial `EAMConfig` override: `k`, `t_max`, `beta`, `neighbor_cap`, `num_landmarks`, `l_0`, `competitive`, `precision`. Unset fields keep the engine default; the merged config is validated. `"competitive": false` makes every collection a plain store: writes append each vector as its own location with no activation, merge or migration, use it to retain individual observations, including similarity-based associative recall through attention. Competitive mode learns shared patterns and can adapt through graceful forgetting. See [Choose a memory mode](../how-to/choose-memory-mode.md). `"precision": "f32"` stores vectors in half the space (rounded to f32 when written; all math stays f64). Both are fixed for the database's lifetime, and `GET /db` / `GET /db/{db}` report them |
+| `eam` | object | — | Partial `EAMConfig` override: `k`, `t_max`, `beta`, `neighbor_cap`, `num_landmarks`, `l_0`, `competitive`, `precision`. Unset fields keep the engine default; the merged config is validated. `"competitive": false` makes every collection a plain store: writes append each vector as its own location with no activation, merge or migration, use it to retain individual observations, including similarity-based associative recall through attention. Competitive mode learns shared patterns and can adapt through graceful forgetting. See [Choose a memory mode](../how-to/choose-memory-mode.md). `"precision": "f32"` stores vectors in half the space (rounded to f32 when written; all math stays f64). Both are fixed for the database's lifetime, and `GET /db` / `GET /db/{db}` report them. `"selective_attention"` turns on attention learned from prediction error (plain databases only); see [GET /db/{db}/selective-attention](#get-dbdbselective-attention) and [Selective attention](../explanation/selective-attention.md) |
 
 ```bash
 curl -u admin:pw -X POST http://localhost:6380/db \
@@ -60,7 +60,7 @@ Responds with the same shape as [`GET /db/{db}`](#get-dbdb):
 ```json
 { "name": "movies", "created_at": 1767225600, "dimension": 384,
   "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64",
-  "format_version": 1, "skipped_records": 0 }
+  "format_version": 2, "skipped_records": 0 }
 ```
 
 | Status | Cause |
@@ -85,7 +85,7 @@ curl -u admin:pw http://localhost:6380/db/movies
 ```json
 { "name": "movies", "created_at": 1767225600, "dimension": 384,
   "map_size_mb": 32768, "collections": 0, "competitive": true, "precision": "f64",
-  "format_version": 1, "skipped_records": 0 }
+  "format_version": 2, "skipped_records": 0 }
 ```
 
 `collections` is `0` when the collection list cannot be read, not an error.
@@ -96,7 +96,10 @@ curl -u admin:pw http://localhost:6380/db/movies
 | `404 Not Found` | no `db.toml` for that name |
 | `409 Conflict` | (any `/db/{db}/...` route) the database is on disk in a format newer than this server reads; the message says which. See [Storage format](../reference/storage-format.md) |
 
-`format_version` is the database's on-disk format; `skipped_records` counts
+`format_version` is the database's on-disk format (`2` since selective
+attention; a format-`1` database is raised to `2` the first time a newer
+server mounts it, without rewriting any record). Databases created with
+`selective_attention` also report it. `skipped_records` counts
 records reads have skipped since it was opened because they did not decode
 (non-zero means damage).
 
@@ -138,6 +141,40 @@ disk. Without it, `purged` is `false`.
 | `403 Forbidden` | the caller is scoped to a different database, or the target is `default`, which cannot be dropped (the legacy routes target it) |
 
 See also [Backup and restore](../how-to/backup-and-restore.md).
+
+### GET /db/{db}/selective-attention
+
+What a database created with `selective_attention` has learned about where
+to look. Legacy: `GET /selective-attention` (the `default` database).
+
+Auth: Basic or Bearer, root or `Database(db)`.
+
+Request body: no body.
+
+```bash
+curl -u admin:pw http://localhost:6380/db/crm/selective-attention
+```
+
+```json
+{ "k": 200, "warmup": 64,
+  "heads": { "outcome": { "dims": [51, 52],
+                          "weights": [0.31, 0.02, …, 0.0, 0.0],
+                          "updates": 31583 } },
+  "time": { "bucket_starts": [1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233],
+            "weights": [1.0, 0.77, 0.61, …],
+            "updates": 327412 } }
+```
+
+A head's `weights` are its attention per dimension, the head's own fields
+reading `0`; `null` until the head has seen `warmup` rows. Their scale is
+also the read's temperature. `time.weights` are the consolidated per-age
+weights reads use; bucket `b` covers lags from `bucket_starts[b]` up to the
+next start (lag `1` is a collection's newest row). `time` is absent when the
+database was created without it.
+
+| Status | Cause |
+|---|---|
+| `404 Not Found` | no such database, or it was created without selective attention |
 
 ### GET /db/{db}/durability
 

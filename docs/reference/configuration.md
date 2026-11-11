@@ -150,6 +150,35 @@ edit and a restart.
 | `mdl_gate` | `false` | Allocate by description length (`surprise·recurrence > engram bits`) instead of `tau_split` / `tau_overload` |
 | `competitive` | `true` | Adaptive learning of shared patterns by default. `false` appends individual vectors without activation, merge or migration. Choose at database creation; see [Choose a memory mode](../how-to/choose-memory-mode.md) |
 
+## `[eam.selective_attention]`
+
+Optional; absent means off. Set at `POST /db` (`eam.selective_attention`)
+and fixed for the database's lifetime. Needs `competitive = false`. See
+[Selective attention](../explanation/selective-attention.md).
+
+```toml
+[eam.selective_attention]
+time = true
+k = 200
+warmup = 64
+feature_rate = 0.01
+time_rate = 0.002
+
+[eam.selective_attention.heads]
+outcome = [51, 52]
+```
+
+| Key | Default | Meaning |
+|---|---|---|
+| `heads` | `{}` | Named fields to predict: head name → the dimensions it fills in. Names are 1–63 chars of `[a-z0-9_-]`; a head may not name every dimension |
+| `time` | `false` | Learn attention over age from each collection's history |
+| `k` | `200` | Rows a recall blends |
+| `warmup` | `64` | Rows a collection holds before its writes start teaching the heads |
+| `feature_rate` | `0.01` | Step size of feature attention (Adam, on log attention) |
+| `time_rate` | `0.002` | Step size of time attention (Adam) |
+
+At least one head or `time = true` is required.
+
 Validation, enforced whenever a config is built or merged:
 
 - `d > 0`, `k > 0`, `t_max > 0`

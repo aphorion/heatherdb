@@ -888,6 +888,136 @@ pub async fn fingerprint(State(hive): State<AppState>, Path(name): Path<String>)
     }
 }
 
+fn engine_error_status(e: &heather_db::HeatherError) -> StatusCode {
+    match e {
+        heather_db::HeatherError::Storage(_)
+        | heather_db::HeatherError::Serialization(_)
+        | heather_db::HeatherError::LockPoisoned => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::BAD_REQUEST,
+    }
+}
+
+/// Recall with an attention head: the stored rows nearest under the head's
+/// learned attention, blended, with the head's fields filled in.
+pub async fn recall(
+    State(hive): State<AppState>,
+    Path(name): Path<String>,
+    ctx: AuditCtx,
+    Json(req): Json<RecallRequest>,
+) -> Response {
+    let col = match hive.get_collection(&name) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("collection '{name}' not found"),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    let n = req.contributors.unwrap_or(10);
+    let qinfo = AuditQueryInfo::of(&hive, &req.query);
+    let result =
+        tokio::task::spawn_blocking(move || col.attention_recall(&req.query, &req.head)).await;
+    // Audited like `analyze`: every stored row the recall blended.
+    let (status, ids) = match &result {
+        Ok(Ok(r)) => (
+            StatusCode::OK,
+            AuditIds::locations(r.contributors.iter().map(|c| c.id).collect()),
+        ),
+        Ok(Err(e)) => (engine_error_status(e), AuditIds::default()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, AuditIds::default()),
+    };
+    audit_read(&hive, &ctx, &name, "recall", status, ids, qinfo);
+    match result {
+        Ok(Ok(r)) => Json(RecallResponse {
+            result: r.result,
+            contributors: r
+                .contributors
+                .into_iter()
+                .take(n)
+                .map(|c| RecallContributor {
+                    id: c.id,
+                    distance: c.distance,
+                    weight: c.weight,
+                })
+                .collect(),
+        })
+        .into_response(),
+        Ok(Err(e)) => error_response(engine_error_status(&e), e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// The time-attended read of a collection's history: what the database's
+/// learned recency expects next.
+pub async fn next(State(hive): State<AppState>, Path(name): Path<String>) -> Response {
+    let col = match hive.get_collection(&name) {
+        Ok(Some(col)) => col,
+        Ok(None) => {
+            return error_response(
+                StatusCode::NOT_FOUND,
+                format!("collection '{name}' not found"),
+            );
+        }
+        Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    };
+    match tokio::task::spawn_blocking(move || col.attention_next()).await {
+        Ok(Ok(result)) => Json(NextResponse { result }).into_response(),
+        Ok(Err(e)) => error_response(engine_error_status(&e), e),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e),
+    }
+}
+
+/// What the database has learned about where to look.
+pub async fn selective_attention(State(hive): State<AppState>) -> Response {
+    let Some(shared) = hive.attention() else {
+        return error_response(
+            StatusCode::NOT_FOUND,
+            "this database was created without selective attention",
+        );
+    };
+    let state = match shared.state.lock() {
+        Ok(s) => s.clone(),
+        Err(_) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, "lock poisoned"),
+    };
+    let cfg = &shared.config;
+    let heads = cfg
+        .heads
+        .iter()
+        .map(|(name, dims)| {
+            let st = state.heads.get(name).cloned().unwrap_or_default();
+            let weights = st.alpha().map(|mut a| {
+                for &i in dims {
+                    a[i] = 0.0;
+                }
+                a
+            });
+            (
+                name.clone(),
+                AttentionHeadInfo {
+                    dims: dims.clone(),
+                    weights,
+                    updates: st.updates,
+                },
+            )
+        })
+        .collect();
+    let time = cfg.time.then(|| AttentionTimeInfo {
+        bucket_starts: heather_db::attention::TIME_EDGES[..heather_db::attention::TIME_BUCKETS]
+            .to_vec(),
+        weights: state.time.consolidated.clone(),
+        updates: state.time.updates,
+    });
+    Json(SelectiveAttentionResponse {
+        k: cfg.k,
+        warmup: cfg.warmup,
+        heads,
+        time,
+    })
+    .into_response()
+}
+
 pub async fn analyze(
     State(hive): State<AppState>,
     Path(name): Path<String>,

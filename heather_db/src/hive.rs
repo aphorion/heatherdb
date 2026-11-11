@@ -27,6 +27,9 @@ pub struct Hive {
     config: EAMConfig,
     audit: AuditLog,
     collections: RwLock<HashMap<String, Arc<Collection>>>,
+    /// Selective attention shared by every collection, when the database
+    /// opted in. See [`crate::attention`].
+    attention: Option<Arc<crate::attention::SharedAttention>>,
 }
 
 impl Hive {
@@ -52,11 +55,29 @@ impl Hive {
         )?);
         let audit = AuditLog::open(&store, audit)?;
 
+        let attention = match &config.selective_attention {
+            None => None,
+            Some(att) => {
+                let state = match store
+                    .load_metadata(crate::attention::STATE_SCOPE, crate::attention::STATE_KEY)?
+                {
+                    Some(bytes) => bincode::deserialize(&bytes)?,
+                    None => crate::attention::AttentionState::default(),
+                };
+                Some(Arc::new(crate::attention::SharedAttention::new(
+                    att.clone(),
+                    config.d,
+                    state,
+                )))
+            }
+        };
+
         Ok(Hive {
             store,
             config,
             audit,
             collections: RwLock::new(HashMap::new()),
+            attention,
         })
     }
 
@@ -130,6 +151,7 @@ impl Hive {
                 self.store.clone(),
                 &self.config,
             )?
+            .with_attention(self.attention.clone())
         } else {
             // Exists on disk, load it
             Collection::load(
@@ -138,6 +160,7 @@ impl Hive {
                 self.store.clone(),
                 &self.config,
             )?
+            .with_attention(self.attention.clone())
         };
 
         let col = Arc::new(col);
@@ -176,12 +199,15 @@ impl Hive {
             return Ok(Some(col.clone()));
         }
 
-        let col = Arc::new(Collection::load(
-            collection_id,
-            name.to_string(),
-            self.store.clone(),
-            &self.config,
-        )?);
+        let col = Arc::new(
+            Collection::load(
+                collection_id,
+                name.to_string(),
+                self.store.clone(),
+                &self.config,
+            )?
+            .with_attention(self.attention.clone()),
+        );
         cache.insert(name.to_string(), col.clone());
         Ok(Some(col))
     }
@@ -257,6 +283,11 @@ impl Hive {
     }
 
     /// Get a reference to the shared config.
+    /// The database's selective attention, when it opted in.
+    pub fn attention(&self) -> Option<&Arc<crate::attention::SharedAttention>> {
+        self.attention.as_ref()
+    }
+
     pub fn config(&self) -> &EAMConfig {
         &self.config
     }
@@ -440,5 +471,108 @@ mod tests {
         let stats = hive.stats().unwrap();
         assert_eq!(stats.num_collections, 2);
         assert_eq!(stats.collections.len(), 2);
+    }
+
+    fn attention_config(d: usize) -> EAMConfig {
+        let mut config = EAMConfig::new(d).unwrap();
+        config.competitive = false;
+        config.selective_attention = Some(crate::attention::AttentionConfig {
+            time: true,
+            k: 50,
+            warmup: 16,
+            feature_rate: 0.01,
+            time_rate: 0.002,
+            heads: [("y".to_string(), vec![d - 1])].into_iter().collect(),
+        });
+        config.validate().unwrap();
+        config
+    }
+
+    /// Rows whose last field (the outcome) is decided by field 0.
+    fn labelled_rows(n: usize, d: usize, seed: u64) -> Vec<Vec<f64>> {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+        (0..n)
+            .map(|_| {
+                let mut r: Vec<f64> = (0..d).map(|_| rng.gen_range(-1.0..1.0)).collect();
+                r[d - 1] = if r[0] > 0.0 { 1.0 } else { 0.0 };
+                r
+            })
+            .collect()
+    }
+
+    #[test]
+    fn attention_is_learned_by_writes_and_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let d = 6;
+        let rows = labelled_rows(600, d, 1);
+        let learned = {
+            let hive = Hive::open(dir.path(), attention_config(d), 256).unwrap();
+            let col = hive.get_or_create_collection("customers").unwrap();
+            for chunk in rows.chunks(50) {
+                col.write_batch(chunk).unwrap();
+            }
+            let state = hive.attention().unwrap().state.lock().unwrap().clone();
+            let head = &state.heads["y"];
+            assert!(
+                head.updates > 500,
+                "every write past warm-up teaches the head"
+            );
+            let a = head.alpha().unwrap();
+            let noise = (1..d - 1).map(|j| a[j]).fold(0.0, f64::max);
+            assert!(
+                a[0] > noise,
+                "field 0 decides the outcome: {} vs {}",
+                a[0],
+                noise
+            );
+            assert!(state.time.updates > 0);
+            state
+        };
+        let hive = Hive::open(dir.path(), attention_config(d), 256).unwrap();
+        assert_eq!(*hive.attention().unwrap().state.lock().unwrap(), learned);
+
+        let col = hive.get_or_create_collection("customers").unwrap();
+        let mut q = labelled_rows(1, d, 99).remove(0);
+        let truth = q[d - 1];
+        q[d - 1] = 0.5; // ignored: the head fills it in
+        let r = col.attention_recall(&q, "y").unwrap();
+        assert!((r.result[d - 1] - truth).abs() < 0.5);
+        let total: f64 = r.contributors.iter().map(|c| c.weight).sum();
+        assert!((total - 1.0).abs() < 1e-9);
+        assert!(col.attention_next().unwrap().is_some());
+        assert!(col.attention_recall(&q, "nope").is_err());
+    }
+
+    #[test]
+    fn a_rejected_batch_leaves_attention_unchanged() {
+        let dir = TempDir::new().unwrap();
+        let d = 6;
+        let hive = Hive::open(dir.path(), attention_config(d), 256).unwrap();
+        let col = hive.get_or_create_collection("c").unwrap();
+        col.write_batch(&labelled_rows(100, d, 2)).unwrap();
+        let before = hive.attention().unwrap().state.lock().unwrap().clone();
+        let mut bad = labelled_rows(3, d, 3);
+        bad[2].push(0.0); // wrong dimension: the whole batch is refused
+        assert!(col.write_batch(&bad).is_err());
+        assert_eq!(*hive.attention().unwrap().state.lock().unwrap(), before);
+    }
+
+    #[test]
+    fn databases_without_attention_learn_nothing() {
+        let dir = TempDir::new().unwrap();
+        let hive = Hive::open(dir.path(), test_config(), 256).unwrap();
+        assert!(hive.attention().is_none());
+        let col = hive.get_or_create_collection("c").unwrap();
+        let v = vec![0.25; 16];
+        col.write_batch(std::slice::from_ref(&v)).unwrap();
+        assert!(col.attention_recall(&v, "y").is_err());
+    }
+
+    #[test]
+    fn attention_needs_a_plain_database() {
+        let mut config = attention_config(6);
+        config.competitive = true;
+        assert!(config.validate().is_err());
     }
 }

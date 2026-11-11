@@ -316,7 +316,8 @@ pub fn is_authorized(
     if db_name == "default" {
         return path.starts_with("/collections")
             || path.starts_with("/algebra")
-            || path.starts_with("/compose");
+            || path.starts_with("/compose")
+            || path == "/selective-attention";
     }
 
     false
@@ -468,6 +469,23 @@ mod tests {
         assert!(!is_authorized(&s, "/db", None));
         assert!(!is_authorized(&s, "/collections/x", None));
         assert!(!is_authorized(&s, "/algebra/add", None));
+        assert!(!is_authorized(&s, "/selective-attention", None));
+        assert!(is_authorized(&s, "/db/memoria/selective-attention", None));
+        assert!(!is_authorized(
+            &s,
+            "/db/navigator/selective-attention",
+            None
+        ));
+    }
+
+    /// The legacy selective-attention route belongs to the default database.
+    #[test]
+    fn auth_legacy_selective_attention_is_the_default_dbs() {
+        assert!(is_authorized(
+            &Scope::Database("default".into()),
+            "/selective-attention",
+            None
+        ));
     }
 
     /// The access log is Root-only by default, even for the database you

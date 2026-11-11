@@ -97,6 +97,7 @@ pub async fn list_databases(Extension(server): Extension<Arc<Server>>) -> Respon
             competitive: cfg.eam.competitive,
             precision: cfg.eam.precision,
             format_version: cfg.format_version,
+            selective_attention: cfg.eam.selective_attention.clone(),
             skipped_records: server
                 .database(&name)
                 .map(|h| h.skipped_records())
@@ -142,6 +143,9 @@ pub async fn create_database(
         if let Some(v) = o.precision {
             cfg.eam.precision = v;
         }
+        if let Some(v) = o.selective_attention {
+            cfg.eam.selective_attention = Some(v);
+        }
         if let Err(e) = cfg.eam.validate() {
             return err(StatusCode::BAD_REQUEST, e);
         }
@@ -160,6 +164,7 @@ pub async fn create_database(
                     competitive: c.eam.competitive,
                     precision: c.eam.precision,
                     format_version: c.format_version,
+                    selective_attention: c.eam.selective_attention.clone(),
                     skipped_records: 0,
                 })
                 .into_response()
@@ -210,6 +215,7 @@ pub async fn get_database(
         competitive: cfg.eam.competitive,
         precision: cfg.eam.precision,
         format_version: cfg.format_version,
+        selective_attention: cfg.eam.selective_attention.clone(),
         skipped_records,
     })
     .into_response()
@@ -469,6 +475,41 @@ pub async fn fingerprint(
         Err(r) => return r,
     };
     routes::fingerprint(State(hive), Path(col)).await
+}
+
+pub async fn recall(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col)): Path<(String, String)>,
+    ctx: AuditCtx,
+    Json(req): Json<RecallRequest>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::recall(State(hive), Path(col), ctx.for_db(&db_name), Json(req)).await
+}
+
+pub async fn next(
+    Extension(server): Extension<Arc<Server>>,
+    Path((db_name, col)): Path<(String, String)>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::next(State(hive), Path(col)).await
+}
+
+pub async fn selective_attention(
+    Extension(server): Extension<Arc<Server>>,
+    Path(db_name): Path<String>,
+) -> Response {
+    let hive = match resolve_db(&server, &db_name) {
+        Ok(h) => h,
+        Err(r) => return r,
+    };
+    routes::selective_attention(State(hive)).await
 }
 
 pub async fn analyze(
@@ -946,5 +987,134 @@ mod refused_tests {
 
         let missing = list_collections(Extension(server), Path("nope".into())).await;
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+}
+
+#[cfg(test)]
+mod selective_attention_tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    async fn body(resp: Response) -> serde_json::Value {
+        serde_json::from_slice(&to_bytes(resp.into_body(), usize::MAX).await.unwrap()).unwrap()
+    }
+
+    fn ctx() -> AuditCtx {
+        AuditCtx {
+            user: "alice".into(),
+            scope: "root".into(),
+            db: "default".into(),
+        }
+    }
+
+    /// Created through the API, learned by plain writes, read back through
+    /// `recall`, `next` and `selective-attention`, and audited.
+    #[tokio::test]
+    async fn selective_attention_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Server::open(dir.path(), 8).unwrap());
+        let req: CreateDatabaseRequest = serde_json::from_value(serde_json::json!({
+            "name": "crm", "dimension": 4,
+            "eam": {"competitive": false, "selective_attention": {
+                "time": true, "warmup": 8, "heads": {"outcome": [3]}}}
+        }))
+        .unwrap();
+        let resp = create_database(Extension(server.clone()), Json(req)).await;
+        assert!(resp.status().is_success(), "{}", resp.status());
+        let info = body(resp).await;
+        assert_eq!(info["selective_attention"]["heads"]["outcome"][0], 3);
+
+        // Outcome (dim 3) follows dim 0; dims 1-2 are noise.
+        let vectors: Vec<Vec<f64>> = (0..200)
+            .map(|i| {
+                let a = ((i * 37) % 100) as f64 / 50.0 - 1.0;
+                let n1 = ((i * 53) % 100) as f64 / 50.0 - 1.0;
+                let n2 = ((i * 71) % 100) as f64 / 50.0 - 1.0;
+                vec![a, n1, n2, if a > 0.0 { 1.0 } else { 0.0 }]
+            })
+            .collect();
+        let resp = write(
+            Extension(server.clone()),
+            Path(("crm".into(), "customers".into())),
+            Json(WriteRequest {
+                metadata: None,
+                vectors,
+                vectors_b64: None,
+            }),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let req: RecallRequest = serde_json::from_value(serde_json::json!({
+            "query": [0.9, 0.0, 0.0, 0.0], "head": "outcome", "contributors": 3
+        }))
+        .unwrap();
+        let resp = recall(
+            Extension(server.clone()),
+            Path(("crm".into(), "customers".into())),
+            ctx(),
+            Json(req),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let r = body(resp).await;
+        assert!(
+            r["result"][3].as_f64().unwrap() > 0.5,
+            "a high dim 0 means outcome 1: {r}"
+        );
+        assert_eq!(r["contributors"].as_array().unwrap().len(), 3);
+
+        let resp = next(
+            Extension(server.clone()),
+            Path(("crm".into(), "customers".into())),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(body(resp).await["result"].as_array().unwrap().len(), 4);
+
+        let resp = selective_attention(Extension(server.clone()), Path("crm".into())).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let a = body(resp).await;
+        assert!(a["heads"]["outcome"]["updates"].as_u64().unwrap() > 100);
+        assert_eq!(a["heads"]["outcome"]["weights"][3], 0.0);
+        assert_eq!(a["time"]["weights"].as_array().unwrap().len(), 12);
+
+        // Unknown head and a database without the feature are client errors.
+        let req: RecallRequest = serde_json::from_value(serde_json::json!({
+            "query": [0.9, 0.0, 0.0, 0.0], "head": "nope"
+        }))
+        .unwrap();
+        let resp = recall(
+            Extension(server.clone()),
+            Path(("crm".into(), "customers".into())),
+            ctx(),
+            Json(req),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let resp = selective_attention(Extension(server.clone()), Path("default".into())).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+        // The recall was audited against `crm`, with the blended rows.
+        let hive = server.database("crm").unwrap();
+        let entries = hive.query_audit(&heather_db::AuditQuery::new(10)).unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|e| e.route == "recall" && e.status == 200 && e.result_count > 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn selective_attention_on_a_competitive_database_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let server = Arc::new(Server::open(dir.path(), 8).unwrap());
+        let req: CreateDatabaseRequest = serde_json::from_value(serde_json::json!({
+            "name": "x", "dimension": 4,
+            "eam": {"selective_attention": {"time": true}}
+        }))
+        .unwrap();
+        let resp = create_database(Extension(server.clone()), Json(req)).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
