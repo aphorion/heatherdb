@@ -530,6 +530,24 @@ impl Store {
         Ok(())
     }
 
+    /// Every metadata entry of a collection whose key starts with `prefix`,
+    /// in key order, as (key without the collection prefix, value).
+    pub fn load_metadata_prefix(
+        &self,
+        collection_id: u32,
+        prefix: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
+        let rtxn = self.env.read_txn()?;
+        let start = metadata_key(collection_id, prefix);
+        let mut out = Vec::new();
+        for item in self.metadata_db.prefix_iter(&rtxn, &start)? {
+            let (k, v) = item?;
+            let key = String::from_utf8_lossy(&k[4..]).into_owned();
+            out.push((key, v.to_vec()));
+        }
+        Ok(out)
+    }
+
     pub fn load_metadata(&self, collection_id: u32, key: &str) -> Result<Option<Vec<u8>>> {
         let rtxn = self.env.read_txn()?;
         let composite_key = metadata_key(collection_id, key);

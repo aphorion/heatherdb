@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -353,6 +354,19 @@ struct NeighbourhoodCache {
     state: crate::novelty::Incremental,
 }
 
+/// A column collection's rows as novelty compares them (see
+/// [`Collection::novelty_rows`]), and their neighbourhood. Current while the
+/// collection's version and the database's learned state are unchanged.
+struct RowViewCache {
+    version: u64,
+    generation: u64,
+    k: usize,
+    width: usize,
+    flat: Vec<f64>,
+    ids: Vec<u64>,
+    hood: crate::novelty::Neighbourhood,
+}
+
 /// One query's novelty relative to its neighbourhood.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NoveltyResult {
@@ -400,30 +414,85 @@ fn ids_and_rows_by_id(locations: &[HardLocation]) -> (Vec<u64>, Vec<&[f64]>) {
     )
 }
 
-type AttentionTxn<'a> = Option<(
-    std::sync::MutexGuard<'a, crate::attention::AttentionState>,
-    crate::attention::AttentionState,
-    Vec<(String, Vec<bool>)>,
-)>;
+/// A write's hold on the database's attention: the lock, a copy of the small
+/// learned state (heads, time) to update, and the live symbol table, which
+/// the write changes in place under a journal. Dropped without publishing,
+/// the journal is undone: a failed write leaves nothing learned.
+pub(crate) struct AttnTxn<'a> {
+    guard: std::sync::MutexGuard<'a, crate::attention::AttentionState>,
+    state: crate::attention::AttentionState,
+    masks: Vec<(String, Vec<bool>)>,
+    dims: usize,
+    committed: bool,
+}
+
+impl Drop for AttnTxn<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let dims = self.dims;
+            self.guard.symbols.rollback(dims);
+        }
+    }
+}
+
+type AttentionTxn<'a> = Option<AttnTxn<'a>>;
 
 /// Writes the updated attention state into the write's own transaction.
 fn put_attention_state(store: &Store, txn: &mut heed::RwTxn, att: &AttentionTxn<'_>) -> Result<()> {
-    if let Some((_, state, _)) = att {
+    if let Some(t) = att {
         store.put_metadata(
             txn,
             crate::attention::STATE_SCOPE,
             crate::attention::STATE_KEY,
-            &bincode::serialize(state)?,
+            &bincode::serialize(&t.state)?,
         )?;
+        if !t.state.scales.is_empty() {
+            store.put_metadata(
+                txn,
+                crate::attention::STATE_SCOPE,
+                crate::attention::SCALES_KEY,
+                &bincode::serialize(&t.state.scales)?,
+            )?;
+        }
+        for (key, bytes) in t.guard.symbols.changed_records(t.dims)? {
+            store.put_metadata(txn, crate::attention::STATE_SCOPE, &key, &bytes)?;
+        }
     }
     Ok(())
 }
 
 /// After the commit: the learned state becomes the database's.
 fn publish_attention_state(att: AttentionTxn<'_>) {
-    if let Some((mut guard, state, _)) = att {
-        *guard = state;
+    if let Some(mut t) = att {
+        let mut symbols = std::mem::take(&mut t.guard.symbols);
+        symbols.finish();
+        t.state.generation = crate::attention::Generation(t.guard.generation.0 + 1);
+        *t.guard = std::mem::take(&mut t.state);
+        t.guard.symbols = symbols;
+        t.committed = true;
     }
+}
+
+/// Rows as stored for a database with symbol fields: each numeric part,
+/// then one id per field (values interned into the live, journaled table).
+fn intern_rows(
+    att: &mut AttentionTxn<'_>,
+    sym: &crate::symbols::SymbolConfig,
+    numeric: &[impl AsRef<[f64]>],
+    values: &[BTreeMap<String, String>],
+) -> Vec<Vec<f64>> {
+    let state = &mut *att.as_mut().expect("symbols need attention").guard;
+    numeric
+        .iter()
+        .zip(values)
+        .map(|(row, vals)| {
+            let mut v = row.as_ref().to_vec();
+            for (f, name) in sym.fields.iter().enumerate() {
+                v.push(state.symbols.intern(sym, f, &vals[name]) as f64);
+            }
+            v
+        })
+        .collect()
 }
 
 /// A single EAM collection, scoped to a collection_id within a shared Store.
@@ -440,6 +509,7 @@ pub struct Collection {
     /// Spreads and familiarities for `novelty`, built on first use and
     /// rebuilt when the collection changes (see [`crate::novelty`]).
     neighbourhood: std::sync::RwLock<Option<NeighbourhoodCache>>,
+    row_view: std::sync::RwLock<Option<RowViewCache>>,
 }
 
 /// Hold the collection lock through persistence and recovery. Successful writes
@@ -971,6 +1041,7 @@ impl Collection {
             attention: None,
             coalescer: Coalescer::default(),
             neighbourhood: std::sync::RwLock::new(None),
+            row_view: std::sync::RwLock::new(None),
         })
     }
 
@@ -1026,6 +1097,7 @@ impl Collection {
             attention: None,
             coalescer: Coalescer::default(),
             neighbourhood: std::sync::RwLock::new(None),
+            row_view: std::sync::RwLock::new(None),
         })
     }
 
@@ -1211,12 +1283,23 @@ impl Collection {
         let Some(shared) = self.attention.as_ref() else {
             return Ok(None);
         };
-        let guard = shared
+        let mut guard = shared
             .state
             .lock()
             .map_err(|_| HeatherError::LockPoisoned)?;
+        // Copy the small state; the symbol table stays live, journaled.
+        let symbols = std::mem::take(&mut guard.symbols);
         let state = guard.clone();
-        Ok(Some((guard, state, shared.masks())))
+        guard.symbols = symbols;
+        guard.symbols.begin();
+        let dims = shared.config.symbols.as_ref().map_or(0, |s| s.dims);
+        Ok(Some(AttnTxn {
+            guard,
+            state,
+            masks: shared.masks(),
+            dims,
+            committed: false,
+        }))
     }
 
     /// Predict-then-learn for one incoming row, before it is stored.
@@ -1226,9 +1309,43 @@ impl Collection {
         locations: &[HardLocation],
         input: &[f64],
     ) {
-        if let (Some(shared), Some((_, state, masks))) = (self.attention.as_ref(), att.as_mut()) {
+        if let (Some(shared), Some(t)) = (self.attention.as_ref(), att.as_mut()) {
             let rows = rows_by_id(locations);
-            crate::attention::learn_from_rows(&shared.config, masks, state, &rows, input);
+            let AttnTxn {
+                guard,
+                state,
+                masks,
+                ..
+            } = t;
+            // Number columns compare on the common scale, as it is now.
+            let slots = shared.scaled_slots();
+            if slots.is_empty() {
+                crate::attention::learn_from_rows(
+                    &shared.config,
+                    masks,
+                    state,
+                    &mut guard.symbols,
+                    &rows,
+                    input,
+                );
+            } else {
+                let scaled = |r: &[f64]| {
+                    let mut v = r.to_vec();
+                    crate::columns::standardize_row(&slots, &state.scales, &mut v);
+                    v
+                };
+                let owned: Vec<Vec<f64>> = rows.iter().map(|r| scaled(r)).collect();
+                let refs: Vec<&[f64]> = owned.iter().map(|r| r.as_slice()).collect();
+                let x = scaled(input);
+                crate::attention::learn_from_rows(
+                    &shared.config,
+                    masks,
+                    state,
+                    &mut guard.symbols,
+                    &refs,
+                    &x,
+                );
+            }
         }
     }
 
@@ -1236,35 +1353,118 @@ impl Collection {
     /// the head's learned attention, blended, with the head's fields filled
     /// in. The query's values in those fields are ignored.
     pub fn attention_recall(&self, query: &[f64], head: &str) -> Result<AttendedRecall> {
+        self.attention_recall_symbols(query, head, &BTreeMap::new())
+    }
+
+    /// [`Self::attention_recall`] for a database with symbol fields: `query`
+    /// is the numeric part, `values` the symbol values to compare by (a
+    /// field left out does not count). The result is the numeric part.
+    pub fn attention_recall_symbols(
+        &self,
+        query: &[f64],
+        head: &str,
+        values: &BTreeMap<String, String>,
+    ) -> Result<AttendedRecall> {
+        self.recall_masked(query, head, values, &[])
+    }
+
+    /// [`Self::attention_recall_symbols`], also leaving the numeric slots
+    /// `unknown` out of the distance (columns a query did not give).
+    fn recall_masked(
+        &self,
+        query: &[f64],
+        head: &str,
+        values: &BTreeMap<String, String>,
+        unknown: &[usize],
+    ) -> Result<AttendedRecall> {
         vec_ops::validate_vector(query)?;
         let shared = self.attention.as_ref().ok_or_else(|| {
             HeatherError::InvalidInput(
                 "this database was created without selective attention".into(),
             )
         })?;
-        if query.len() != shared.d {
+        let sym = shared.config.symbols.as_ref();
+        let expected = sym.map_or(shared.d, |s| s.numeric(shared.d));
+        if query.len() != expected {
             return Err(HeatherError::DimensionMismatch {
-                expected: shared.d,
+                expected,
                 got: query.len(),
             });
         }
-        let mask = shared
+        if sym.is_none() && !values.is_empty() {
+            return Err(HeatherError::InvalidInput(
+                "this database has no symbol fields".into(),
+            ));
+        }
+        let mut mask = shared
             .config
             .mask(head, shared.d)
             .map_err(|e| HeatherError::InvalidInput(e.to_string()))?;
-        let head_state = shared
+        for &i in unknown {
+            mask[i] = true;
+        }
+        // Lock order: attention, then collection (as writes take them).
+        let state = shared
             .state
             .lock()
-            .map_err(|_| HeatherError::LockPoisoned)?
-            .heads
-            .get(head)
-            .cloned()
-            .unwrap_or_default();
+            .map_err(|_| HeatherError::LockPoisoned)?;
+        let head_state = state.heads.get(head).cloned().unwrap_or_default();
         let inner = self.read_inner()?;
-        let (ids, rows) = ids_and_rows_by_id(&inner.locations);
-        let r = crate::attention::recall(&head_state, query, &rows, &mask, shared.config.k)?;
+        let (ids, stored) = ids_and_rows_by_id(&inner.locations);
+        // Number columns compare on the common scale, as it is now.
+        let slots = shared.scaled_slots();
+        let mut q_scaled = query.to_vec();
+        let standardized: Vec<Vec<f64>> = if slots.is_empty() {
+            Vec::new()
+        } else {
+            crate::columns::standardize_row(&slots, &state.scales, &mut q_scaled);
+            stored
+                .iter()
+                .map(|r| {
+                    let mut v = r.to_vec();
+                    crate::columns::standardize_row(&slots, &state.scales, &mut v);
+                    v
+                })
+                .collect()
+        };
+        let stored: Vec<&[f64]> = if slots.is_empty() {
+            stored
+        } else {
+            standardized.iter().map(|r| r.as_slice()).collect()
+        };
+        let query: &[f64] = &q_scaled;
+        let (q, assembled) = match sym {
+            Some(s) => {
+                // A field the query leaves out takes no part in the distance.
+                let dn = s.numeric(shared.d);
+                for (f, name) in s.fields.iter().enumerate() {
+                    if !values.contains_key(name) {
+                        for m in mask.iter_mut().skip(dn + f * s.dims).take(s.dims) {
+                            *m = true;
+                        }
+                    }
+                }
+                (
+                    state.symbols.assemble_query(s, query, values)?,
+                    stored
+                        .iter()
+                        .map(|r| state.symbols.assemble(s, r))
+                        .collect::<Vec<_>>(),
+                )
+            }
+            None => (query.to_vec(), Vec::new()),
+        };
+        drop(state);
+        let rows: Vec<&[f64]> = if sym.is_some() {
+            assembled.iter().map(|r| r.as_slice()).collect()
+        } else {
+            stored
+        };
+        let r = crate::attention::recall(&head_state, &q, &rows, &mask, shared.config.k)?;
+        let mut result = r.result;
+        result.truncate(expected);
         Ok(AttendedRecall {
-            result: r.result,
+            result,
             contributors: r
                 .contributors
                 .into_iter()
@@ -1340,6 +1540,11 @@ impl Collection {
     ) -> Result<Vec<NoveltyResult>> {
         if k == 0 {
             return Err(HeatherError::InvalidInput("k must be > 0".into()));
+        }
+        if self.columns().is_some() {
+            return Err(HeatherError::InvalidInput(
+                "this database was declared with columns: ask novelty by row (`rows`)".into(),
+            ));
         }
         let inner = self.read_inner()?;
         let d = inner.config.d;
@@ -1466,17 +1671,375 @@ impl Collection {
             .clone();
         let inner = self.read_inner()?;
         let rows = rows_by_id(&inner.locations);
-        let history: Vec<&[f64]> = rows.iter().rev().copied().collect();
-        Ok(crate::attention::time_read(&time, &history, shared.d).map(|v| vec_ops::normalize(&v)))
+        // With symbols only the numeric part is a quantity to blend; the
+        // symbol slots hold ids (rank those with `attention_next_values`).
+        let dn = shared
+            .config
+            .symbols
+            .as_ref()
+            .map_or(shared.d, |s| s.numeric(shared.d));
+        if dn == 0 {
+            return Ok(None);
+        }
+        let history: Vec<&[f64]> = rows.iter().rev().map(|r| &r[..dn]).collect();
+        Ok(crate::attention::time_read(&time, &history, dn).map(|v| vec_ops::normalize(&v)))
+    }
+
+    /// The values of symbol field `field` the collection's history predicts
+    /// next, best first, with their scores: the history's codes weighted by
+    /// the learned recency, scored against every value's learned target
+    /// code. `exclude_seen` leaves out values already in the history.
+    pub fn attention_next_values(
+        &self,
+        field: &str,
+        n: usize,
+        exclude_seen: bool,
+    ) -> Result<Vec<(String, f64)>> {
+        let shared = self.attention.as_ref().ok_or_else(|| {
+            HeatherError::InvalidInput(
+                "this database was created without selective attention".into(),
+            )
+        })?;
+        let sym = shared.config.symbols.as_ref().ok_or_else(|| {
+            HeatherError::InvalidInput("this database has no symbol fields".into())
+        })?;
+        if !shared.config.time {
+            return Err(HeatherError::InvalidInput(
+                "ranking next values needs selective attention with `time`".into(),
+            ));
+        }
+        let f = sym.field(field)?;
+        let dn = sym.numeric(shared.d);
+        let state = shared
+            .state
+            .lock()
+            .map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
+        let rows = rows_by_id(&inner.locations);
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let history: Vec<u32> = rows.iter().rev().map(|r| r[dn + f] as u32).collect();
+        let pred = crate::symbols::predict_next(
+            sym,
+            &state.symbols,
+            f,
+            &state.time.consolidated,
+            &history,
+        );
+        let exclude: std::collections::BTreeSet<u32> = if exclude_seen {
+            history.iter().copied().collect()
+        } else {
+            Default::default()
+        };
+        Ok(crate::symbols::rank_values(
+            sym,
+            &state.symbols,
+            f,
+            &pred,
+            n,
+            &exclude,
+        ))
     }
 
     /// Batch write multiple patterns under a single lock + transaction.
     pub fn write_batch(&self, inputs: &[impl AsRef<[f64]>]) -> Result<()> {
+        self.refuse_raw_symbol_rows()?;
         for input in inputs {
             vec_ops::validate_vector(input.as_ref())?;
         }
+        let att = self.attention_begin()?;
+        self.write_batch_with(inputs, att)
+    }
 
+    /// The database's symbol configuration, when it has symbol fields.
+    fn symbol_config(&self) -> Option<&crate::symbols::SymbolConfig> {
+        self.attention.as_ref()?.config.symbols.as_ref()
+    }
+
+    /// A database with symbols stores value ids in its symbol slots; a raw
+    /// vector cannot say which values it means, so it is refused.
+    fn refuse_raw_symbol_rows(&self) -> Result<()> {
+        self.refuse_column_database()?;
+        if self.symbol_config().is_some() {
+            return Err(HeatherError::InvalidInput(
+                "this database has symbol fields: write rows with `symbols` \
+                 (and their numeric part as `vectors`)"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A database declared with columns is written by column name only: a
+    /// vector would bypass the scaling of its numbers.
+    fn refuse_column_database(&self) -> Result<()> {
+        if self.columns().is_some() {
+            return Err(HeatherError::InvalidInput(
+                "this database was declared with columns: write rows by name (`rows`)".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Writes rows given as a numeric part plus one value per symbol field.
+    /// Values become ids in the database's symbol table (new values start
+    /// from their initial code), inside the write's own transaction: a
+    /// failed write adds no value.
+    pub fn write_batch_symbols(
+        &self,
+        numeric: &[impl AsRef<[f64]>],
+        values: &[BTreeMap<String, String>],
+    ) -> Result<()> {
+        self.refuse_column_database()?;
+        let sym = self.symbol_config().ok_or_else(|| {
+            HeatherError::InvalidInput("this database has no symbol fields".into())
+        })?;
+        if numeric.len() != values.len() {
+            return Err(HeatherError::InvalidInput(
+                "symbols must have one entry per row".into(),
+            ));
+        }
+        let d = self.attention.as_ref().expect("symbols need attention").d;
+        let dn = sym.numeric(d);
+        for (row, vals) in numeric.iter().zip(values) {
+            vec_ops::validate_vector(row.as_ref())?;
+            if row.as_ref().len() != dn {
+                return Err(HeatherError::DimensionMismatch {
+                    expected: dn,
+                    got: row.as_ref().len(),
+                });
+            }
+            for k in vals.keys() {
+                sym.field(k)?;
+            }
+            if let Some(missing) = sym.fields.iter().find(|f| !vals.contains_key(*f)) {
+                return Err(HeatherError::InvalidInput(format!(
+                    "every row needs a value for symbol field {missing:?}"
+                )));
+            }
+        }
         let mut att = self.attention_begin()?;
+        let full = intern_rows(&mut att, sym, numeric, values);
+        self.write_batch_with(&full, att)
+    }
+
+    /// The columns this database was declared with, if any.
+    pub fn columns(&self) -> Option<&[crate::columns::Column]> {
+        self.attention.as_ref()?.config.columns.as_deref()
+    }
+
+    fn columns_or_err(
+        &self,
+    ) -> Result<(
+        &crate::attention::SharedAttention,
+        &[crate::columns::Column],
+    )> {
+        let no =
+            || HeatherError::InvalidInput("this database was not declared with columns".into());
+        let shared = self.attention.as_deref().ok_or_else(no)?;
+        let cols = shared.config.columns.as_deref().ok_or_else(no)?;
+        Ok((shared, cols))
+    }
+
+    /// Writes rows given by column name (see [`crate::columns`]). Number
+    /// columns are rescaled by the database's running statistics, which this
+    /// write updates; categories become ids. All in the write's own
+    /// transaction: a failed write changes neither.
+    pub fn write_rows(&self, rows: &[crate::columns::Row]) -> Result<()> {
+        use crate::columns;
+        let (shared, cols) = self.columns_or_err()?;
+        if rows.is_empty() {
+            return Err(HeatherError::InvalidInput("rows must not be empty".into()));
+        }
+        for row in rows {
+            columns::check(cols, row, false)?;
+        }
+        let heads = &shared.config.heads;
+        let mut att = self.attention_begin()?;
+        let encoded: Vec<columns::Encoded> = {
+            let t = att.as_mut().expect("columns need attention");
+            for row in rows {
+                columns::observe(cols, heads, &mut t.state.scales, row);
+            }
+            rows.iter()
+                .map(|row| columns::encode(cols, heads, row))
+                .collect()
+        };
+        let full = match shared.config.symbols.as_ref() {
+            Some(sym) => {
+                let (numeric, values): (Vec<Vec<f64>>, Vec<BTreeMap<String, String>>) =
+                    encoded.into_iter().map(|e| (e.numeric, e.values)).unzip();
+                intern_rows(&mut att, sym, &numeric, &values)
+            }
+            None => encoded.into_iter().map(|e| e.numeric).collect(),
+        };
+        self.write_batch_with(&full, att)
+    }
+
+    /// Predicts `column` for a row given by column name: the stored rows
+    /// nearest under the column's learned attention, blended. Columns the
+    /// row leaves out take no part. The value is in the column's own units.
+    pub fn predict(
+        &self,
+        row: &crate::columns::Row,
+        column: &str,
+    ) -> Result<(f64, Vec<AttendedContributor>)> {
+        use crate::columns;
+        let (shared, cols) = self.columns_or_err()?;
+        let slot = match shared.config.heads.get(column) {
+            Some(dims) => dims[0],
+            None => {
+                return Err(HeatherError::InvalidInput(format!(
+                    "{column:?} is not a predicted column (declare it in `predict`)"
+                )));
+            }
+        };
+        columns::check(cols, row, true)?;
+        let e = columns::encode(cols, &shared.config.heads, row);
+        let r = self.recall_masked(&e.numeric, column, &e.values, &e.missing)?;
+        Ok((r.result[slot], r.contributors))
+    }
+
+    /// How unusual each row is among the collection's rows, for a database
+    /// declared with columns: about 1 when a row sits the way its `k`
+    /// nearest rows do, higher when it stands out. Rows are compared on
+    /// every column but the predicted ones (outcomes, not features): numbers
+    /// on the common scale, each category as its learned code divided by
+    /// √dims (so a category weighs about as much as a number), vectors as
+    /// given. A query row needs each of those columns.
+    pub fn novelty_rows(
+        &self,
+        rows: &[crate::columns::Row],
+        k: usize,
+    ) -> Result<Vec<NoveltyResult>> {
+        use crate::columns;
+        let (shared, cols) = self.columns_or_err()?;
+        if k == 0 {
+            return Err(HeatherError::InvalidInput("k must be > 0".into()));
+        }
+        let heads = &shared.config.heads;
+        for r in rows {
+            columns::check(cols, r, true)?;
+            if let Some(c) = cols
+                .iter()
+                .find(|c| !heads.contains_key(&c.name) && !r.contains_key(&c.name))
+            {
+                return Err(HeatherError::InvalidInput(format!(
+                    "novelty compares every column but the predicted ones: {:?} is missing",
+                    c.name
+                )));
+            }
+        }
+        let d = shared.d;
+        let sym = shared.config.symbols.as_ref();
+        let dn = sym.map_or(d, |s| s.numeric(d));
+        let predicted: std::collections::BTreeSet<usize> =
+            heads.values().flatten().copied().collect();
+        let slots = shared.scaled_slots();
+        // Lock order: attention, then collection.
+        let state = shared
+            .state
+            .lock()
+            .map_err(|_| HeatherError::LockPoisoned)?;
+        let inner = self.read_inner()?;
+        let n = inner.locations.len();
+        if n < 2 {
+            return Err(HeatherError::InvalidInput(
+                "novelty needs at least 2 stored rows".into(),
+            ));
+        }
+        let k = k.min(n - 1);
+        let scale = sym.map_or(1.0, |s| 1.0 / (s.dims as f64).sqrt());
+        let view = |numeric: &[f64], codes: &mut dyn Iterator<Item = Vec<f64>>| -> Vec<f64> {
+            let mut num = numeric[..dn].to_vec();
+            columns::standardize_row(&slots, &state.scales, &mut num);
+            let mut out: Vec<f64> = num
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !predicted.contains(i))
+                .map(|(_, x)| x)
+                .collect();
+            for code in codes {
+                out.extend(code.into_iter().map(|x| x * scale));
+            }
+            out
+        };
+        let fresh = |c: &RowViewCache| {
+            c.version == inner.version
+                && c.generation == state.generation.0
+                && c.k == k
+                && c.ids.len() == n
+        };
+        let built = {
+            let slot = self
+                .row_view
+                .read()
+                .map_err(|_| HeatherError::LockPoisoned)?;
+            slot.as_ref().is_some_and(fresh)
+        };
+        if !built {
+            let (ids, stored) = ids_and_rows_by_id(&inner.locations);
+            let mut flat = Vec::new();
+            let mut width = 0;
+            for r in &stored {
+                let mut codes = r[dn..].iter().enumerate().map(|(f, &id)| {
+                    let s = sym.expect("symbol slots need symbols");
+                    state.symbols.code(s, f, id as u32).to_vec()
+                });
+                let v = view(r, &mut codes);
+                width = v.len();
+                flat.extend(v);
+            }
+            let knn = crate::novelty::knn_all(&flat, n, width, k);
+            let hood = crate::novelty::Neighbourhood::from_knn(&knn, k);
+            *self
+                .row_view
+                .write()
+                .map_err(|_| HeatherError::LockPoisoned)? = Some(RowViewCache {
+                version: inner.version,
+                generation: state.generation.0,
+                k,
+                width,
+                flat,
+                ids,
+                hood,
+            });
+        }
+        let slot = self
+            .row_view
+            .read()
+            .map_err(|_| HeatherError::LockPoisoned)?;
+        let c = slot.as_ref().expect("just built");
+        let refs: Vec<&[f64]> = c.flat.chunks(c.width.max(1)).collect();
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let e = columns::encode(cols, heads, row);
+                let mut codes = sym.into_iter().flat_map(|s| {
+                    s.fields.iter().enumerate().map(|(f, name)| {
+                        let v = &e.values[name];
+                        match state.symbols.fields[f].ids.get(v) {
+                            Some(&id) => state.symbols.code(s, f, id).to_vec(),
+                            None => crate::symbols::initial_code(name, v, s.dims),
+                        }
+                    })
+                });
+                let q = view(&e.numeric, &mut codes);
+                let (novelty, nb) = c.hood.novelty(&q, &refs);
+                NoveltyResult {
+                    novelty,
+                    nearest: nb.into_iter().map(|(i, dist)| (c.ids[i], dist)).collect(),
+                }
+            })
+            .collect())
+    }
+
+    fn write_batch_with(
+        &self,
+        inputs: &[impl AsRef<[f64]>],
+        mut att: AttentionTxn<'_>,
+    ) -> Result<()> {
         let mut inner = self.atomic_mutation()?;
         let before = (inner.version, inner.locations.len());
 
@@ -2444,6 +3007,7 @@ impl Collection {
             vec_ops::validate_vector(input.as_ref())?;
         }
 
+        self.refuse_raw_symbol_rows()?;
         let mut att = self.attention_begin()?;
         let mut inner = self.atomic_mutation()?;
         let before = (inner.version, inner.locations.len());
