@@ -43,7 +43,10 @@ Auth: Basic or Bearer, **root scope**.
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `name` | string | *required* | 1–63 chars, `[a-z][a-z0-9_-]*`. Must not start with `_` |
-| `dimension` | integer | *required* | Immutable for the life of the database |
+| `dimension` | integer | — | Row width for a database written as vectors. Immutable for the life of the database. Give `dimension` or `columns`, not both |
+| `columns` | object | — | Instead of `dimension`: column name → `"category"`, `"number"` or `{"vector": N}`. HeatherDB works out the layout, plain storage and selective attention. See [Describe your data with columns](../how-to/describe-your-data-with-columns.md) |
+| `predict` | array of strings | `[]` | With `columns`: number columns the database learns to fill in ([predict](reads.md#post-dbdbcollectionsnamepredict)) |
+| `sequence` | boolean | `false` | With `columns`: each collection is a history in order, and the database learns what comes next ([next](reads.md#get-dbdbcollectionsnamenext)). `columns` needs `predict`, `sequence` or both |
 | `map_size_mb` | integer | `4096` | LMDB ceiling for this database's env |
 | `mdl_gate` | boolean | `false` | Allocate by description length instead of `tau_split`/`tau_overload` |
 | `eam` | object | — | Partial `EAMConfig` override: `k`, `t_max`, `beta`, `neighbor_cap`, `num_landmarks`, `l_0`, `competitive`, `precision`, `residency`. Unset fields keep the engine default; the merged config is validated. `"competitive": false` makes every collection a plain store: writes append each vector as its own location with no activation, merge or migration, use it to retain individual observations, including similarity-based associative recall through attention. Competitive mode learns shared patterns and can adapt through graceful forgetting. See [Choose a memory mode](../how-to/choose-memory-mode.md). `"precision": "f32"` stores vectors in half the space (rounded to f32 when written; all math stays f64). Both are fixed for the database's lifetime, and `GET /db` / `GET /db/{db}` report them. `"residency"` is `"auto"` by default: plain databases without selective attention run in `"shadow"` residency, keeping an int8 shadow of each vector in memory and reading exact vectors from storage when an answer needs them (answers are identical, memory is several times smaller); other databases run in `"memory"`. Set `"memory"` to keep a plain database's vectors in RAM. Responses report the resolved residency. See [Configuration](../reference/configuration.md#eam-knobs). `"selective_attention"` turns on attention learned from prediction error (plain databases only); see [GET /db/{db}/selective-attention](#get-dbdbselective-attention) and [Selective attention](../explanation/selective-attention.md) |
@@ -53,6 +56,15 @@ curl -u admin:pw -X POST http://localhost:6380/db \
   -H 'Content-Type: application/json' \
   -d '{"name":"movies","dimension":384,"map_size_mb":32768,
        "eam":{"k":64,"t_max":8}}'
+```
+
+Or by columns:
+
+```bash
+curl -u admin:pw -X POST http://localhost:6380/db \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"access","columns":{"role":"category","amount":"number","granted":"number"},
+       "predict":["granted"]}'
 ```
 
 Responds with the same shape as [`GET /db/{db}`](#get-dbdb):
@@ -65,7 +77,7 @@ Responds with the same shape as [`GET /db/{db}`](#get-dbdb):
 
 | Status | Cause |
 |---|---|
-| `400 Bad Request` | invalid name, or the merged EAM config failed validation |
+| `400 Bad Request` | invalid name, the merged EAM config failed validation, both or neither of `dimension` and `columns`, `columns` with nothing to learn, or `predict` naming a column that is not a number |
 | `403 Forbidden` | the caller is scoped to a database |
 | `409 Conflict` | a database of that name already exists |
 | `500 Internal Server Error` | the database was created but its config could not be read back |

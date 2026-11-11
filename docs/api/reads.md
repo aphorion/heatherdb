@@ -226,6 +226,7 @@ with `selective_attention` naming the head. Legacy:
 | `query` | array | *required*. Values in the head's own fields are ignored |
 | `head` | string | *required*. A head named at database creation |
 | `contributors` | integer | `10`. How many contributing rows to list |
+| `symbols` | object | `{}`. For a database with symbol fields: the values to compare by; `query` is then the numeric part, and a field left out takes no part. The result is the numeric part |
 
 The stored rows are scored by attention-weighted squared distance over the
 fields the head does not fill in, `Σ_d α_d (q_d − x_d)²`, with the head's
@@ -253,6 +254,38 @@ to 1.
 | `400 Bad Request` | the database has no selective attention, the head is unknown, or a dimension mismatch |
 | `404 Not Found` | no such collection |
 
+### POST /db/{db}/collections/{name}/predict
+
+Fill in a predicted column for a row given by name, on a database created
+with [`columns`](databases.md#post-db) and `predict`. Legacy:
+`POST /collections/{name}/predict`. Audited.
+
+| Field | Type | Default |
+|---|---|---|
+| `row` | object | *required*. The values you know. A column you leave out takes no part |
+| `column` | string | *required*. A column named in `predict` |
+| `contributors` | integer | `10`. How many contributing rows to list |
+
+```bash
+curl -u admin:pw -X POST \
+  http://localhost:6380/db/access/collections/requests/predict \
+  -H 'Content-Type: application/json' \
+  -d '{"row":{"role":"R-117","resource":"r-4471"},"column":"granted"}'
+```
+
+```json
+{ "predicted": { "granted": 0.83 },
+  "contributors": [ { "id": 812, "distance": 0.04, "weight": 0.11 } ] }
+```
+
+The value is in the column's own units. It is [recall](#post-dbdbcollectionsnamerecall)
+with the column's head, from a row instead of a vector.
+
+| Status | Cause |
+|---|---|
+| `400 Bad Request` | the database was not declared with columns, `column` is not in `predict`, an unknown column, or a value of the wrong type |
+| `404 Not Found` | no such collection |
+
 ### GET /db/{db}/collections/{name}/next
 
 The time-attended read of a collection's history: its rows weighted by the
@@ -268,7 +301,23 @@ curl -u admin:pw http://localhost:6380/db/movies/collections/user_42/next
 { "result": [0.02, -0.11, 0.07] }
 ```
 
-`{"result": null}` for an empty collection.
+`{"result": null}` for an empty collection, or when rows have no numeric
+part.
+
+On a database with [symbol fields](../how-to/encode-identities-as-symbols.md),
+`?field=<name>` also ranks that field's most likely next values from the
+collection's history, scored against each value's learned code:
+
+| Parameter | Default |
+|---|---|
+| `field` | none. A symbol field to rank. `column` is the same parameter, for a database declared with columns |
+| `n` | `10`. Values returned |
+| `exclude_seen` | `true`. Leave out values already in the history |
+
+```json
+{ "result": null,
+  "values": [ { "value": "2028", "score": 4.1 }, { "value": "1221", "score": 3.8 } ] }
+```
 
 | Status | Cause |
 |---|---|
@@ -287,7 +336,8 @@ normal moved?". Legacy: `POST /collections/{name}/novelty`. Audited when
 
 | Field | Type | Default |
 |---|---|---|
-| `queries` | array of arrays | *required*, non-empty, at most `--max-batch-queries` |
+| `queries` | array of arrays | Vectors, for a database written as vectors. At most `--max-batch-queries` |
+| `rows` | array of objects | Instead of `queries`, for a database declared with [columns](../how-to/describe-your-data-with-columns.md): rows by name, each giving every column but the predicted ones. Send `queries` or `rows`, not both |
 | `k` | integer | `50`. Neighbours compared |
 | `nearest` | integer | `0`. How many nearest stored rows to return per query |
 
@@ -298,6 +348,21 @@ rows divided by its own, where familiarity is the inverse mean distance to
 those neighbours, each distance floored at the neighbour's spread.
 Distances are Euclidean over the stored rows, so store standardised
 features.
+
+On a database declared with columns, send `rows`; `queries` is refused, since
+a stored row's category slots hold ids, not features. Rows are compared on
+every column but the predicted ones: numbers on the database's common scale,
+each category as its learned code divided by √dims (so a category weighs
+about as much as a number), vectors as given. The neighbourhood is built by
+an exact all-pairs search on the first call and kept until the next write to
+the database, since a write can move codes and scales.
+
+```bash
+curl -u admin:pw -X POST \
+  http://localhost:6380/db/payments/collections/txns/novelty \
+  -H 'Content-Type: application/json' \
+  -d '{"rows":[{"merchant":"4471","country":"KE","amount":4200}],"k":50}'
+```
 
 Neighbours are found by the exact int8 scan (`Euclidean` metric), which
 reads only a few dozen candidate rows back from storage in shadow

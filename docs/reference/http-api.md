@@ -18,8 +18,8 @@ endpoint that documents it.
 | [Auth](../api/auth.md) | session tokens |
 | [Databases](../api/databases.md) | `/db` management |
 | [Collections](../api/collections.md) | create, list, drop, stats, config, locations, compress, fingerprint |
-| [Writes](../api/writes.md) | `write`, `bulk_load` |
-| [Reads](../api/reads.md) | `read`, `attention`, `analyze` |
+| [Writes](../api/writes.md) | `rows`, `write`, `bulk_load` |
+| [Reads](../api/reads.md) | `read`, `attention`, `analyze`, `recall`, `predict`, `next`, `novelty` |
 | [Documents](../api/documents.md) | document storage and similarity search |
 | [Algebra](../api/algebra.md) | algebra over collections, `compose/read` |
 | [Vectors](../api/vectors.md) | stateless `/vec/*` math |
@@ -94,6 +94,7 @@ Source of truth: `heather_server/src/main.rs`.
 |---|---|
 | [POST /db/{db}/collections/{name}/write](../api/writes.md#post-dbdbcollectionsnamewrite) | [POST /collections/{name}/write](../api/writes.md#post-dbdbcollectionsnamewrite) |
 | [POST /db/{db}/collections/{name}/bulk_load](../api/writes.md#post-dbdbcollectionsnamebulkload) | [POST /collections/{name}/bulk_load](../api/writes.md#post-dbdbcollectionsnamebulkload) |
+| [POST /db/{db}/collections/{name}/rows](../api/writes.md#post-dbdbcollectionsnamerows) | [POST /collections/{name}/rows](../api/writes.md#post-dbdbcollectionsnamerows) |
 
 ### Reads
 
@@ -106,6 +107,7 @@ Source of truth: `heather_server/src/main.rs`.
 | [POST /db/{db}/collections/{name}/analyze](../api/reads.md#post-dbdbcollectionsnameanalyze) | [POST /collections/{name}/analyze](../api/reads.md#post-dbdbcollectionsnameanalyze) |
 | [POST /db/{db}/collections/{name}/batch_analyze](../api/reads.md#post-dbdbcollectionsnamebatchanalyze) | [POST /collections/{name}/batch_analyze](../api/reads.md#post-dbdbcollectionsnamebatchanalyze) |
 | [POST /db/{db}/collections/{name}/recall](../api/reads.md#post-dbdbcollectionsnamerecall) | [POST /collections/{name}/recall](../api/reads.md#post-dbdbcollectionsnamerecall) |
+| [POST /db/{db}/collections/{name}/predict](../api/reads.md#post-dbdbcollectionsnamepredict) | [POST /collections/{name}/predict](../api/reads.md#post-dbdbcollectionsnamepredict) |
 | [GET /db/{db}/collections/{name}/next](../api/reads.md#get-dbdbcollectionsnamenext) | [GET /collections/{name}/next](../api/reads.md#get-dbdbcollectionsnamenext) |
 | [POST /db/{db}/collections/{name}/novelty](../api/reads.md#post-dbdbcollectionsnamenovelty) | [POST /collections/{name}/novelty](../api/reads.md#post-dbdbcollectionsnamenovelty) |
 

@@ -21,6 +21,32 @@ is written. You still supply an item encoder and you still own the catalogue.
 | Answer resolves to | the catalogue, ranked against the fingerprint | the catalogue stays application-side |
 | Abstain when | the fingerprint is `null`, or history is too thin | a taste vector from two items is not a taste |
 
+## Or let the database learn the items
+
+Instead of encoding items yourself, declare `item` as a category and the
+database as a sequence, write each user's history as rows (one collection per
+user, oldest first), and ask for what comes next:
+
+```bash
+curl -u admin:pw -X POST http://localhost:6380/db \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"movies","columns":{"item":"category"},"sequence":true}'
+
+curl -u admin:pw -X POST \
+  http://localhost:6380/db/movies/collections/user_42/rows \
+  -H 'Content-Type: application/json' \
+  -d '{"rows":[{"item":"1193"},{"item":"661"}]}'
+
+curl -u admin:pw \
+  'http://localhost:6380/db/movies/collections/user_42/next?column=item&n=10'
+```
+
+The database learns item codes and recency from the order of writes. On
+MovieLens 1M it reached NDCG@10 0.066 against 0.062 for ALS with
+time-decayed confidence, in one online pass (`benchmarks/h2h`). See
+[Describe your data with columns](describe-your-data-with-columns.md). The
+rest of this guide is the hand-encoded route.
+
 ## Encode an item
 
 An item is a row of attributes: a set column (genres), an identity column
