@@ -70,6 +70,9 @@ every input, including inputs the store has nothing to say about. The iteration
 did not fail to detect anything; it converged, which is what it is for. The
 number it leaves behind is a statement about convergence, not about the query.
 
+A [`read`](../api/reads.md#diagnostics) with `"diagnostics": true` returns
+these first-contact signals next to its result, whatever its strategy.
+
 <!--figure:memory-->
 
 ## The counter-property

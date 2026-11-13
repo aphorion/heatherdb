@@ -516,6 +516,28 @@ pub fn hopfield_iter(
     Ok(xi)
 }
 
+/// Normalised Shannon entropy of an attention weight distribution:
+/// `-Σ w·ln w / ln n`, which is 1 for the uniform distribution over `n`
+/// contributors and 0 when one of them takes everything. Zero for fewer
+/// than two contributors, where there is no spread to measure.
+///
+/// This is a *reported* scalar, not a decision. Attention entropy is a weak
+/// abstention signal on its own (a study measured AUC 0.61–0.76, against
+/// 0.997 for the top-1 match margin), so endpoints hand back the number and
+/// leave the threshold — if any — to the caller.
+pub fn normalized_entropy(weights: &[f64]) -> f64 {
+    let n = weights.len();
+    if n < 2 {
+        return 0.0;
+    }
+    let h: f64 = -weights
+        .iter()
+        .filter(|&&w| w > 0.0)
+        .map(|&w| w * w.ln())
+        .sum::<f64>();
+    h / (n as f64).ln()
+}
+
 /// Traced activation info for a single location.
 #[derive(Debug, Clone)]
 pub struct ActivatedLocation {

@@ -153,6 +153,10 @@ pub struct ReadRequest {
     pub query: Vec<f64>,
     /// "iterative" (default) or "fast"
     pub strategy: Option<String>,
+    /// Add first-step confidence signals to the response. Off by default;
+    /// when off the response is unchanged.
+    #[serde(default)]
+    pub diagnostics: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -237,6 +241,31 @@ pub struct WriteResponse {
 #[derive(Debug, Serialize)]
 pub struct ReadResponse {
     pub result: Vec<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<ReadDiagnosticsItem>,
+}
+
+/// Per-read confidence signals, measured on a single `fast` step on the
+/// query whatever the read's own strategy. See `Collection::read_diagnostics`.
+#[derive(Debug, Serialize)]
+pub struct ReadDiagnosticsItem {
+    pub top_weight: f64,
+    pub margin: f64,
+    pub entropy: f64,
+    pub support: f64,
+    pub fidelity: f64,
+}
+
+impl From<heather_db::ReadDiagnostics> for ReadDiagnosticsItem {
+    fn from(d: heather_db::ReadDiagnostics) -> Self {
+        Self {
+            top_weight: d.top_weight,
+            margin: d.margin,
+            entropy: d.entropy,
+            support: d.support,
+            fidelity: d.fidelity,
+        }
+    }
 }
 
 #[derive(Debug, Serialize)]
@@ -246,6 +275,16 @@ pub struct StatsResponse {
     pub current_eta: f64,
     pub avg_write_count: f64,
     pub max_write_count: f64,
+    /// Items one location holds before reads blur (`tau_overload`,
+    /// default `max(d/32, 8)`).
+    pub capacity: f64,
+    /// Locations per `write_count / capacity` bucket: ten 10% buckets, then
+    /// one for locations at or past capacity.
+    pub occupancy_histogram: Vec<usize>,
+    /// Locations at or above 90% of capacity (includes those at capacity).
+    pub locations_near_capacity: usize,
+    /// Locations at or above capacity.
+    pub locations_at_capacity: usize,
 }
 
 #[derive(Debug, Serialize)]

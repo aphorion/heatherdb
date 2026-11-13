@@ -24,6 +24,7 @@ Reconstruct a pattern associated with the query. Legacy:
 |---|---|---|
 | `query` | array | *required* |
 | `strategy` | `"iterative"` \| `"fast"` | `"iterative"` |
+| `diagnostics` | bool | `false` |
 
 `iterative` runs the Hopfield loop to convergence (up to `t_max`); `fast` is a
 single step.
@@ -49,6 +50,53 @@ curl -u admin:pw -X POST \
 ```json
 { "result": [0.1, 0.3, 0.5, 0.2] }
 ```
+
+#### Diagnostics
+
+With `"diagnostics": true` the response gains a `diagnostics` object saying
+how far the result can be trusted. Without it, or with `false`, the response is
+exactly `{ "result": [...] }` as above.
+
+```bash
+curl -u admin:pw -X POST \
+  http://localhost:6380/db/movies/collections/taste/read \
+  -H 'Content-Type: application/json' \
+  -d '{"query":[0.1,0.2,0.3],"diagnostics":true}'
+```
+
+```json
+{ "result": [0.1, 0.3, 0.5, 0.2],
+  "diagnostics": { "top_weight": 0.84, "margin": 0.82, "entropy": 0.29,
+                   "support": 3.0, "fidelity": 0.998 } }
+```
+
+| Field | Meaning |
+|---|---|
+| `top_weight` | Largest activation weight. |
+| `margin` | Largest weight minus the second largest. |
+| `entropy` | Normalised entropy of the weights: 0 when one location takes everything, 1 when they are uniform. Same measure as [`attention/mdl`](#post-dbdbcollectionsnameattentionmdl), over these weights. |
+| `support` | `write_count` of the location with the largest weight: how many writes it holds. Always `1` in plain mode (`"competitive": false`), which never merges. Compare it with `capacity` from [`stats`](collections.md#get-dbdbcollectionsnamestats). |
+| `fidelity` | Cosine between the query and the `fast` result. |
+
+All five come from **one `fast` step on the query, whatever `strategy` the
+read itself uses**, the same numbers as
+[`analyze`](#post-dbdbcollectionsnameanalyze) with `"strategy": "fast"`. An
+iterative read always converges onto *some* stored pattern, so its final
+weights look the same for queries the collection knows and queries it has
+never seen. The first step still reflects the query. In a test with 60 stored
+random vectors (`d = 256`), stored queries scored `top_weight` 0.83–0.86 and
+`fidelity` 0.999. Never-stored queries scored 0.06–0.12 and 0.21–0.42. Overfilled
+competitive collections (5× capacity per cluster) scored `top_weight` ≤ 0.12,
+`entropy` ≥ 0.75 and `fidelity` ≤ 0.80.
+
+The endpoint reports numbers and makes no decision. Where they separate
+depends on the data and on how full the collection is, so derive any
+threshold from your own data at your collection's load. See
+[Abstention](../explanation/abstention.md).
+
+The diagnostics are computed after the read, under a separate lock. A write
+landing in between can make them describe a slightly newer state than
+`result`.
 
 | Status | Cause |
 |---|---|
