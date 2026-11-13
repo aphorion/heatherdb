@@ -86,11 +86,29 @@ curl -u admin:pw \
 
 ```json
 { "num_locations": 812, "total_writes": 10450.0, "current_eta": 0.0031,
-  "avg_write_count": 12.87, "max_write_count": 96.0 }
+  "avg_write_count": 12.87, "max_write_count": 96.0,
+  "capacity": 8.0,
+  "occupancy_histogram": [3, 41, 88, 102, 97, 110, 95, 80, 61, 44, 91],
+  "locations_near_capacity": 135, "locations_at_capacity": 91 }
 ```
 
 `num_locations` is a diagnostic of data complexity, not a tunable.
 `current_eta` is the decayed learning rate.
+
+The last four fields show how full the locations are. A location's reads
+start to blur once it holds more items than `capacity`.
+
+| Field | Meaning |
+|---|---|
+| `capacity` | Items per location: the collection's `tau_overload`, default `max(d/32, 8)`. |
+| `occupancy_histogram` | Locations per `write_count / capacity` bucket. The first ten buckets are 10% wide (`[0,10%)` … `[90,100%)`), and the last holds every location at or past capacity. |
+| `locations_near_capacity` | Locations at 90% of capacity or more, including those at capacity. |
+| `locations_at_capacity` | Locations at capacity or more. |
+
+The histogram lets you choose your own threshold. Merges add write counts
+together, so a location can sit well past capacity. Plain-mode collections
+(`"competitive": false`) store one item per location, so they stay in the
+lowest buckets.
 
 | Status | Cause |
 |---|---|

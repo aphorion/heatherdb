@@ -126,6 +126,10 @@ consequence of the stored geometry rather than a free parameter.
 | A schema loses slots as it grows | quadratic schema law | fewer slots per record, or raise `D` |
 | Small pools sharp, large pools mushy | `β` fixed against growing `N` | `attention/mdl` or calibrate |
 
+[`stats`](../api/collections.md#get-dbdbcollectionsnamestats) reports how many
+locations are near or past capacity. A [`read`](../api/reads.md#diagnostics)
+with `"diagnostics": true` reports whether a given answer is a blend.
+
 ## Related
 
 - [How the memory works](associative-memory.md) — `tau_overload`, splitting and

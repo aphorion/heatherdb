@@ -53,8 +53,9 @@ pub mod write;
 
 pub use audit::{AuditConfig, AuditLog, AuditQuery, AuditRecord, AuditVisibility, query_hash};
 pub use collection::{
-    Collection, CompressResult, EAMStats, LocationSummary, MIN_CLEANUP_BETA, MultiRoleHit,
-    MultiRoleResults, ReadStrategy, RoleCleanup,
+    CapacityStats, Collection, CompressResult, EAMStats, LocationSummary, MIN_CLEANUP_BETA,
+    MultiRoleHit, MultiRoleResults, NEAR_CAPACITY_FRACTION, OCCUPANCY_BUCKETS, ReadDiagnostics,
+    ReadStrategy, RoleCleanup,
 };
 pub use config::{EAMConfig, Precision};
 pub use db_config::{

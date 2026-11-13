@@ -546,7 +546,20 @@ pub async fn read(
 
     let dims = req.query.len();
     let qinfo = AuditQueryInfo::of(&hive, &req.query);
-    let result = tokio::task::spawn_blocking(move || col.read(&req.query, strategy)).await;
+    let want_diagnostics = req.diagnostics;
+    // The read itself, then (opt-in) the first-step diagnostics. They take
+    // separate read locks, so a write landing in between can make the
+    // diagnostics describe a slightly newer state than `result`.
+    let result = tokio::task::spawn_blocking(move || {
+        let vec = col.read(&req.query, strategy)?;
+        let diagnostics = if want_diagnostics {
+            Some(col.read_diagnostics(&req.query)?)
+        } else {
+            None
+        };
+        Ok::<_, heather_db::HeatherError>((vec, diagnostics))
+    })
+    .await;
 
     let (status, ids) = match &result {
         Ok(Ok(_)) => (StatusCode::OK, AuditIds::count(1)),
@@ -556,9 +569,13 @@ pub async fn read(
     audit_read(&hive, &ctx, &name, "read", status, ids, qinfo);
 
     match result {
-        Ok(Ok(vec)) => {
+        Ok(Ok((vec, diagnostics))) => {
             tracing::info!(collection = %name, strategy = strategy_name, dims, "Read completed");
-            Json(ReadResponse { result: vec }).into_response()
+            Json(ReadResponse {
+                result: vec,
+                diagnostics: diagnostics.map(Into::into),
+            })
+            .into_response()
         }
         Ok(Err(e)) => {
             tracing::warn!(error = %e, collection = %name, strategy = strategy_name, "Read failed");
@@ -615,28 +632,6 @@ pub async fn attention(
     }
 }
 
-/// Normalised Shannon entropy of an attention weight distribution:
-/// `-Σ w·ln w / ln n`, which is 1 for the uniform distribution over `n`
-/// contributors and 0 when one of them takes everything. Zero for fewer
-/// than two contributors, where there is no spread to measure.
-///
-/// This is a *reported* scalar, not a decision. Attention entropy is a weak
-/// abstention signal on its own (a study measured AUC 0.61–0.76, against
-/// 0.997 for the top-1 match margin), so the endpoint hands back the number
-/// and leaves the threshold — if any — to the caller.
-fn normalized_entropy(weights: &[f64]) -> f64 {
-    let n = weights.len();
-    if n < 2 {
-        return 0.0;
-    }
-    let h: f64 = -weights
-        .iter()
-        .filter(|&&w| w > 0.0)
-        .map(|&w| w * w.ln())
-        .sum::<f64>();
-    h / (n as f64).ln()
-}
-
 /// `POST /collections/{name}/attention/mdl` — the self-calibrating attention
 /// read. Same read as `attention`, except β is not supplied: it is selected
 /// per query by minimising the description length of the activated key set,
@@ -659,7 +654,7 @@ pub async fn attention_mdl(
             Json(AttentionMdlResponse {
                 result: trace.result,
                 beta,
-                entropy: normalized_entropy(&weights),
+                entropy: heather_db::read::normalized_entropy(&weights),
                 contributors: trace
                     .contributors
                     .into_iter()
@@ -716,13 +711,17 @@ pub async fn stats(State(hive): State<AppState>, Path(name): Path<String>) -> Re
         }
     };
 
-    match col.stats() {
-        Ok(s) => Json(StatsResponse {
+    match col.stats().and_then(|s| Ok((s, col.capacity_stats()?))) {
+        Ok((s, c)) => Json(StatsResponse {
             num_locations: s.num_locations,
             total_writes: s.total_writes,
             current_eta: s.current_eta,
             avg_write_count: s.avg_write_count,
             max_write_count: s.max_write_count,
+            capacity: c.capacity,
+            occupancy_histogram: c.occupancy_histogram,
+            locations_near_capacity: c.locations_near_capacity,
+            locations_at_capacity: c.locations_at_capacity,
         })
         .into_response(),
         Err(e) => {
@@ -2083,5 +2082,156 @@ mod binary_vector_tests {
                 .iter()
                 .any(|f| f == "vectors_b64")
         );
+    }
+}
+
+#[cfg(test)]
+mod read_diagnostics_tests {
+    use super::*;
+    use heather_db::EAMConfig;
+
+    fn ctx() -> AuditCtx {
+        AuditCtx {
+            user: "alice".into(),
+            scope: "root".into(),
+            db: "default".into(),
+        }
+    }
+
+    async fn body(resp: Response) -> (StatusCode, Vec<u8>) {
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (status, bytes.to_vec())
+    }
+
+    fn seeded(competitive: bool) -> (tempfile::TempDir, AppState) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = EAMConfig::new(8).unwrap();
+        config.competitive = competitive;
+        let hive = Arc::new(Hive::open(dir.path(), config, 16).unwrap());
+        let col = hive.get_or_create_collection("c").unwrap();
+        for i in 0..4 {
+            let mut v = vec![0.0; 8];
+            v[i] = 1.0;
+            col.write(&v).unwrap();
+        }
+        (dir, hive)
+    }
+
+    async fn post_read(hive: &AppState, req: serde_json::Value) -> (StatusCode, Vec<u8>) {
+        body(
+            read(
+                State(hive.clone()),
+                Path("c".into()),
+                ctx(),
+                Json(serde_json::from_value(req).unwrap()),
+            )
+            .await,
+        )
+        .await
+    }
+
+    /// Without `diagnostics`, or with it false, `/read` returns exactly the
+    /// bytes it returned before the field existed: `{"result":[…]}`.
+    #[tokio::test]
+    async fn diagnostics_off_leaves_the_response_unchanged() {
+        for competitive in [true, false] {
+            let (_dir, hive) = seeded(competitive);
+            let query = [1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            for strategy in ["iterative", "fast"] {
+                let expected = hive
+                    .get_collection("c")
+                    .unwrap()
+                    .unwrap()
+                    .read(
+                        &query,
+                        if strategy == "fast" {
+                            ReadStrategy::HopfieldSS
+                        } else {
+                            ReadStrategy::HopfieldIter
+                        },
+                    )
+                    .unwrap();
+                let expected =
+                    serde_json::to_vec(&serde_json::json!({ "result": expected })).unwrap();
+                for req in [
+                    serde_json::json!({ "query": query, "strategy": strategy }),
+                    serde_json::json!({ "query": query, "strategy": strategy, "diagnostics": false }),
+                ] {
+                    let (status, bytes) = post_read(&hive, req).await;
+                    assert_eq!(status, StatusCode::OK);
+                    assert_eq!(bytes, expected);
+                }
+            }
+        }
+    }
+
+    /// With `diagnostics: true` the result is the same and one object is
+    /// added, measured on the first `fast` step whatever the strategy.
+    #[tokio::test]
+    async fn diagnostics_on_adds_first_step_signals() {
+        for competitive in [true, false] {
+            let (_dir, hive) = seeded(competitive);
+            let query = [1.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let mut seen = Vec::new();
+            for strategy in ["iterative", "fast"] {
+                let (_, plain) = post_read(
+                    &hive,
+                    serde_json::json!({ "query": query, "strategy": strategy }),
+                )
+                .await;
+                let (status, bytes) = post_read(
+                    &hive,
+                    serde_json::json!({ "query": query, "strategy": strategy, "diagnostics": true }),
+                )
+                .await;
+                assert_eq!(status, StatusCode::OK);
+                let with: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                let without: serde_json::Value = serde_json::from_slice(&plain).unwrap();
+                assert_eq!(with["result"], without["result"]);
+                assert_eq!(with.as_object().unwrap().len(), 2);
+                let d = &with["diagnostics"];
+                let mut keys: Vec<_> = d.as_object().unwrap().keys().cloned().collect();
+                keys.sort();
+                assert_eq!(
+                    keys,
+                    ["entropy", "fidelity", "margin", "support", "top_weight"]
+                );
+                assert!(d["top_weight"].as_f64().unwrap() > 0.5);
+                assert_eq!(d["support"].as_f64().unwrap(), 1.0);
+                seen.push(d.clone());
+            }
+            // Independent of the read's own strategy.
+            assert_eq!(seen[0], seen[1]);
+        }
+    }
+
+    #[tokio::test]
+    async fn stats_reports_capacity() {
+        let (_dir, hive) = seeded(true);
+        let (status, bytes) = body(stats(State(hive.clone()), Path("c".into())).await).await;
+        assert_eq!(status, StatusCode::OK);
+        let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v["capacity"], 8.0); // max(8/32, 8)
+        let hist: Vec<u64> = serde_json::from_value(v["occupancy_histogram"].clone()).unwrap();
+        assert_eq!(hist.len(), heather_db::OCCUPANCY_BUCKETS);
+        assert_eq!(
+            hist.iter().sum::<u64>(),
+            v["num_locations"].as_u64().unwrap()
+        );
+        assert_eq!(v["locations_near_capacity"], 0);
+        assert_eq!(v["locations_at_capacity"], 0);
+        // The fields that were already there are unchanged.
+        for k in [
+            "num_locations",
+            "total_writes",
+            "current_eta",
+            "avg_write_count",
+            "max_write_count",
+        ] {
+            assert!(v.get(k).is_some(), "{k}");
+        }
     }
 }

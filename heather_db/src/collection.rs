@@ -216,6 +216,48 @@ pub struct EAMStats {
     pub max_write_count: f64,
 }
 
+/// Per-read confidence signals from a single `fast` step on the query.
+/// See [`Collection::read_diagnostics`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ReadDiagnostics {
+    /// Largest first-step activation weight.
+    pub top_weight: f64,
+    /// Largest weight minus the second largest (`top_weight` when only one
+    /// location is activated).
+    pub margin: f64,
+    /// Normalised entropy of the weights, 0 (one location takes everything)
+    /// to 1 (uniform). See [`read::normalized_entropy`].
+    pub entropy: f64,
+    /// `write_count` of the dominant location: how many writes it holds.
+    /// Always 1 in plain (`competitive: false`) mode, which never merges.
+    pub support: f64,
+    /// Cosine between the query and the `fast` result.
+    pub fidelity: f64,
+}
+
+/// Occupancy buckets reported by [`Collection::capacity_stats`]: ten 10%
+/// buckets below capacity plus one for locations at or past it.
+pub const OCCUPANCY_BUCKETS: usize = 11;
+
+/// Fraction of capacity at which a location counts as "near" capacity.
+pub const NEAR_CAPACITY_FRACTION: f64 = 0.9;
+
+/// How full a collection's locations are. See [`Collection::capacity_stats`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct CapacityStats {
+    /// Items one location holds before reads blur: the collection's
+    /// `tau_overload`, default `max(d/32, 8)`.
+    pub capacity: f64,
+    /// Count of locations per `write_count / capacity` bucket:
+    /// `[0,10%), [10,20%), … [90,100%), [100%,∞)`.
+    pub occupancy_histogram: Vec<usize>,
+    /// Locations with `write_count >= NEAR_CAPACITY_FRACTION · capacity`
+    /// (includes those at capacity).
+    pub locations_near_capacity: usize,
+    /// Locations with `write_count >= capacity`.
+    pub locations_at_capacity: usize,
+}
+
 /// Outcome of a description-length-minimising compression pass.
 #[derive(Debug, Clone)]
 pub struct CompressResult {
@@ -2617,7 +2659,79 @@ impl Collection {
     pub fn analyze_read(&self, query: &[f64], strategy: ReadStrategy) -> Result<ReadTrace> {
         vec_ops::validate_vector(query)?;
         let inner = self.read_inner()?;
+        Self::analyze_read_locked(&inner, query, strategy)
+    }
 
+    /// Confidence signals for `query`, measured on a single `fast` step
+    /// whatever strategy the caller reads with. Iterated weights converge
+    /// onto *some* stored pattern even for queries the collection never saw,
+    /// so they cannot tell known from unknown; first-step weights still
+    /// reflect the query (issue #104).
+    ///
+    /// Runs the same traced read as [`Self::analyze_read`] with
+    /// [`ReadStrategy::HopfieldSS`], and looks up the dominant location's
+    /// `write_count` under the same lock so a concurrent write cannot shift
+    /// location indices in between.
+    pub fn read_diagnostics(&self, query: &[f64]) -> Result<ReadDiagnostics> {
+        vec_ops::validate_vector(query)?;
+        let inner = self.read_inner()?;
+        let trace = Self::analyze_read_locked(&inner, query, ReadStrategy::HopfieldSS)?;
+
+        let mut weights: Vec<(usize, f64)> = trace
+            .activated_locations
+            .iter()
+            .map(|a| (a.id, a.weight))
+            .collect();
+        weights.sort_by(|a, b| b.1.total_cmp(&a.1));
+        // analyze_read_locked errors on an empty collection, so there is at
+        // least one activated location.
+        let (top_id, top_weight) = weights[0];
+        let second = weights.get(1).map_or(0.0, |w| w.1);
+        let just_weights: Vec<f64> = weights.iter().map(|w| w.1).collect();
+
+        Ok(ReadDiagnostics {
+            top_weight,
+            margin: top_weight - second,
+            entropy: read::normalized_entropy(&just_weights),
+            support: inner.locations[top_id].write_count,
+            fidelity: vec_ops::cosine_similarity(query, &trace.result),
+        })
+    }
+
+    /// Location occupancy against the per-location capacity
+    /// (`tau_overload`, default `max(d/32, 8)` items).
+    pub fn capacity_stats(&self) -> Result<CapacityStats> {
+        let inner = self.read_inner()?;
+        let capacity = inner.config.tau_overload;
+        let mut histogram = [0usize; OCCUPANCY_BUCKETS];
+        let mut near = 0;
+        let mut at = 0;
+        for loc in &inner.locations {
+            let wc = loc.write_count;
+            // Buckets of 10%; the last one collects everything at or past capacity.
+            let bucket =
+                ((wc * 10.0 / capacity).floor().max(0.0) as usize).min(OCCUPANCY_BUCKETS - 1);
+            histogram[bucket] += 1;
+            if wc >= NEAR_CAPACITY_FRACTION * capacity {
+                near += 1;
+            }
+            if wc >= capacity {
+                at += 1;
+            }
+        }
+        Ok(CapacityStats {
+            capacity,
+            occupancy_histogram: histogram.to_vec(),
+            locations_near_capacity: near,
+            locations_at_capacity: at,
+        })
+    }
+
+    fn analyze_read_locked(
+        inner: &EAMInner,
+        query: &[f64],
+        strategy: ReadStrategy,
+    ) -> Result<ReadTrace> {
         if query.len() != inner.config.d {
             return Err(HeatherError::DimensionMismatch {
                 expected: inner.config.d,
@@ -4769,5 +4883,253 @@ mod tests {
         q[0] = 1.0;
         let res = col.read(&q, ReadStrategy::HopfieldSS).unwrap();
         assert!(vec_ops::dot(&vec_ops::normalize(&res), &q) > 0.5);
+    }
+}
+
+#[cfg(test)]
+mod read_diagnostics_tests {
+    //! Per-read diagnostics and capacity stats (issue #104).
+    use super::*;
+    use crate::Hive;
+    use crate::config::Precision;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    const D: usize = 256; // capacity max(256/32, 8) = 8
+
+    fn config(competitive: bool, precision: Precision) -> EAMConfig {
+        let mut config = EAMConfig::new(D).unwrap();
+        config.competitive = competitive;
+        config.precision = precision;
+        config
+    }
+
+    /// Writes `items`, then closes and reopens the hive so the reads see
+    /// what was persisted (f32 rounding happens on the way to disk).
+    fn stored(
+        dir: &std::path::Path,
+        competitive: bool,
+        precision: Precision,
+        items: &[Vec<f64>],
+    ) -> (Hive, Arc<Collection>) {
+        {
+            let hive = Hive::open(dir, config(competitive, precision), 64).unwrap();
+            let col = hive.get_or_create_collection("diag").unwrap();
+            for v in items {
+                col.write(v).unwrap();
+            }
+        }
+        let hive = Hive::open(dir, config(competitive, precision), 64).unwrap();
+        let col = hive.get_collection("diag").unwrap().unwrap();
+        (hive, col)
+    }
+
+    fn unit(rng: &mut StdRng) -> Vec<f64> {
+        vec_ops::random_unit_vector(D, rng)
+    }
+
+    /// `base` mixed with fresh noise so the result has cosine ≈ `c` to `base`.
+    fn near(base: &[f64], c: f64, rng: &mut StdRng) -> Vec<f64> {
+        let noise = unit(rng);
+        let s = (1.0 - c * c).sqrt();
+        let v: Vec<f64> = base
+            .iter()
+            .zip(&noise)
+            .map(|(b, n)| c * b + s * n)
+            .collect();
+        vec_ops::normalize(&v)
+    }
+
+    fn diagnose(col: &Collection, queries: &[Vec<f64>]) -> Vec<ReadDiagnostics> {
+        queries
+            .iter()
+            .map(|q| col.read_diagnostics(q).unwrap())
+            .collect()
+    }
+
+    fn min(ds: &[ReadDiagnostics], f: fn(&ReadDiagnostics) -> f64) -> f64 {
+        ds.iter().map(f).fold(f64::INFINITY, f64::min)
+    }
+
+    fn max(ds: &[ReadDiagnostics], f: fn(&ReadDiagnostics) -> f64) -> f64 {
+        ds.iter().map(f).fold(f64::NEG_INFINITY, f64::max)
+    }
+
+    /// The maintainer's check from #104: 60 stored items, 30 stored queries
+    /// against 30 never-stored ones. First-step signals must not overlap.
+    #[test]
+    fn stored_and_never_stored_queries_separate() {
+        for precision in [Precision::F64, Precision::F32] {
+            for competitive in [true, false] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut rng = StdRng::seed_from_u64(104);
+                let items: Vec<Vec<f64>> = (0..60).map(|_| unit(&mut rng)).collect();
+                let novel: Vec<Vec<f64>> = (0..30).map(|_| unit(&mut rng)).collect();
+                let (_hive, col) = stored(dir.path(), competitive, precision, &items);
+
+                let known = diagnose(&col, &items[..30]);
+                let unknown = diagnose(&col, &novel);
+                let case = format!("{precision:?}, competitive={competitive}");
+
+                // Observed: stored 0.83–0.86, never-stored 0.06–0.12.
+                assert!(min(&known, |d| d.top_weight) > 0.7, "{case}");
+                assert!(max(&unknown, |d| d.top_weight) < 0.2, "{case}");
+                // Observed: stored 0.999, never-stored 0.21–0.42.
+                assert!(min(&known, |d| d.fidelity) > 0.95, "{case}");
+                assert!(max(&unknown, |d| d.fidelity) < 0.6, "{case}");
+                // Observed: stored 0.81–0.85, never-stored < 0.06.
+                assert!(min(&known, |d| d.margin) > 0.6, "{case}");
+                assert!(max(&unknown, |d| d.margin) < 0.2, "{case}");
+                // Observed: stored 0.27–0.32, never-stored 0.98–1.0.
+                assert!(max(&known, |d| d.entropy) < 0.5, "{case}");
+                assert!(min(&unknown, |d| d.entropy) > 0.9, "{case}");
+                // Unrelated random items never merge, so every location
+                // holds one write; in plain mode that holds by construction.
+                for d in known.iter().chain(&unknown) {
+                    assert_eq!(d.support, 1.0, "{case}");
+                    assert!((0.0..=1.0).contains(&d.entropy), "{case}");
+                }
+            }
+        }
+    }
+
+    /// Ten clusters, written either once each (within budget) or 40 times
+    /// each with noise (5× the per-location capacity of 8). Competitive
+    /// mode folds each cluster into blended, at-capacity locations; the
+    /// diagnostics must flag every overfilled read and none of the others.
+    #[test]
+    fn overfilled_reads_are_flagged() {
+        for precision in [Precision::F64, Precision::F32] {
+            let mut rng = StdRng::seed_from_u64(7);
+            let centroids: Vec<Vec<f64>> = (0..10).map(|_| unit(&mut rng)).collect();
+            let fill = |per_cluster: usize, rng: &mut StdRng| -> Vec<Vec<f64>> {
+                centroids
+                    .iter()
+                    .flat_map(|c| {
+                        (0..per_cluster)
+                            .map(|_| near(c, 0.75, rng))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect()
+            };
+            let sparse_items = fill(1, &mut rng);
+            let dense_items = fill(40, &mut rng);
+
+            let dir = tempfile::tempdir().unwrap();
+            let (_h1, sparse) = stored(dir.path(), true, precision, &sparse_items);
+            let dir2 = tempfile::tempdir().unwrap();
+            let (_h2, dense) = stored(dir2.path(), true, precision, &dense_items);
+
+            let sparse_stats = sparse.capacity_stats().unwrap();
+            let dense_stats = dense.capacity_stats().unwrap();
+            assert_eq!(sparse_stats.locations_near_capacity, 0);
+            assert!(dense_stats.locations_at_capacity > dense.num_locations().unwrap() / 2);
+
+            let good = diagnose(&sparse, &sparse_items);
+            let blurred = diagnose(&dense, &dense_items);
+            let case = format!("{precision:?}");
+
+            // Observed within budget: top_weight 0.93–0.95, fidelity ≥ 0.9997.
+            // Observed overfilled: top_weight ≤ 0.12, entropy ≥ 0.75,
+            // fidelity ≤ 0.80.
+            assert!(min(&good, |d| d.top_weight) > 0.8, "{case}");
+            assert!(min(&good, |d| d.fidelity) > 0.99, "{case}");
+            assert!(max(&good, |d| d.entropy) < 0.3, "{case}");
+            assert!(max(&blurred, |d| d.top_weight) < 0.3, "{case}");
+            assert!(max(&blurred, |d| d.fidelity) < 0.9, "{case}");
+            assert!(min(&blurred, |d| d.entropy) > 0.6, "{case}");
+            // An overload split halves a location's count, so the dominant
+            // location can sit just under capacity; observed 6.5–49.
+            assert!(min(&blurred, |d| d.support) > 4.0, "{case}");
+        }
+    }
+
+    /// Plain mode stores every write as its own location: `support` stays 1
+    /// and no location fills up, however much a cluster is overfilled.
+    #[test]
+    fn plain_mode_support_is_one_and_never_fills() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let c = unit(&mut rng);
+        let items: Vec<Vec<f64>> = (0..40).map(|_| near(&c, 0.75, &mut rng)).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let (_hive, col) = stored(dir.path(), false, Precision::F64, &items);
+        assert_eq!(col.num_locations().unwrap(), 40);
+        for d in diagnose(&col, &items) {
+            assert_eq!(d.support, 1.0);
+        }
+        let stats = col.capacity_stats().unwrap();
+        assert_eq!(stats.locations_near_capacity, 0);
+        assert_eq!(stats.occupancy_histogram[1], 40); // 1/8 = 12.5%
+    }
+
+    #[test]
+    fn single_location_is_fully_confident() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut rng = StdRng::seed_from_u64(1);
+        let v = unit(&mut rng);
+        let (_hive, col) = stored(dir.path(), true, Precision::F64, std::slice::from_ref(&v));
+        let d = col.read_diagnostics(&v).unwrap();
+        assert_eq!(d.top_weight, 1.0);
+        assert_eq!(d.margin, 1.0);
+        assert_eq!(d.entropy, 0.0);
+        assert!(d.fidelity > 0.999);
+    }
+
+    #[test]
+    fn diagnostics_reject_what_read_rejects() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_hive, col) = stored(dir.path(), true, Precision::F64, &[]);
+        assert!(matches!(
+            col.read_diagnostics(&[0.1; D]),
+            Err(HeatherError::EmptyMemory)
+        ));
+        col.write(&[0.1; D]).unwrap();
+        assert!(matches!(
+            col.read_diagnostics(&[0.1; 3]),
+            Err(HeatherError::DimensionMismatch { .. })
+        ));
+    }
+
+    /// Hand-built occupancies against capacity 10 land in known buckets.
+    #[test]
+    fn capacity_stats_count_a_known_fill() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config(true, Precision::F64);
+        cfg.tau_overload = 10.0;
+        let hive = Hive::open(dir.path(), cfg.clone(), 64).unwrap();
+        let col = hive.get_or_create_collection("cap").unwrap();
+        let counts = [0.0, 0.5, 1.0, 4.99, 5.0, 8.99, 9.0, 9.99, 10.0, 25.0];
+        let locations: Vec<HardLocation> = counts
+            .iter()
+            .enumerate()
+            .map(|(i, &wc)| {
+                let mut addr = vec![0.0; D];
+                addr[i] = 1.0;
+                let mut loc = HardLocation::new(LocationId(i as u64), addr);
+                loc.write_count = wc;
+                loc
+            })
+            .collect();
+        col.load_snapshot(locations, cfg).unwrap();
+
+        let stats = col.capacity_stats().unwrap();
+        assert_eq!(stats.capacity, 10.0);
+        //          bucket:  0  1  2  3  4  5  6  7  8  9  ≥100%
+        assert_eq!(
+            stats.occupancy_histogram,
+            vec![2, 1, 0, 0, 1, 1, 0, 0, 1, 2, 2]
+        );
+        assert_eq!(stats.locations_near_capacity, 4); // 9.0, 9.99, 10, 25
+        assert_eq!(stats.locations_at_capacity, 2); // 10, 25
+    }
+
+    #[test]
+    fn default_capacity_is_d_over_32_floored_at_8() {
+        for (d, cap) in [(64, 8.0), (256, 8.0), (512, 16.0), (1024, 32.0)] {
+            let dir = tempfile::tempdir().unwrap();
+            let hive = Hive::open(dir.path(), EAMConfig::new(d).unwrap(), 64).unwrap();
+            let col = hive.get_or_create_collection("c").unwrap();
+            assert_eq!(col.capacity_stats().unwrap().capacity, cap);
+        }
     }
 }
